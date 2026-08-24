@@ -1,0 +1,38 @@
+services:
+  web:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    image: amnezia-web-panel-revert
+    container_name: amnezia-panel-web
+    restart: unless-stopped
+    environment:
+      SECRET_KEY: 4FJBj_WAJiMun5FrLqnlOlEBo5du597Bur4axizqgTM
+    volumes:
+      - ./data.json:/app/data.json
+    networks:
+      - panelnet
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: amnezia-panel-proxy
+    depends_on:
+      - web
+    ports:
+      - "80:80"
+      - "43127:43127"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks:
+      - panelnet
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  panelnet:
+    driver: bridge

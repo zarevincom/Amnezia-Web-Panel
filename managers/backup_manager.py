@@ -75,6 +75,13 @@ class BackupManager:
         elif base == 'nginx':
             paths['host'] = ['/opt/amnezia/nginx']
             paths['container'] = ['/etc/nginx/conf.d', '/usr/share/nginx/html']
+        elif base == 'aivpn':
+            # Config/server.key/masks are bind-mounted from the host, so the
+            # host copy already mirrors container state 1:1 — no separate
+            # docker cp needed.
+            config_dir = inst_path('/opt/amnezia/aivpn')
+            paths['host'] = [config_dir]
+            paths['container'] = []
         else:
             paths['host'] = [f'/opt/amnezia/{base}']
             paths['container'] = [f'/opt/amnezia/{base}']

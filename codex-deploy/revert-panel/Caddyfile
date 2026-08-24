@@ -1,0 +1,15 @@
+panel.2-26-147-10.sslip.io:43127 {
+    basic_auth {
+        panelgate $2a$14$t.kthh3Wev8Cp3wAiJ.YuOz0fRk9PrMQ06OZj1YBIiO/u7BmBZ.iy
+    }
+
+    reverse_proxy web:5000
+
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy same-origin
+        X-Frame-Options DENY
+    }
+}

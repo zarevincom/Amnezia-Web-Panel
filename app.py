@@ -19,7 +19,9 @@ import time
 import urllib.request
 import zipfile
 import signal
-from datetime import datetime
+import calendar
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import io
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse, FileResponse
 from starlette.background import BackgroundTask
@@ -41,6 +43,7 @@ from managers.ssh_manager import SSHManager
 from managers.awg_manager import AWGManager
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
+from managers.aivpn_manager import AIVPNManager
 from managers.backup_manager import BackupManager
 import telegram_bot as tg_bot
 
@@ -59,6 +62,8 @@ OPENAPI_TAGS = [
     {"name": "Self-service", "description": "Endpoints called by a regular user for their own data (the /my surface)."},
     {"name": "Sharing", "description": "Public, token-protected configuration sharing for end users — no panel session required."},
     {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, JSON backup/restore."},
+    {"name": "Notifications", "description": "Scheduled Telegram personal messages."},
+    {"name": "Invites", "description": "Admin-managed public VPN profile invitations and claims."},
     {"name": "API Tokens", "description": "Bearer tokens for external integrations. Send the token in `Authorization: Bearer <token>`; tokens have admin-equivalent rights and are tied to the admin user that created them."},
 ]
 
@@ -79,12 +84,14 @@ async def custom_redoc():
     (the Montserrat/Roboto stylesheet is blocked on a lot of networks and made
     the page hang for some users)."""
     from fastapi.openapi.docs import get_redoc_html
-    return get_redoc_html(
-        openapi_url=app.openapi_url or "/openapi.json",
+    response = get_redoc_html(
+        openapi_url=(app.openapi_url or "/openapi.json") + "?v=invites-1",
         title=f"{app.title} — ReDoc",
         redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
         with_google_fonts=False,
     )
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
 
 # Mount static files & templates
@@ -96,7 +103,12 @@ if getattr(sys, 'frozen', False):
 else:
     application_path = os.path.dirname(__file__)
 
-DATA_FILE = os.path.join(application_path, 'data.json')
+# Default stays alongside the app so existing installs are unaffected.
+# PANEL_DATA_FILE lets a deployment point this at a mounted volume — the
+# stock docker-compose mounts its volume at /app/data while the default path
+# is /app/data.json, so without an override panel data lives in the
+# container's writable layer and is lost on every image rebuild.
+DATA_FILE = os.environ.get('PANEL_DATA_FILE') or os.path.join(application_path, 'data.json')
 CURRENT_VERSION = "v1.5.0"
 BIN_DIR = os.environ.get('TUNNEL_BIN_DIR', os.path.join(application_path, 'bin'))
 TUNNEL_STATE_FILE = os.environ.get('TUNNEL_STATE_FILE', os.path.join(application_path, 'tunnels_state.json'))
@@ -150,6 +162,8 @@ load_translations()
 
 # Global lock for data.json access to prevent race conditions during async operations
 DATA_LOCK = asyncio.Lock()
+NOTIFICATION_LOCK = asyncio.Lock()
+INVITE_ATTEMPTS = {}
 
 
 def load_data():
@@ -162,6 +176,10 @@ def load_data():
     data.setdefault('users', [])
     data.setdefault('user_connections', [])
     data.setdefault('api_tokens', [])
+    data.setdefault('notifications', [])
+    data.setdefault('invites', [])
+    data.setdefault('invite_claims', [])
+    data.setdefault('audit_log', [])
     data.setdefault('settings', {
         'appearance': {
             'title': 'Amnezia',
@@ -178,10 +196,22 @@ def load_data():
             'remnawave_protocol': 'awg'
         }
     })
+    data['settings'].setdefault('alerts', {
+        'chat_id': '', 'disk_threshold': 90,
+        'server_offline_template': '⚠️ Сервер {{server_name}} ({{server_ip}}) недоступен.',
+        'disk_full_template': '⚠️ На сервере {{server_name}} осталось мало места: занято {{disk_percent}}%.',
+        'protocol_stopped_template': '⚠️ На сервере {{server_name}} остановлен протокол {{protocol}}.',
+    })
+    data.setdefault('alert_states', {})
     return data
 
 
 def save_data(data):
+    # Ensure the target directory exists — PANEL_DATA_FILE may point at a
+    # mounted volume path that isn't created yet on first run.
+    parent = os.path.dirname(DATA_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -854,8 +884,8 @@ async def wait_for_tunnel_url(provider: str, seconds: int = 20):
     return get_tunnel_status(provider)
 
 
-BASE_PROTOCOLS = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx']
-MULTI_INSTANCE_PROTOCOLS = {'awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'socks5'}
+BASE_PROTOCOLS = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn']
+MULTI_INSTANCE_PROTOCOLS = {'awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'}
 
 
 def protocol_base(protocol: str) -> str:
@@ -900,6 +930,7 @@ def protocol_display_name(protocol: str) -> str:
         'socks5': 'SOCKS5',
         'adguard': 'AdGuard Home',
         'nginx': 'NGINX',
+        'aivpn': 'AIVPN',
     }
     name = names.get(base, base)
     return name if idx <= 1 else f'{name} #{idx}'
@@ -919,6 +950,7 @@ def protocol_container_name(protocol: str) -> Optional[str]:
         'socks5': 'amnezia-socks5proxy',
         'adguard': 'amnezia-adguard',
         'nginx': 'amnezia-nginx',
+        'aivpn': 'amnezia-aivpn',
     }
     name = base_names.get(base)
     if not name:
@@ -953,6 +985,9 @@ def get_protocol_manager(ssh, protocol: str):
     elif base == 'nginx':
         from managers.nginx_manager import NginxManager
         return NginxManager(ssh, protocol)
+    elif base == 'aivpn':
+        from managers.aivpn_manager import AIVPNManager
+        return AIVPNManager(ssh, protocol)
     from managers.awg_manager import AWGManager
     return AWGManager(ssh)
 
@@ -1010,9 +1045,78 @@ def _manager_call(manager, method, protocol, *args, **kwargs):
     return fn(protocol, *args, **kwargs)
 
 
+def normalize_rfc3339(value: Optional[str]) -> Optional[str]:
+    """Coerce a datetime string from the UI into the RFC 3339 UTC form that
+    AIVPN's management API expects.
+
+    Accepts what <input type="datetime-local"> produces ("2026-12-31T23:59"),
+    a plain date ("2026-12-31" -> end of that day), or an already-valid
+    RFC 3339 string. Returns None for empty input so callers can distinguish
+    "no expiry" from a real timestamp.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    # A date with no time means "through the end of that day" — expiring at
+    # 00:00 would cut the profile off a day earlier than the operator picked.
+    try:
+        dt = datetime.strptime(raw, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+    except ValueError:
+        candidate = raw[:-1] + '+00:00' if raw.endswith('Z') else raw
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except ValueError:
+            raise ValueError(f"Invalid date/time format: {raw}")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 def generate_vpn_link(config_text):
     b64 = base64.b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
     return f"vpn://{b64}"
+
+
+def _invite_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _find_invite(data: dict, token: str):
+    return next((i for i in data.get('invites', []) if secrets.compare_digest(i.get('token_hash', ''), _invite_hash(token))), None)
+
+
+def _audit(data: dict, event: str, **details):
+    data.setdefault('audit_log', []).append({'id': str(uuid.uuid4()), 'event': event, 'created_at': datetime.now(timezone.utc).isoformat(), **details})
+
+
+def _claim_rate_allowed(request: Request, token: str) -> bool:
+    key = f"{request.client.host if request.client else 'unknown'}:{token}"
+    now = time.monotonic()
+    attempts = [t for t in INVITE_ATTEMPTS.get(key, []) if now - t < 3600]
+    attempts.append(now)
+    INVITE_ATTEMPTS[key] = attempts
+    return len(attempts) <= 10
+
+
+def _public_error(message='This invitation is unavailable'):
+    return JSONResponse({'error': message}, status_code=400)
+
+
+def _ensure_invite_guest(data: dict, owner_id: str) -> dict:
+    """Keep self-service profiles visible in the panel's shared user list."""
+    user = next((u for u in data.get('users', []) if u.get('invite_owner_id') == owner_id), None)
+    if user:
+        return user
+    user = {
+        'id': str(uuid.uuid4()), 'username': f'guest-{owner_id[:8]}',
+        'password_hash': hash_password(secrets.token_urlsafe(24)), 'role': 'user',
+        'enabled': True, 'created_at': datetime.now(timezone.utc).isoformat(),
+        'invite_owner_id': owner_id, 'description': 'Self-service invitation user',
+    }
+    data.setdefault('users', []).append(user)
+    return user
 
 
 # ===================== API tokens =====================
@@ -1424,6 +1528,9 @@ class AddServerRequest(BaseModel):
     password: str = ''
     private_key: str = ''
     name: str = ''
+    expires_at: Optional[str] = None
+    payment_day: Optional[int] = None
+    price: Optional[str] = None
 
 
 class EditServerRequest(BaseModel):
@@ -1436,6 +1543,9 @@ class EditServerRequest(BaseModel):
     # fields can be omitted to keep current auth unchanged.
     password: Optional[str] = None
     private_key: Optional[str] = None
+    expires_at: Optional[str] = None
+    payment_day: Optional[int] = None
+    price: Optional[str] = None
 
 
 class ReorderServersRequest(BaseModel):
@@ -1488,17 +1598,25 @@ class AddConnectionRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    # AIVPN profile options
+    aivpn_expiry: Optional[str] = None
+    aivpn_one_time: Optional[bool] = False
 
 
 class EditConnectionRequest(BaseModel):
     protocol: str = 'telemt'
     client_id: str = ''
+    name: Optional[str] = None
     telemt_quota: Optional[str] = None
     telemt_max_ips: Optional[int] = None
     telemt_expiry: Optional[str] = None
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    # AIVPN profile options. `aivpn_expiry=''` explicitly clears the expiry;
+    # omitting the field leaves it untouched.
+    aivpn_expiry: Optional[str] = None
+    aivpn_one_time: Optional[bool] = None
 
 
 class ConnectionActionRequest(BaseModel):
@@ -1580,6 +1698,49 @@ class SSLSettings(BaseModel):
 class TelegramSettings(BaseModel):
     token: str = ''
     enabled: bool = False
+
+
+class TelegramTokenRequest(BaseModel):
+    token: str = ''
+
+
+class AlertSettingsRequest(BaseModel):
+    chat_id: str = ''
+    disk_threshold: int = 90
+    server_offline_template: str = '⚠️ Сервер {{server_name}} ({{server_ip}}) недоступен.'
+    disk_full_template: str = '⚠️ На сервере {{server_name}} осталось мало места: занято {{disk_percent}}%.'
+    protocol_stopped_template: str = '⚠️ На сервере {{server_name}} остановлен протокол {{protocol}}.'
+
+
+class NotificationRequest(BaseModel):
+    chat_id: str
+    text: str
+    run_at: str
+    timezone: str = 'Europe/Moscow'
+    repeat: str = 'once'
+    server_id: Optional[int] = None
+
+
+class NotificationToggleRequest(BaseModel):
+    enabled: bool
+
+
+class InviteRequest(BaseModel):
+    name: str
+    server_id: int
+    protocol: str = 'awg'
+    max_claims: int = 1
+    expires_at: str
+    profile_expires_at: Optional[str] = None
+    password: Optional[str] = None
+    max_reissues: int = 1
+    reissue_cooldown_hours: int = 24
+
+
+class ClaimRequest(BaseModel):
+    device_name: str
+    password: Optional[str] = None
+    captcha: Optional[str] = None
 
 
 
@@ -1692,6 +1853,11 @@ async def startup():
         changed = True
         logger.info("Initialised empty api_tokens collection")
 
+    if 'notifications' not in data:
+        data['notifications'] = []
+        changed = True
+        logger.info("Initialised empty notifications collection")
+
     # SSL settings migration
     if 'ssl' not in data.get('settings', {}):
         if 'settings' not in data: data['settings'] = {}
@@ -1712,12 +1878,188 @@ async def startup():
 
     # Start periodic background tasks
     asyncio.create_task(periodic_background_tasks())
+    asyncio.create_task(notification_scheduler())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
     if tg_cfg.get('enabled') and tg_cfg.get('token'):
         logger.info("Starting Telegram bot from saved settings...")
         tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data)
+
+
+def _parse_notification_time(value: str, tz_name: str) -> datetime:
+    """Convert browser's local datetime input into an aware UTC timestamp."""
+    try:
+        zone = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        raise ValueError('Unknown timezone')
+    try:
+        local_time = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError('Invalid date and time')
+    if local_time.tzinfo is not None:
+        return local_time.astimezone(timezone.utc)
+    return local_time.replace(tzinfo=zone).astimezone(timezone.utc)
+
+
+def _next_notification_run(notification: dict, previous_run: datetime) -> Optional[datetime]:
+    if notification.get('repeat', 'once') == 'daily':
+        return previous_run + timedelta(days=1)
+    if notification.get('repeat') == 'weekly':
+        return previous_run + timedelta(days=7)
+    if notification.get('repeat') == 'monthly':
+        year = previous_run.year + (previous_run.month == 12)
+        month = 1 if previous_run.month == 12 else previous_run.month + 1
+        day = min(notification.get('monthly_day', previous_run.day), calendar.monthrange(year, month)[1])
+        return previous_run.replace(year=year, month=month, day=day)
+    return None
+
+
+def _server_due_date(server: dict):
+    payment_day = server.get('payment_day')
+    if payment_day:
+        today = datetime.now().date()
+        year, month = today.year, today.month
+        due_day = min(int(payment_day), calendar.monthrange(year, month)[1])
+        due = today.replace(day=due_day)
+        if due < today:
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+            due = due.replace(year=year, month=month, day=min(int(payment_day), calendar.monthrange(year, month)[1]))
+        return due
+    value = server.get('expires_at')
+    return datetime.fromisoformat(value).date() if value else None
+
+
+def _server_days_left(server: dict) -> Optional[int]:
+    try:
+        due = _server_due_date(server)
+        return (due - datetime.now().date()).days if due else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _render_alert_template(template: str, server: dict, **extra) -> str:
+    values = {
+        'server_name': server.get('name') or server.get('host', ''),
+        'server_ip': server.get('host', ''),
+        'days_left': _server_days_left(server),
+        'price': server.get('price', ''),
+        **extra,
+    }
+    result = template
+    for key, value in values.items():
+        result = result.replace('{{' + key + '}}', '' if value is None else str(value))
+    return result
+
+
+def _monitor_server_alerts(data: dict, server_index: int, server: dict) -> list:
+    """Return new alert events. State suppresses repeated messages until recovery."""
+    alerts = []
+    states = data.setdefault('alert_states', {})
+    server_states = states.setdefault(str(server_index), {})
+    try:
+        ssh = get_ssh(server)
+        ssh.connect()
+    except Exception:
+        if not server_states.get('offline'):
+            alerts.append(('server_offline_template', {}))
+        server_states['offline'] = True
+        return alerts
+
+    server_states['offline'] = False
+    try:
+        out, _, _ = ssh.run_command("df -P / | awk 'NR==2 {print $5}'")
+        disk_percent = int(out.strip().rstrip('%'))
+        threshold = int(data.get('settings', {}).get('alerts', {}).get('disk_threshold', 90))
+        if disk_percent >= threshold:
+            if not server_states.get('disk_full'):
+                alerts.append(('disk_full_template', {'disk_percent': disk_percent}))
+            server_states['disk_full'] = True
+        else:
+            server_states['disk_full'] = False
+
+        for proto in server.get('protocols', {}):
+            state_key = 'protocol:' + proto
+            try:
+                manager = get_protocol_manager(ssh, proto)
+                status = _manager_call(manager, 'get_server_status', proto)
+                stopped = status.get('container_exists') and not status.get('container_running', False)
+                if stopped and not server_states.get(state_key):
+                    alerts.append(('protocol_stopped_template', {'protocol': protocol_display_name(proto)}))
+                server_states[state_key] = stopped
+            except Exception:
+                # A per-protocol check failure is not proof that it stopped.
+                continue
+    finally:
+        ssh.disconnect()
+    return alerts
+
+
+async def _send_telegram_message(token: str, chat_id: str, text: str):
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            f'https://api.telegram.org/bot{token}/sendMessage',
+            json={'chat_id': chat_id, 'text': text},
+        )
+    payload = response.json()
+    if not response.is_success or not payload.get('ok'):
+        raise RuntimeError(payload.get('description', 'Telegram rejected the message'))
+
+
+async def notification_scheduler():
+    """Deliver due notifications; their schedule remains durable in data.json."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            async with NOTIFICATION_LOCK:
+                data = load_data()
+                token = data.get('settings', {}).get('telegram', {}).get('token', '')
+                due = [n for n in data.get('notifications', []) if n.get('enabled', True)
+                       and n.get('next_run_at') and datetime.fromisoformat(n['next_run_at']) <= now]
+                for notification in due:
+                    notification['last_attempt_at'] = now.isoformat()
+                if due:
+                    save_data(data)
+
+            for notification in due:
+                try:
+                    if not token:
+                        raise RuntimeError('Telegram bot token is not configured')
+                    data = load_data()
+                    server = None
+                    if notification.get('server_id') is not None:
+                        server_id = notification['server_id']
+                        if 0 <= server_id < len(data.get('servers', [])):
+                            server = data['servers'][server_id]
+                    text = _render_alert_template(notification['text'], server) if server else notification['text']
+                    await _send_telegram_message(token, notification['chat_id'], text)
+                    async with NOTIFICATION_LOCK:
+                        data = load_data()
+                        current = next((n for n in data.get('notifications', []) if n['id'] == notification['id']), None)
+                        if not current:
+                            continue
+                        following = _next_notification_run(current, datetime.fromisoformat(current['next_run_at']))
+                        current['last_sent_at'] = datetime.now(timezone.utc).isoformat()
+                        current['last_error'] = ''
+                        if following:
+                            while following <= datetime.now(timezone.utc):
+                                following = _next_notification_run(current, following)
+                            current['next_run_at'] = following.isoformat()
+                        else:
+                            current['enabled'] = False
+                        save_data(data)
+                except Exception as e:
+                    logger.warning('Telegram notification %s failed: %s', notification['id'], e)
+                    async with NOTIFICATION_LOCK:
+                        data = load_data()
+                        current = next((n for n in data.get('notifications', []) if n['id'] == notification['id']), None)
+                        if current:
+                            current['last_error'] = str(e)
+                            current['next_run_at'] = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+                            save_data(data)
+        except Exception:
+            logger.exception('Notification scheduler error')
+        await asyncio.sleep(20)
 
 
 def _scrape_server_traffic(server, sid, my_conns):
@@ -1846,6 +2188,22 @@ async def periodic_background_tasks():
                 logger.info(f"Background Remnawave sync finished: {count} users updated. {msg}")
             else:
                 logger.info("Background Remnawave sync skipped (disabled in settings)")
+
+            # --- 3. SERVER HEALTH ALERTS ---
+            data = load_data()
+            alert_cfg = data.get('settings', {}).get('alerts', {})
+            token = data.get('settings', {}).get('telegram', {}).get('token', '')
+            chat_id = alert_cfg.get('chat_id', '').strip()
+            for sid, server in enumerate(data.get('servers', [])):
+                events = await asyncio.to_thread(_monitor_server_alerts, data, sid, server)
+                for template_key, extra in events:
+                    if token and chat_id:
+                        try:
+                            text = _render_alert_template(alert_cfg.get(template_key, ''), server, **extra)
+                            await _send_telegram_message(token, chat_id, text)
+                        except Exception as e:
+                            logger.warning('Failed to send server health alert: %s', e)
+            save_data(data)
                 
         except Exception as e:
             logger.error(f"Error in periodic_background_tasks: {e}")
@@ -1885,6 +2243,8 @@ async def index(request: Request):
     if user['role'] == 'user':
         return RedirectResponse(url='/my', status_code=302)
     data = load_data()
+    for server in data['servers']:
+        server['days_left'] = _server_days_left(server)
     return tpl(request, 'index.html', servers=data['servers'])
 
 
@@ -2036,6 +2396,9 @@ async def api_add_server(request: Request, req: AddServerRequest):
             'username': username, 'password': req.password,
             'private_key': req.private_key, 'server_info': server_info,
             'protocols': {},
+            'expires_at': req.expires_at or None,
+            'payment_day': req.payment_day if req.payment_day and 1 <= req.payment_day <= 31 else None,
+            'price': (req.price or '').strip(),
         }
         data = load_data()
         data['servers'].append(server)
@@ -2093,6 +2456,14 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
         server['password'] = new_pass
         server['private_key'] = new_key
         server['server_info'] = server_info
+        if req.expires_at is not None:
+            server['expires_at'] = req.expires_at or None
+        if req.payment_day is not None:
+            if req.payment_day and not 1 <= req.payment_day <= 31:
+                return JSONResponse({'error': 'Payment day must be between 1 and 31'}, status_code=400)
+            server['payment_day'] = req.payment_day or None
+        if req.price is not None:
+            server['price'] = req.price.strip()
         save_data(data)
         return {'status': 'success', 'server_info': server_info}
     except Exception as e:
@@ -2645,6 +3016,7 @@ CONTAINER_NAMES = {
     'socks5': 'amnezia-socks5proxy',
     'adguard': 'amnezia-adguard',
     'nginx': 'amnezia-nginx',
+    'aivpn': 'amnezia-aivpn',
 }
 
 
@@ -2828,6 +3200,10 @@ async def api_server_config(request: Request, server_id: int, req: ProtocolReque
             from managers.nginx_manager import NginxManager
             mgr = NginxManager(ssh, req.protocol)
             config = mgr._get_server_config(req.protocol)
+        elif protocol_base(req.protocol) == 'aivpn':
+            from managers.aivpn_manager import AIVPNManager
+            mgr = AIVPNManager(ssh, req.protocol)
+            config = mgr._get_server_config()
         else:
             mgr = AWGManager(ssh)
             config = mgr._get_server_config(req.protocol)
@@ -2872,6 +3248,10 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
             from managers.nginx_manager import NginxManager
             mgr = NginxManager(ssh, req.protocol)
             mgr.save_server_config(req.protocol, req.config)
+        elif protocol_base(req.protocol) == 'aivpn':
+            from managers.aivpn_manager import AIVPNManager
+            mgr = AIVPNManager(ssh, req.protocol)
+            mgr.save_server_config(req.config)
         else:
             mgr = AWGManager(ssh)
             mgr.save_server_config(req.protocol, req.config)
@@ -2996,6 +3376,12 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
             )
         elif protocol_base(req.protocol) == 'wireguard':
             result = manager.add_client(req.name, server['host'])
+        elif protocol_base(req.protocol) == 'aivpn':
+            result = manager.add_client(
+                req.protocol, req.name, server['host'], port,
+                expires_at=normalize_rfc3339(req.aivpn_expiry),
+                one_time=bool(req.aivpn_one_time),
+            )
         else:
             result = manager.add_client(req.protocol, req.name, server['host'], port)
         ssh.disconnect()
@@ -3073,7 +3459,16 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
             edit_params['secret'] = req.telemt_secret
             edit_params['user_ad_tag'] = req.telemt_ad_tag
             edit_params['max_tcp_conns'] = req.telemt_max_conns
-            
+        elif protocol_base(req.protocol) == 'aivpn':
+            if req.name:
+                edit_params['name'] = req.name
+            if req.aivpn_one_time is not None:
+                edit_params['one_time'] = req.aivpn_one_time
+            # An empty string means "clear the expiry"; omitting the field
+            # entirely leaves the current expiry alone.
+            if req.aivpn_expiry is not None:
+                edit_params['expires_at'] = normalize_rfc3339(req.aivpn_expiry)
+
         result = manager.edit_client(req.protocol, req.client_id, edit_params)
         ssh.disconnect()
         return result
@@ -3114,6 +3509,75 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
     except Exception as e:
         logger.exception("Error getting connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/connections/details', tags=["Connections"])
+async def api_get_connection_details(request: Request, server_id: int, req: ConnectionActionRequest):
+    """Full profile card for one connection: identity, status, traffic and the
+    connection key. Currently backed by AIVPN's management API — other
+    protocols expose their details through the connections list instead."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    ssh = None
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        if protocol_base(req.protocol) != 'aivpn':
+            return JSONResponse({'error': 'Profile details are not supported for this protocol'}, status_code=400)
+        if not req.client_id:
+            return JSONResponse({'error': 'Client ID is required'}, status_code=400)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, req.protocol)
+        details = manager.get_client_details(req.protocol, req.client_id)
+
+        # Attach the panel user this profile is assigned to, if any.
+        for uc in data.get('user_connections', []):
+            if (uc.get('client_id') == req.client_id
+                    and uc.get('server_id') == server_id
+                    and uc.get('protocol') == req.protocol):
+                user = next((u for u in data.get('users', []) if u['id'] == uc.get('user_id')), None)
+                if user:
+                    details['assigned_user'] = user['username']
+                    details['assigned_user_id'] = user['id']
+                break
+        return details
+    except Exception as e:
+        logger.exception("Error getting connection details")
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/connections/reset-device', tags=["Connections"])
+async def api_reset_connection_device(request: Request, server_id: int, req: ConnectionActionRequest):
+    """Clear an AIVPN profile's bound device key so it can be enrolled again
+    (used when the bound phone/laptop is lost or replaced)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    ssh = None
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        if protocol_base(req.protocol) != 'aivpn':
+            return JSONResponse({'error': 'Device binding is not supported for this protocol'}, status_code=400)
+        if not req.client_id:
+            return JSONResponse({'error': 'Client ID is required'}, status_code=400)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, req.protocol)
+        return manager.reset_device(req.protocol, req.client_id)
+    except Exception as e:
+        logger.exception("Error resetting device binding")
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
 
 
 @app.post('/api/servers/{server_id}/connections/toggle', tags=["Connections"])
@@ -3610,6 +4074,287 @@ async def settings_page(request: Request):
     return tpl(request, 'settings.html', settings=data.get('settings', {}), servers=data.get('servers', []), current_version=CURRENT_VERSION)
 
 
+@app.get('/notifications', response_class=HTMLResponse, tags=["System Templates"])
+async def notifications_page(request: Request):
+    if not _check_admin(request):
+        return RedirectResponse('/login')
+    return tpl(request, 'notifications.html', servers=load_data().get('servers', []))
+
+
+@app.get('/api/notifications', tags=["Notifications"])
+async def api_list_notifications(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    result = []
+    for notification in data.get('notifications', []):
+        item = dict(notification)
+        server_id = item.get('server_id')
+        if isinstance(server_id, int) and 0 <= server_id < len(data.get('servers', [])):
+            item['preview_text'] = _render_alert_template(item.get('text', ''), data['servers'][server_id])
+        else:
+            item['preview_text'] = item.get('text', '')
+        result.append(item)
+    return result
+
+
+@app.get('/api/notifications/alerts', tags=["Notifications"])
+async def api_get_alert_settings(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    return load_data().get('settings', {}).get('alerts', {})
+
+
+@app.get('/invites', response_class=HTMLResponse, tags=["System Templates"])
+async def invites_page(request: Request):
+    if not _check_admin(request):
+        return RedirectResponse('/login')
+    data = load_data()
+    return tpl(request, 'invites.html', invites=data.get('invites', []), servers=data.get('servers', []))
+
+
+@app.post('/api/invites', tags=["Invites"])
+async def api_create_invite(request: Request, payload: InviteRequest):
+    if not _check_admin(request): return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if payload.server_id < 0 or payload.server_id >= len(data.get('servers', [])) or not payload.name.strip():
+        return JSONResponse({'error': 'Invalid invitation settings'}, status_code=400)
+    if payload.max_claims < 1 or payload.max_reissues < 0 or payload.reissue_cooldown_hours < 1:
+        return JSONResponse({'error': 'Invalid limits'}, status_code=400)
+    try:
+        expires = datetime.fromisoformat(payload.expires_at.replace('Z', '+00:00'))
+        if expires.tzinfo is None: expires = expires.replace(tzinfo=timezone.utc)
+    except ValueError: return JSONResponse({'error': 'Invalid expiry date'}, status_code=400)
+    raw_token = secrets.token_urlsafe(32)
+    invite = {'id':str(uuid.uuid4()), 'name':payload.name.strip(), 'token_hash':_invite_hash(raw_token), 'server_id':payload.server_id, 'protocol':payload.protocol, 'max_claims':payload.max_claims, 'claims_count':0, 'expires_at':expires.astimezone(timezone.utc).isoformat(), 'profile_expires_at':payload.profile_expires_at or None, 'password_hash':hash_password(payload.password) if payload.password else None, 'max_reissues':payload.max_reissues, 'reissue_cooldown_hours':payload.reissue_cooldown_hours, 'enabled':True, 'created_at':datetime.now(timezone.utc).isoformat()}
+    data['invites'].append(invite); _audit(data, 'invite_created', invite_id=invite['id']); save_data(data)
+    return {'invite':invite, 'url':str(request.base_url).rstrip('/') + '/claim/' + raw_token}
+
+
+@app.post('/api/invites/{invite_id}/toggle', tags=["Invites"])
+async def api_toggle_invite(invite_id: str, request: Request):
+    if not _check_admin(request): return JSONResponse({'error':'Forbidden'},status_code=403)
+    data=load_data(); invite=next((i for i in data['invites'] if i['id']==invite_id),None)
+    if not invite: return JSONResponse({'error':'Not found'},status_code=404)
+    invite['enabled']=not invite.get('enabled',True); save_data(data); return invite
+
+
+@app.get('/claim/{token}', response_class=HTMLResponse, tags=["System Templates"])
+async def claim_page(token: str, request: Request):
+    data=load_data(); invite=_find_invite(data,token)
+    if not invite or not invite.get('enabled') or datetime.fromisoformat(invite['expires_at']) <= datetime.now(timezone.utc):
+        return HTMLResponse('<h1>Invitation unavailable</h1>',status_code=404)
+    response = templates.TemplateResponse('claim.html', {'request': request, 'token': token, 'needs_password': bool(invite.get('password_hash')), 'invite_name': invite.get('name', 'VPN access')})
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
+@app.get('/api/claim/captcha', tags=["Invites"])
+async def api_claim_captcha(request: Request):
+    if not CaptchaGenerator:
+        return JSONResponse({'error': 'Unavailable'}, status_code=503)
+    captcha = CaptchaGenerator(2).gen_captcha_image(difficult_level=2)
+    request.session['claim_captcha'] = captcha.characters.lower()
+    image = io.BytesIO(); captcha.image.save(image, format='PNG'); image.seek(0)
+    return StreamingResponse(image, media_type='image/png', headers={'Cache-Control': 'no-store'})
+
+
+async def _create_invite_profile(data, invite, device_name):
+    server=data['servers'][invite['server_id']]; proto=invite['protocol']; ssh=get_ssh(server); ssh.connect()
+    try:
+        manager=get_protocol_manager(ssh,proto); port=server.get('protocols',{}).get(proto,{}).get('port','55424')
+        result=_manager_call(manager,'add_client',proto,device_name,server['host'],port)
+        if isinstance(result, str):
+            config=result
+            clients=_manager_call(manager,'get_clients',proto)
+            client_id=next((c.get('clientId') for c in clients if c.get('name') == device_name), None)
+        else:
+            client_id=result.get('clientId') or result.get('client_id')
+            config=result.get('config') or _manager_call(manager,'get_client_config',proto,client_id,server['host'],port)
+        if not client_id:
+            raise RuntimeError('Created profile could not be identified')
+        return client_id, config
+    finally: ssh.disconnect()
+
+
+@app.post('/api/claim/{token}', tags=["Invites"])
+async def api_claim(token: str, payload: ClaimRequest, request: Request):
+    if not _claim_rate_allowed(request,token): return _public_error('Too many attempts')
+    data=load_data(); invite=_find_invite(data,token)
+    if not invite or not invite.get('enabled') or datetime.fromisoformat(invite['expires_at']) <= datetime.now(timezone.utc) or invite.get('claims_count',0)>=invite.get('max_claims',1):
+        _audit(data,'invite_claim_rejected',reason='unavailable'); save_data(data); return _public_error()
+    if invite.get('password_hash') and not verify_password(payload.password or '',invite['password_hash']):
+        _audit(data,'invite_claim_rejected',invite_id=invite['id'],reason='password'); save_data(data); return _public_error('Invalid password')
+    name=re.sub(r'[^\w .-]','',payload.device_name).strip()[:48]
+    if not name: return _public_error('Device name is required')
+    try: client_id,config=await _create_invite_profile(data,invite,name)
+    except Exception:
+        logger.exception('Invite profile creation failed'); return _public_error('Profile could not be created')
+    owner_key = 'claim_owner_' + _invite_hash(token)
+    owner_id = request.session.get(owner_key) or secrets.token_urlsafe(24)
+    request.session[owner_key] = owner_id
+    guest = _ensure_invite_guest(data, owner_id)
+    claim={'id':str(uuid.uuid4()),'invite_id':invite['id'],'owner_id':owner_id,'client_id':client_id,'device_name':name,'server_id':invite['server_id'],'protocol':invite['protocol'],'reissues':0,'last_reissue_at':None,'created_at':datetime.now(timezone.utc).isoformat(),'last_ip':request.client.host if request.client else ''}
+    data['invite_claims'].append(claim)
+    data.setdefault('user_connections', []).append({'id': str(uuid.uuid4()), 'user_id': guest['id'], 'server_id': invite['server_id'], 'protocol': invite['protocol'], 'client_id': client_id, 'name': name, 'invite_claim_id': claim['id'], 'created_at': claim['created_at']})
+    invite['claims_count']+=1; _audit(data,'invite_claimed',invite_id=invite['id'],claim_id=claim['id']); save_data(data)
+    request.session['claim_session_' + _invite_hash(token)] = claim['id']
+    return {'claim_id':claim['id'],'config':config,'vpn_link':generate_vpn_link(config),'expires_at':invite.get('profile_expires_at'),'can_reissue':invite.get('max_reissues',0)>0}
+
+
+@app.get('/api/claim/{token}/profiles', tags=["Invites"])
+async def api_claim_profiles(token: str, request: Request):
+    data = load_data(); invite = _find_invite(data, token)
+    owner_id = request.session.get('claim_owner_' + _invite_hash(token))
+    if not invite or not owner_id:
+        return {'profiles': []}
+    profiles = []
+    for claim in data.get('invite_claims', []):
+        if claim.get('invite_id') != invite['id'] or claim.get('owner_id') != owner_id:
+            continue
+        try:
+            server = data['servers'][claim['server_id']]
+            ssh = get_ssh(server); ssh.connect()
+            manager = get_protocol_manager(ssh, claim['protocol'])
+            port = server.get('protocols', {}).get(claim['protocol'], {}).get('port', '55424')
+            config = _manager_call(manager, 'get_client_config', claim['protocol'], claim['client_id'], server['host'], port)
+            ssh.disconnect()
+            if config:
+                profiles.append({'id': claim['id'], 'name': claim['device_name'], 'protocol': claim['protocol'], 'server': server.get('name') or server['host'], 'expires_at': invite.get('profile_expires_at'), 'config': config, 'vpn_link': generate_vpn_link(config), 'can_reissue': claim.get('reissues', 0) < invite.get('max_reissues', 0)})
+        except Exception:
+            logger.warning('Could not load claim profile %s', claim['id'])
+    return {'profiles': profiles}
+
+
+@app.post('/api/claim/{token}/{claim_id}/reissue', tags=["Invites"])
+async def api_reissue_claim(token: str, claim_id: str, payload: ClaimRequest, request: Request):
+    if not _claim_rate_allowed(request, token): return _public_error('Too many attempts')
+    if request.session.get('claim_session_' + _invite_hash(token)) != claim_id: return _public_error()
+    data=load_data(); invite=_find_invite(data,token); claim=next((c for c in data.get('invite_claims',[]) if c['id']==claim_id),None)
+    if not invite or not claim or claim.get('invite_id') != invite['id'] or not invite.get('enabled'): return _public_error()
+    if claim.get('reissues',0) >= invite.get('max_reissues',0): return _public_error('Reissue limit reached')
+    if claim.get('last_reissue_at'):
+        last=datetime.fromisoformat(claim['last_reissue_at'])
+        if datetime.now(timezone.utc) < last + timedelta(hours=invite.get('reissue_cooldown_hours',24)): return _public_error('Reissue is temporarily unavailable')
+    try:
+        server=data['servers'][claim['server_id']]; ssh=get_ssh(server); ssh.connect(); manager=get_protocol_manager(ssh,claim['protocol'])
+        old_client_id = claim['client_id']; _manager_call(manager,'remove_client',claim['protocol'],old_client_id); ssh.disconnect()
+        client_id,config=await _create_invite_profile(data,invite,payload.device_name or claim['device_name'])
+    except Exception:
+        logger.exception('Invite reissue failed'); return _public_error('Profile could not be reissued')
+    claim.update({'client_id':client_id,'previous_client_id':old_client_id,'revoked_at':datetime.now(timezone.utc).isoformat(),'device_name':payload.device_name or claim['device_name'],'reissues':claim.get('reissues',0)+1,'last_reissue_at':datetime.now(timezone.utc).isoformat()})
+    for connection in data.get('user_connections', []):
+        if connection.get('invite_claim_id') == claim['id']:
+            connection.update({'client_id': client_id, 'name': claim['device_name'], 'updated_at': claim['last_reissue_at']})
+    _audit(data,'invite_reissued',invite_id=invite['id'],claim_id=claim['id']); save_data(data)
+    return {'claim_id':claim['id'],'config':config,'vpn_link':generate_vpn_link(config),'can_reissue':claim['reissues'] < invite.get('max_reissues',0)}
+
+
+@app.post('/api/notifications/alerts', tags=["Notifications"])
+async def api_save_alert_settings(request: Request, payload: AlertSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not 1 <= payload.disk_threshold <= 100:
+        return JSONResponse({'error': 'Disk threshold must be between 1 and 100'}, status_code=400)
+    data = load_data()
+    data['settings']['alerts'] = payload.dict()
+    save_data(data)
+    return data['settings']['alerts']
+
+
+@app.post('/api/notifications', tags=["Notifications"])
+async def api_create_notification(request: Request, payload: NotificationRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    text = payload.text.strip()
+    chat_id = payload.chat_id.strip()
+    if not text or not chat_id:
+        return JSONResponse({'error': 'Recipient and message text are required'}, status_code=400)
+    if payload.repeat not in {'once', 'daily', 'weekly', 'monthly'}:
+        return JSONResponse({'error': 'Unsupported repeat rule'}, status_code=400)
+    try:
+        next_run = _parse_notification_time(payload.run_at, payload.timezone)
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    data = load_data()
+    server = None
+    if payload.server_id is not None:
+        if payload.server_id < 0 or payload.server_id >= len(data.get('servers', [])):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][payload.server_id]
+        if payload.repeat == 'monthly' and server.get('payment_day'):
+            local = datetime.fromisoformat(payload.run_at)
+            day = min(int(server['payment_day']), calendar.monthrange(local.year, local.month)[1])
+            local = local.replace(day=day)
+            next_run = _parse_notification_time(local.isoformat(), payload.timezone)
+            if next_run <= datetime.now(timezone.utc):
+                next_run = _next_notification_run({'repeat': 'monthly', 'monthly_day': int(server['payment_day'])}, next_run)
+    notification = {
+        'id': str(uuid.uuid4()), 'chat_id': chat_id, 'text': text,
+        'timezone': payload.timezone, 'repeat': payload.repeat,
+        'monthly_day': int(server['payment_day']) if server and server.get('payment_day') else datetime.fromisoformat(payload.run_at).day,
+        'server_id': payload.server_id,
+        'next_run_at': next_run.isoformat(), 'enabled': True,
+        'created_at': datetime.now(timezone.utc).isoformat(), 'last_sent_at': '', 'last_error': '',
+    }
+    async with NOTIFICATION_LOCK:
+        data.setdefault('notifications', []).append(notification)
+        save_data(data)
+    return notification
+
+
+@app.post('/api/notifications/test', tags=["Notifications"])
+async def api_test_notification(request: Request, payload: NotificationRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    token = load_data().get('settings', {}).get('telegram', {}).get('token', '')
+    if not token:
+        return JSONResponse({'error': 'Configure the Telegram bot token first'}, status_code=400)
+    try:
+        data = load_data()
+        server = None
+        if payload.server_id is not None and 0 <= payload.server_id < len(data.get('servers', [])):
+            server = data['servers'][payload.server_id]
+        text = payload.text.strip() or 'Test notification from Amnezia Web Panel'
+        if server:
+            text = _render_alert_template(text, server)
+        await _send_telegram_message(token, payload.chat_id.strip(), text)
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    return {'status': 'sent'}
+
+
+@app.post('/api/notifications/{notification_id}/toggle', tags=["Notifications"])
+async def api_toggle_notification(notification_id: str, request: Request, payload: NotificationToggleRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    async with NOTIFICATION_LOCK:
+        data = load_data()
+        notification = next((n for n in data.get('notifications', []) if n['id'] == notification_id), None)
+        if not notification:
+            return JSONResponse({'error': 'Notification not found'}, status_code=404)
+        notification['enabled'] = payload.enabled
+        save_data(data)
+    return notification
+
+
+@app.delete('/api/notifications/{notification_id}', tags=["Notifications"])
+async def api_delete_notification(notification_id: str, request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    async with NOTIFICATION_LOCK:
+        data = load_data()
+        original = len(data.get('notifications', []))
+        data['notifications'] = [n for n in data.get('notifications', []) if n['id'] != notification_id]
+        if len(data['notifications']) == original:
+            return JSONResponse({'error': 'Notification not found'}, status_code=404)
+        save_data(data)
+    return {'status': 'deleted'}
+
+
 @app.get('/api/settings', tags=["Settings"])
 async def api_get_settings(request: Request):
     if not _check_admin(request):
@@ -3754,12 +4499,19 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
 
 
 @app.post('/api/settings/telegram/toggle', tags=["Settings"])
-async def api_telegram_toggle(request: Request):
+async def api_telegram_toggle(
+    request: Request,
+    payload: Optional[TelegramTokenRequest] = None,
+):
     """Quick enable/disable of the bot without a full settings save."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     tg_cfg = data.get('settings', {}).get('telegram', {})
+    if payload and payload.token.strip():
+        tg_cfg['token'] = payload.token.strip()
+        data['settings']['telegram'] = tg_cfg
+        save_data(data)
     token = tg_cfg.get('token', '')
     if not token:
         return JSONResponse({'error': 'Telegram token not set in settings'}, status_code=400)

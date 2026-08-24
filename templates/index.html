@@ -17,7 +17,7 @@
         {% for server in servers %}
         <div class="card card-hover server-card" id="server-{{ loop.index0 }}" data-idx="{{ loop.index0 }}"
             data-name="{{ server.name }}" data-host="{{ server.host }}" data-port="{{ server.ssh_port }}"
-            data-username="{{ server.username }}" data-auth="{{ 'key' if server.private_key else 'password' }}"
+            data-username="{{ server.username }}" data-expires-at="{{ server.expires_at or '' }}" data-payment-day="{{ server.payment_day or '' }}" data-price="{{ server.price or '' }}" data-auth="{{ 'key' if server.private_key else 'password' }}"
             draggable="true">
             <div class="server-meta">
                 <div class="server-icon">🖥</div>
@@ -29,6 +29,11 @@
                         <span class="ping-ms text-muted" id="ping-ms-{{ loop.index0 }}"></span>
                     </div>
                     <div class="server-host">{{ server.host }}:{{ server.ssh_port }}</div>
+                    {% if server.days_left is not none %}
+                    <div class="form-hint" style="margin-top:4px;color:{{ 'var(--danger)' if server.days_left < 0 else ('var(--warning)' if server.days_left <= 7 else 'var(--text-muted)') }};">
+                        Оплата: {% if server.days_left < 0 %}просрочено на {{ -server.days_left }} дн.{% else %}осталось {{ server.days_left }} дн.{% endif %}{% if server.price %} · {{ server.price }}{% endif %}
+                    </div>
+                    {% endif %}
                 </div>
             </div>
 
@@ -112,6 +117,8 @@
                 <label class="form-label">{{ _('ssh_user') }}</label>
                 <input class="form-input" type="text" id="editServerUser" required>
             </div>
+            <div class="form-group"><label class="form-label">Дата оплаты / окончания</label><input class="form-input" type="date" id="editServerExpiresAt"></div>
+            <div class="form-row"><div class="form-group"><label class="form-label">День оплаты ежемесячно</label><input class="form-input" type="number" min="1" max="31" id="editServerPaymentDay"></div><div class="form-group"><label class="form-label">Цена</label><input class="form-input" id="editServerPrice" placeholder="10 EUR"></div></div>
 
             <div class="tabs" style="margin-top: var(--space-md)">
                 <button type="button" class="tab active" onclick="switchEditAuthTab('password', this)">{{ _('ssh_password') }}</button>
@@ -177,6 +184,8 @@
                 <label class="form-label">{{ _('ssh_user') }}</label>
                 <input class="form-input" type="text" id="serverUser" placeholder="root" required>
             </div>
+            <div class="form-group"><label class="form-label">Дата оплаты / окончания</label><input class="form-input" type="date" id="serverExpiresAt"></div>
+            <div class="form-row"><div class="form-group"><label class="form-label">День оплаты ежемесячно</label><input class="form-input" type="number" min="1" max="31" id="serverPaymentDay"></div><div class="form-group"><label class="form-label">Цена</label><input class="form-input" id="serverPrice" placeholder="10 EUR"></div></div>
 
             <!-- Tabs for auth method -->
             <div class="tabs" style="margin-top: var(--space-md)">
@@ -243,6 +252,9 @@
                 username: document.getElementById('serverUser').value,
                 password: document.getElementById('serverPassword').value,
                 private_key: document.getElementById('serverKey').value,
+                expires_at: document.getElementById('serverExpiresAt').value || null,
+                payment_day: parseInt(document.getElementById('serverPaymentDay').value) || null,
+                price: document.getElementById('serverPrice').value.trim(),
             };
 
             const result = await apiCall('/api/servers/add', 'POST', data);
@@ -289,6 +301,9 @@
         document.getElementById('editServerHost').value = card.dataset.host || '';
         document.getElementById('editServerPort').value = card.dataset.port || '22';
         document.getElementById('editServerUser').value = card.dataset.username || '';
+        document.getElementById('editServerExpiresAt').value = card.dataset.expiresAt || '';
+        document.getElementById('editServerPaymentDay').value = card.dataset.paymentDay || '';
+        document.getElementById('editServerPrice').value = card.dataset.price || '';
         document.getElementById('editServerPassword').value = '';
         document.getElementById('editServerKey').value = '';
 
@@ -320,6 +335,9 @@
                 // Empty -> null means "leave unchanged" on the backend.
                 password: document.getElementById('editServerPassword').value || null,
                 private_key: document.getElementById('editServerKey').value || null,
+                expires_at: document.getElementById('editServerExpiresAt').value || '',
+                payment_day: parseInt(document.getElementById('editServerPaymentDay').value) || null,
+                price: document.getElementById('editServerPrice').value.trim(),
             };
             await apiCall(`/api/servers/${idx}/edit`, 'POST', body);
             showToast(_('server_saved'), 'success');

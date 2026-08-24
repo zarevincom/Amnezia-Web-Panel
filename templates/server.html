@@ -318,23 +318,27 @@
         </div>
     </div>
 
-    <!-- ===== AIVPN teaser (locked, full grid width) ===== -->
-    <div class="promo-block promo-aivpn" aria-disabled="true" role="article">
-        <div class="promo-orbs" aria-hidden="true">
-            <span class="promo-orb"></span>
-            <span class="promo-orb"></span>
-            <span class="promo-orb"></span>
+    <!-- AIVPN Card -->
+    <div class="card card-hover protocol-card protocol-aivpn" id="proto-aivpn">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+            <div class="protocol-icon">🧠</div>
+            <div class="flex gap-sm" id="aivpn-ctrl" style="display:none!important;"></div>
         </div>
-        <span class="promo-lock-badge">🔒 {{ _('coming_soon') }}</span>
-        <div class="promo-content">
-            <div class="promo-icon" aria-hidden="true">🧠</div>
-            <div class="promo-text">
-                <div class="promo-title">AIVPN</div>
-                <div class="promo-subtitle">{{ _('aivpn_subtitle') }}</div>
-            </div>
-            <a class="promo-cta" href="https://github.com/PRVTPRO/Amnezia-Web-Panel" target="_blank" rel="noopener">
-                ⭐ <span>{{ _('promo_star_cta') }}</span>
-            </a>
+        <div class="protocol-name">AIVPN</div>
+        <div class="protocol-desc">
+            {{ _('aivpn_desc') }}
+        </div>
+        <div class="protocol-status" id="aivpn-status">
+            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _('not_checked') }}</span>
+        </div>
+        <div id="aivpn-info" class="hidden">
+            <div class="protocol-info" id="aivpn-info-grid"></div>
+        </div>
+        <div class="flex gap-sm" id="aivpn-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('aivpn')" id="aivpn-install-btn"
+                style="flex:1">
+                {{ _('install') }}
+            </button>
         </div>
     </div>
 
@@ -457,25 +461,6 @@
     </div>
 </div>
 
-<div class="promo-block promo-aivpn" aria-disabled="true" role="article">
-    <div class="promo-orbs" aria-hidden="true">
-        <span class="promo-orb"></span>
-        <span class="promo-orb"></span>
-        <span class="promo-orb"></span>
-    </div>
-    <span class="promo-lock-badge">🔒 Coming soon</span>
-    <div class="promo-content">
-        <div class="promo-icon" aria-hidden="true">🧠</div>
-        <div class="promo-text">
-            <div class="promo-title">AIVPN</div>
-            <div class="promo-subtitle">AI-driven protocol selection that picks the right tunnel for the moment. Land it sooner — drop a star.</div>
-        </div>
-        <a class="promo-cta" href="https://github.com/PRVTPRO/Amnezia-Web-Panel" target="_blank" rel="noopener">
-            ⭐ <span>Star us on GitHub</span>
-        </a>
-    </div>
-</div>
-
 <!-- Connections Section (renamed from Clients) -->
 <div class="clients-section" id="connectionsSection" style="display:none;">
     <div class="clients-header">
@@ -492,6 +477,7 @@
                 <option value="xray">Xray</option>
                 <option value="telemt">Telemt</option>
                 <option value="wireguard">WireGuard</option>
+                <option value="aivpn">AIVPN</option>
             </select>
             <button class="btn btn-primary btn-sm" onclick="openAddConnectionModal()">
                 <span>＋</span> {{ _('add') }}
@@ -820,12 +806,68 @@
             </div>
         </div>
 
+        <div id="aivpnConnOptions"
+            style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+            <div class="form-group">
+                <label class="form-label">{{ _('aivpn_expiry') }}</label>
+                <input class="form-input" type="datetime-local" id="aivpnExpiry">
+                <div class="form-hint">{{ _('aivpn_expiry_hint') }}</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label" style="display:flex; align-items:center; gap:var(--space-sm); cursor:pointer;">
+                    <input type="checkbox" id="aivpnOneTime">
+                    <span>{{ _('aivpn_one_time') }}</span>
+                </label>
+                <div class="form-hint">{{ _('aivpn_one_time_hint') }}</div>
+            </div>
+        </div>
+
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="closeModal('addConnectionModal')">{{ _('cancel') }}</button>
             <button class="btn btn-primary" onclick="addConnection()" id="addConnBtn">
                 <span id="addConnBtnText">{{ _('create') }}</span>
                 <div class="spinner hidden" id="addConnSpinner"></div>
             </button>
+        </div>
+    </div>
+</div>
+
+<!-- ===== AIVPN Profile Modal ===== -->
+<div class="modal-backdrop" id="profileModal">
+    <div class="modal" style="max-width: 560px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="profileModalTitle">{{ _('profile') }}</h2>
+            <button class="modal-close" onclick="closeModal('profileModal')">×</button>
+        </div>
+
+        <div id="profileLoading" class="loading-overlay" style="display:none;">
+            <div class="loading-spinner"></div>
+            <span>{{ _('loading') }}</span>
+        </div>
+
+        <div id="profileBody" style="display:none;">
+            <div class="protocol-info" id="profileInfoGrid" style="margin-bottom: var(--space-md);"></div>
+
+            <div class="form-group">
+                <label class="form-label">{{ _('aivpn_connection_key') }}</label>
+                <div class="vpn-link-box" id="profileKeyText" style="word-break:break-all;"></div>
+                <div class="config-actions" style="margin-top: var(--space-sm);">
+                    <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(currentProfileKey)"
+                        style="flex:1">{{ _('copy_key') }}</button>
+                    <button class="btn btn-primary btn-sm" onclick="showProfileQR()" style="flex:1">
+                        {{ _('qr_code_tab') }}
+                    </button>
+                </div>
+            </div>
+
+            <div class="modal-footer" style="flex-wrap:wrap; gap:var(--space-sm);">
+                <button class="btn btn-secondary btn-sm" id="profileResetDeviceBtn"
+                    onclick="resetProfileDevice()" style="display:none;">
+                    {{ _('aivpn_reset_device') }}
+                </button>
+                <button class="btn btn-secondary btn-sm" onclick="editProfileFromModal()">{{ _('edit') }}</button>
+                <button class="btn btn-primary btn-sm" onclick="closeModal('profileModal')">{{ _('close') }}</button>
+            </div>
         </div>
     </div>
 </div>
@@ -935,6 +977,7 @@
         { proto: 'xray', category: 'protocols', icon: '⚡', title: 'Xray (VLESS-Reality)', descKey: 'xray_desc' },
         { proto: 'telemt', category: 'protocols', icon: '✈', title: 'Telemt (Telegram Proxy)', descKey: 'telemt_desc' },
         { proto: 'wireguard', category: 'protocols', icon: '🔒', title: 'WireGuard', descKey: 'wireguard_desc' },
+        { proto: 'aivpn', category: 'protocols', icon: '🧠', title: 'AIVPN', descKey: 'aivpn_desc' },
         { proto: 'dns', category: 'services', icon: '🔍', title: 'AmneziaDNS', descKey: 'dns_desc' },
         { proto: 'adguard', category: 'services', icon: '🛡️', title: 'AdGuard Home', descKey: 'adguard_desc' },
         { proto: 'socks5', category: 'services', icon: '🧦', title: 'SOCKS5 Proxy', descKey: 'socks5_desc' },
@@ -969,7 +1012,7 @@
     }
 
     function isMultiInstanceBase(proto) {
-        return ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'socks5'].includes(protoBase(proto));
+        return ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'].includes(protoBase(proto));
     }
 
     function nextSuggestedPort(base, fallback) {
@@ -1175,6 +1218,7 @@
             case 'xray': title = 'Xray'; break;
             case 'telemt': title = 'Telemt'; break;
             case 'wireguard': title = 'WireGuard'; break;
+            case 'aivpn': title = 'AIVPN'; break;
             case 'dns': title = 'AmneziaDNS'; break;
             case 'socks5': title = 'SOCKS5 Proxy'; break;
             case 'adguard': title = 'AdGuard Home'; break;
@@ -1233,7 +1277,7 @@
 
                 for (const [proto, info] of orderedProtocolEntries(data.protocols)) {
                     updateProtocolCard(proto, info);
-                    const isVPN = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(protoBase(proto));
+                    const isVPN = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard', 'aivpn'].includes(protoBase(proto));
                     if (info.container_running && isVPN) {
                         const opt = document.createElement('option');
                         opt.value = proto;
@@ -1299,7 +1343,7 @@
         if (kind === 'site') return 'htmlmixed';
         const base = protoBase(proto);
         if (base === 'nginx') return 'nginx';
-        if (base === 'xray') return { name: 'javascript', json: true };
+        if (base === 'xray' || base === 'aivpn') return { name: 'javascript', json: true };
         return 'properties';
     }
 
@@ -1746,6 +1790,11 @@
             portHint.textContent = _('nginx_port_hint');
             nginxOpts.style.display = 'block';
             updateNginxDnsHint();
+        } else if (base === 'aivpn') {
+            portLabel.textContent = _('port') + ' (UDP)';
+            portInput.value = currentInstallAnother ? nextSuggestedPort(currentInstallProto, 443) : '443';
+            portInput.disabled = false;
+            portHint.textContent = currentInstallAnother ? _('port_next_instance_hint') : _('aivpn_port_hint');
         } else {
             portLabel.textContent = _('port') + ' (UDP)';
             portInput.value = currentInstallAnother ? nextSuggestedPort(currentInstallProto, 55424) : '55424';
@@ -2025,7 +2074,7 @@
                 const sent = userData.dataSent || '';
                 const initial = name.charAt(0).toUpperCase();
                 const enabled = (client.enabled !== undefined) ? client.enabled : (userData.enabled !== false);
-                const hasPrivKey = !!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt';
+                const hasPrivKey = !!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || protoBase(proto) === 'aivpn';
                 const assignedUser = client.assigned_user || '';
 
                 let metaHtml = '';
@@ -2038,6 +2087,17 @@
                     if (userData.active_ips !== undefined) metaHtml += `<span>📍 ${userData.active_ips} IPs</span>`;
                     if (userData.quota) metaHtml += `<span class="badge" style="font-size:0.65rem;">Quota: ${formatBytes(userData.quota)}</span>`;
                     if (userData.expiry) metaHtml += `<span class="badge" style="font-size:0.65rem;">⌛ ${formatDate(userData.expiry)}</span>`;
+                } else if (protoBase(proto) === 'aivpn') {
+                    if (userData.vpnIp) metaHtml += `<span>🌐 ${escapeHtml(userData.vpnIp)}</span>`;
+                    if (handshake) metaHtml += `<span>🤝 ${formatDate(handshake)}</span>`;
+                    if (received) metaHtml += `<span class="traffic-badge traffic-down">↓ ${received}</span>`;
+                    if (sent) metaHtml += `<span class="traffic-badge traffic-up">↑ ${sent}</span>`;
+                    if (userData.oneTime) {
+                        metaHtml += userData.deviceBound
+                            ? `<span class="badge badge-info" style="font-size:0.65rem;">🔗 ${_('aivpn_device_bound')}</span>`
+                            : `<span class="badge badge-warn" style="font-size:0.65rem;">🔓 ${_('aivpn_awaiting_device')}</span>`;
+                    }
+                    if (userData.expiresAt) metaHtml += `<span class="badge" style="font-size:0.65rem;">⌛ ${formatDate(userData.expiresAt)}</span>`;
                 } else {
                     if (handshake) metaHtml += `<span>🤝 ${handshake}</span>`;
                     if (received) metaHtml += `<span class="traffic-badge traffic-down">↓ ${received}</span>`;
@@ -2063,8 +2123,9 @@
                             </div>
                         </div>
                         <div class="client-actions">
-                            <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt'})" title="${_('config')}">📄</button>
-                            ${proto === 'telemt' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
+                            ${protoBase(proto) === 'aivpn' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="showProfile('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('profile')}">👁</button>` : ''}
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || protoBase(proto) === 'aivpn'})" title="${_('config')}">📄</button>
+                            ${(proto === 'telemt' || protoBase(proto) === 'aivpn') ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="toggleConnection('${escapeJs(client.clientId)}', ${!enabled})" title="${toggleTitle}">${toggleIcon}</button>
                             <button class="btn btn-danger btn-sm btn-icon" onclick="removeConnection('${escapeJs(client.clientId)}')" title="${_('delete')}">🗑</button>
                         </div>
@@ -2099,6 +2160,15 @@
                 params.telemt_ad_tag = document.getElementById('telemtAdTag').value || null;
                 params.telemt_max_conns = parseInt(document.getElementById('telemtMaxConns').value) || null;
                 if (isEditingConn) params.client_id = editingClientId;
+            } else if (protoBase(proto) === 'aivpn') {
+                // Always send the expiry field: an empty string clears it,
+                // which is how the operator removes a previously set expiry.
+                params.aivpn_expiry = document.getElementById('aivpnExpiry').value || '';
+                params.aivpn_one_time = document.getElementById('aivpnOneTime').checked;
+                if (isEditingConn) {
+                    params.client_id = editingClientId;
+                    params.name = connName;
+                }
             }
             const result = await apiCall(isEditingConn ? `/api/servers/${SERVER_ID}/connections/edit` : `/api/servers/${SERVER_ID}/connections/add`, 'POST', params);
             if (isEditingConn) {
@@ -2115,8 +2185,8 @@
                     document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName}`;
                     document.getElementById('configText').textContent = result.config;
                     document.getElementById('vpnLinkText').textContent = currentVpnLink;
-                    document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
-                    document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
+                    document.getElementById('panel-vpn').style.display = ((proto === 'telemt' || protoBase(proto) === 'aivpn') ? 'none' : '');
+                    document.querySelectorAll('.config-tab')[1].style.display = ((proto === 'telemt' || protoBase(proto) === 'aivpn') ? 'none' : '');
                     switchConfigTab('conf');
                     openModal('configModal');
                     generateQR(result.config);
@@ -2139,10 +2209,33 @@
         isEditingConn = isEdit;
         const proto = document.getElementById('connProtoSelect').value;
         const telemtOpts = document.getElementById('telemtConnOptions');
+        const aivpnOpts = document.getElementById('aivpnConnOptions');
+        const isAivpn = protoBase(proto) === 'aivpn';
 
         document.getElementById('addConnectionModalTitle').textContent = isEdit ? _('edit_connection') : _('add_connection');
         document.getElementById('addConnBtnText').textContent = isEdit ? _('save') : _('create');
-        document.getElementById('connectionNameGroup').style.display = isEdit ? 'none' : 'block';
+        // AIVPN profiles can be renamed in place, so keep the name field
+        // visible when editing them.
+        document.getElementById('connectionNameGroup').style.display = (isEdit && !isAivpn) ? 'none' : 'block';
+        // Assigning to a panel user only makes sense when creating.
+        const userGroup = document.getElementById('connectionUserId').closest('.form-group');
+        if (userGroup) userGroup.style.display = isEdit ? 'none' : '';
+
+        if (aivpnOpts) {
+            aivpnOpts.style.display = isAivpn ? 'block' : 'none';
+            if (isAivpn) {
+                if (isEdit && clientData) {
+                    editingClientId = clientData.clientId || editingClientId;
+                    document.getElementById('connectionName').value = clientData.clientName || '';
+                    document.getElementById('aivpnExpiry').value = toDatetimeLocal(clientData.expiresAt);
+                    document.getElementById('aivpnOneTime').checked = !!clientData.oneTime;
+                } else {
+                    document.getElementById('connectionName').value = '';
+                    document.getElementById('aivpnExpiry').value = '';
+                    document.getElementById('aivpnOneTime').checked = false;
+                }
+            }
+        }
 
         if (proto === 'telemt') {
             telemtOpts.style.display = 'block';
@@ -2170,10 +2263,18 @@
 
     function editConnection(clientId) {
         const userData = window.connectionsStore[clientId];
-        if (userData) {
-            userData.clientName = clientId;
-            openAddConnectionModal(true, userData);
+        if (!userData) return;
+        const proto = document.getElementById('connProtoSelect').value;
+        if (protoBase(proto) === 'aivpn') {
+            // AIVPN addresses profiles by their stable id, and the name is a
+            // separate editable field — unlike Telemt below, where the client
+            // name *is* the identifier.
+            editingClientId = clientId;
+            openAddConnectionModal(true, Object.assign({}, userData, { clientId: clientId }));
+            return;
         }
+        userData.clientName = clientId;
+        openAddConnectionModal(true, userData);
     }
 
     async function removeConnection(clientId) {
@@ -2194,9 +2295,9 @@
         const proto = document.getElementById('connProtoSelect').value;
 
         // Restore tabs visibility first
-        document.getElementById('panel-vpn').style.display = (proto === 'telemt' ? 'none' : '');
+        document.getElementById('panel-vpn').style.display = ((proto === 'telemt' || protoBase(proto) === 'aivpn') ? 'none' : '');
         document.getElementById('panel-qr').style.display = '';
-        document.querySelectorAll('.config-tab')[1].style.display = (proto === 'telemt' ? 'none' : '');
+        document.querySelectorAll('.config-tab')[1].style.display = ((proto === 'telemt' || protoBase(proto) === 'aivpn') ? 'none' : '');
         document.querySelectorAll('.config-tab')[2].style.display = '';
 
         // Client was created via native Amnezia app — private key is not stored server-side
@@ -2232,6 +2333,121 @@
                 openModal('configModal');
                 generateQR(result.config);
             }
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    // ========== AIVPN Profile ==========
+    let currentProfileKey = '';
+    let currentProfileId = '';
+    let currentProfileName = '';
+
+    function toDatetimeLocal(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        if (isNaN(d)) return '';
+        // <input type="datetime-local"> wants local wall-clock time, no zone.
+        const pad = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function formatDateTime(iso) {
+        if (!iso) return '—';
+        const d = new Date(iso);
+        if (isNaN(d)) return iso;
+        return d.toLocaleString();
+    }
+
+    async function showProfile(clientId, connName) {
+        currentProfileId = clientId;
+        currentProfileName = connName;
+        currentProfileKey = '';
+        const proto = document.getElementById('connProtoSelect').value;
+        document.getElementById('profileModalTitle').textContent = `${_('profile')} — ${connName}`;
+        document.getElementById('profileBody').style.display = 'none';
+        document.getElementById('profileLoading').style.display = '';
+        openModal('profileModal');
+        try {
+            const p = await apiCall(`/api/servers/${SERVER_ID}/connections/details`, 'POST', {
+                protocol: proto, client_id: clientId,
+            });
+            const u = p.userData || {};
+            currentProfileKey = p.config || '';
+            // Keep the list's cached copy in sync so a follow-up Edit opens
+            // with the values we just fetched.
+            if (window.connectionsStore) window.connectionsStore[clientId] = u;
+
+            const row = (label, value) =>
+                `<div class="protocol-info-item"><span class="protocol-info-label">${label}</span><span class="protocol-info-value">${value}</span></div>`;
+            let grid = '';
+            grid += row(_('status'), p.enabled
+                ? `<span class="badge badge-success"><span class="badge-dot"></span> ${_('run')}</span>`
+                : `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('stop')}</span>`);
+            if (u.vpnIp) grid += row(_('aivpn_vpn_ip'), escapeHtml(u.vpnIp));
+            if (p.assigned_user) grid += row(_('assign_to_user'), `👤 ${escapeHtml(p.assigned_user)}`);
+            grid += row(_('created'), formatDateTime(u.creationDate));
+            grid += row(_('aivpn_last_seen'), formatDateTime(u.latestHandshake));
+            grid += row(_('traffic'), `↓ ${u.dataReceived || '0 B'} · ↑ ${u.dataSent || '0 B'}`);
+            grid += row(_('aivpn_total_connections'), u.totalConnections || 0);
+            grid += row(_('aivpn_expiry'), u.expiresAt ? formatDateTime(u.expiresAt) : _('aivpn_no_expiry'));
+            grid += row(_('aivpn_device_binding'), u.oneTime
+                ? (u.deviceBound
+                    ? `<span class="badge badge-info">🔗 ${_('aivpn_device_bound')}</span>`
+                    : `<span class="badge badge-warn">🔓 ${_('aivpn_awaiting_device')}</span>`)
+                : _('aivpn_binding_off'));
+            document.getElementById('profileInfoGrid').innerHTML = grid;
+
+            document.getElementById('profileKeyText').textContent = currentProfileKey || _('config_unavailable');
+            // Re-enrollment only matters once a device is actually bound.
+            document.getElementById('profileResetDeviceBtn').style.display = u.deviceBound ? '' : 'none';
+
+            document.getElementById('profileLoading').style.display = 'none';
+            document.getElementById('profileBody').style.display = '';
+        } catch (err) {
+            document.getElementById('profileLoading').style.display = 'none';
+            closeModal('profileModal');
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    function showProfileQR() {
+        if (!currentProfileKey) {
+            showToast(_('config_unavailable'), 'error');
+            return;
+        }
+        currentConfig = currentProfileKey;
+        currentVpnLink = '';
+        currentConfigName = (currentProfileName || 'profile').replace(/\s+/g, '_');
+        closeModal('profileModal');
+        document.getElementById('configModalTitle').textContent = `${_('config')} — ${currentProfileName}`;
+        document.getElementById('configText').textContent = currentProfileKey;
+        document.getElementById('panel-vpn').style.display = 'none';
+        document.querySelectorAll('.config-tab')[1].style.display = 'none';
+        document.getElementById('panel-qr').style.display = '';
+        document.querySelectorAll('.config-tab')[2].style.display = '';
+        switchConfigTab('qr');
+        openModal('configModal');
+        generateQR(currentProfileKey);
+    }
+
+    function editProfileFromModal() {
+        const cached = (window.connectionsStore || {})[currentProfileId] || {};
+        closeModal('profileModal');
+        editingClientId = currentProfileId;
+        openAddConnectionModal(true, Object.assign({}, cached, { clientId: currentProfileId }));
+    }
+
+    async function resetProfileDevice() {
+        if (!confirm(_('aivpn_reset_device_confirm'))) return;
+        const proto = document.getElementById('connProtoSelect').value;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/connections/reset-device`, 'POST', {
+                protocol: proto, client_id: currentProfileId,
+            });
+            showToast(_('aivpn_reset_device_done'), 'success');
+            await showProfile(currentProfileId, currentProfileName);
+            loadConnections();
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
         }

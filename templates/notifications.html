@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block title_extra %} — Уведомления{% endblock %}
+
+{% block content %}
+<div class="section-title"><span class="icon">🔔</span> Уведомления в Telegram</div>
+<div class="card" style="margin-bottom:var(--space-lg);">
+  <h3 class="card-title">Системные тревоги</h3>
+  <p class="form-hint">Проверка серверов выполняется раз в 10 минут. Одна проблема отправляется один раз до её восстановления.</p>
+  <form id="alertsForm" onsubmit="saveAlerts(event)">
+    <div class="form-row"><div class="form-group"><label class="form-label">Chat ID для тревог</label><input id="alertChatId" class="form-input" placeholder="123456789"></div><div class="form-group"><label class="form-label">Порог занятого диска, %</label><input id="diskThreshold" type="number" class="form-input" min="1" max="100" value="90"></div></div>
+    <div class="form-group"><label class="form-label">Недоступен сервер</label><input id="offlineTemplate" class="form-input"></div>
+    <div class="form-group"><label class="form-label">Заканчивается место</label><input id="diskTemplate" class="form-input"></div>
+    <div class="form-group"><label class="form-label">Остановлен протокол</label><input id="protocolTemplate" class="form-input"></div>
+    {% raw %}<p class="form-hint">Переменные: <code>{{server_name}}</code>, <code>{{server_ip}}</code>, <code>{{days_left}}</code>, <code>{{disk_percent}}</code>, <code>{{protocol}}</code>.</p>{% endraw %}
+    <button class="btn btn-secondary" type="submit">Сохранить системные тревоги</button>
+  </form>
+</div>
+<div class="grid" style="display:grid;grid-template-columns:minmax(300px,430px) 1fr;gap:var(--space-lg);align-items:start;">
+  <div class="card">
+    <h3 class="card-title">Новое уведомление</h3>
+    <p class="form-hint">Откройте бота в Telegram и нажмите <code>/start</code>. Затем укажите свой числовой Chat ID.</p>
+    <form id="notificationForm" onsubmit="createNotification(event)">
+      <div class="form-group"><label class="form-label">Сервер для тегов (необязательно)</label><select id="notificationServer" class="form-input"><option value="">Без сервера</option>{% for server in servers %}<option value="{{ loop.index0 }}">{{ server.name }}{% if server.payment_day %} · оплата {{ server.payment_day }} числа{% endif %}</option>{% endfor %}</select></div>
+      <p class="form-hint">Теги сервера: <code>{{ '{{' }}server_name{{ '}}' }}</code>, <code>{{ '{{' }}price{{ '}}' }}</code>, <code>{{ '{{' }}days_left{{ '}}' }}</code>. При ежемесячном повторе дата берётся из дня оплаты.</p>
+      <div class="form-group"><label class="form-label">Chat ID</label><input id="chatId" class="form-input" required placeholder="Например: 123456789"></div>
+      <div class="form-group"><label class="form-label">Текст сообщения</label><textarea id="messageText" class="form-input" rows="5" required placeholder="Напомнить оплатить сервер"></textarea></div>
+      <div class="form-group"><label class="form-label">Дата и время</label><input id="runAt" type="datetime-local" class="form-input" required></div>
+      <div class="form-group"><label class="form-label">Часовой пояс</label><input id="timeZone" class="form-input" value="Europe/Moscow" required></div>
+      <div class="form-group"><label class="form-label">Повтор</label><select id="repeat" class="form-input"><option value="once">Один раз</option><option value="daily">Каждый день</option><option value="weekly">Каждую неделю</option><option value="monthly">Каждый месяц в этот день</option></select></div>
+      <div style="display:flex;gap:var(--space-sm);flex-wrap:wrap;"><button class="btn btn-primary" type="submit">Запланировать</button><button class="btn btn-secondary" type="button" onclick="sendTest()">Отправить тест</button></div>
+    </form>
+  </div>
+  <div class="card"><h3 class="card-title">Запланированные</h3><div id="notificationList" class="empty-state">Загрузка...</div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const form = () => ({ chat_id: chatId.value.trim(), text: messageText.value.trim(), run_at: runAt.value, timezone: timeZone.value.trim(), repeat: repeat.value, server_id: notificationServer.value === '' ? null : parseInt(notificationServer.value) });
+function formatTime(value, tz) { return new Intl.DateTimeFormat('ru-RU', {dateStyle:'medium', timeStyle:'short', timeZone:tz || 'Europe/Moscow'}).format(new Date(value)); }
+function escapeHtml(value) { const d=document.createElement('div'); d.textContent=value; return d.innerHTML; }
+async function loadNotifications() {
+  const res=await fetch('/api/notifications'); const items=await res.json(); const box=document.getElementById('notificationList');
+  if (!items.length) { box.innerHTML='<div class="empty-state">Уведомлений пока нет.</div>'; return; }
+  box.innerHTML=items.map(n => `<div style="padding:var(--space-md) 0;border-bottom:1px solid var(--border-color);"><div style="display:flex;justify-content:space-between;gap:var(--space-md);"><strong>${escapeHtml(n.text)}</strong><span class="badge badge-${n.enabled ? 'success' : 'secondary'}">${n.enabled ? 'Активно' : 'Пауза'}</span></div><div class="form-hint" style="margin-top:var(--space-sm);">${escapeHtml(n.chat_id)} · ${formatTime(n.next_run_at,n.timezone)} · ${n.repeat === 'once' ? 'один раз' : n.repeat === 'daily' ? 'каждый день' : n.repeat === 'weekly' ? 'каждую неделю' : 'каждый месяц'}</div><div style="white-space:pre-wrap;background:var(--bg-primary);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:var(--space-sm);margin-top:var(--space-sm);font-size:.86rem;"><div class="form-hint" style="margin-bottom:4px;">Будет отправлено:</div>${escapeHtml(n.preview_text || n.text)}</div>${n.last_error ? `<div style="color:var(--danger);font-size:.85rem;margin-top:var(--space-xs);">Ошибка: ${escapeHtml(n.last_error)}</div>` : ''}<div style="display:flex;gap:var(--space-sm);margin-top:var(--space-sm);"><button class="btn btn-secondary btn-sm" onclick="toggleNotification('${n.id}',${!n.enabled})">${n.enabled ? 'Пауза' : 'Включить'}</button><button class="btn btn-danger btn-sm" onclick="deleteNotification('${n.id}')">Удалить</button></div></div>`).join('');
+}
+async function loadAlerts(){ const r=await fetch('/api/notifications/alerts'); const a=await r.json(); alertChatId.value=a.chat_id||''; diskThreshold.value=a.disk_threshold||90; offlineTemplate.value=a.server_offline_template||''; diskTemplate.value=a.disk_full_template||''; protocolTemplate.value=a.protocol_stopped_template||''; }
+async function saveAlerts(e){ e.preventDefault(); const body={chat_id:alertChatId.value.trim(),disk_threshold:parseInt(diskThreshold.value)||90,server_offline_template:offlineTemplate.value, disk_full_template:diskTemplate.value, protocol_stopped_template:protocolTemplate.value}; const r=await fetch('/api/notifications/alerts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const d=await r.json(); showToast(r.ok?'Системные тревоги сохранены':(d.error||'Ошибка'),r.ok?'success':'error'); }
+async function createNotification(event) { event.preventDefault(); const res=await fetch('/api/notifications',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(form())}); const data=await res.json(); if(!res.ok){showToast(data.error||'Ошибка','error');return;} showToast('Уведомление запланировано','success'); messageText.value=''; loadNotifications(); }
+async function sendTest(){ const res=await fetch('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(form())}); const data=await res.json(); showToast(res.ok?'Тестовое сообщение отправлено':(data.error||'Ошибка'),res.ok?'success':'error'); }
+async function toggleNotification(id,enabled){ await fetch(`/api/notifications/${id}/toggle`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})}); loadNotifications(); }
+async function deleteNotification(id){ if(!confirm('Удалить уведомление?'))return; await fetch(`/api/notifications/${id}`,{method:'DELETE'}); loadNotifications(); }
+runAt.value = new Date(Date.now()+5*60000).toISOString().slice(0,16); loadNotifications(); loadAlerts();
+</script>
+{% endblock %}

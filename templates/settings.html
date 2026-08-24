@@ -829,7 +829,11 @@
         btn.disabled = true;
         spinner.classList.remove('hidden');
         try {
-            const res = await fetch('/api/settings/telegram/toggle', { method: 'POST' });
+            const res = await fetch('/api/settings/telegram/toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token: document.getElementById('tg_token').value.trim() })
+            });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || _('error'));
             const running = data.bot_running;
