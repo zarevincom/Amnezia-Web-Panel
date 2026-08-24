@@ -1858,6 +1858,16 @@ async def startup():
         changed = True
         logger.info("Initialised empty notifications collection")
 
+    # Backfill profiles created by the public self-service station before the
+    # shared-connections link was introduced.
+    for claim in data.get('invite_claims', []):
+        if any(c.get('invite_claim_id') == claim.get('id') for c in data.get('user_connections', [])):
+            continue
+        owner_id = claim.get('owner_id') or f"legacy-{claim.get('id', '')}"
+        guest = _ensure_invite_guest(data, owner_id)
+        data['user_connections'].append({'id': str(uuid.uuid4()), 'user_id': guest['id'], 'server_id': claim['server_id'], 'protocol': claim['protocol'], 'client_id': claim['client_id'], 'name': claim.get('device_name', 'Self-service profile'), 'invite_claim_id': claim['id'], 'created_at': claim.get('created_at', datetime.now(timezone.utc).isoformat())})
+        changed = True
+
     # SSL settings migration
     if 'ssl' not in data.get('settings', {}):
         if 'settings' not in data: data['settings'] = {}
@@ -3916,6 +3926,8 @@ async def api_my_connections(request: Request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     conns = [c for c in data.get('user_connections', []) if c['user_id'] == user['id']]
+    if user.get('role') in ('admin', 'support'):
+        conns += [c for c in data.get('user_connections', []) if c.get('invite_claim_id')]
     for c in conns:
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
@@ -4202,18 +4214,17 @@ async def api_claim(token: str, payload: ClaimRequest, request: Request):
     data.setdefault('user_connections', []).append({'id': str(uuid.uuid4()), 'user_id': guest['id'], 'server_id': invite['server_id'], 'protocol': invite['protocol'], 'client_id': client_id, 'name': name, 'invite_claim_id': claim['id'], 'created_at': claim['created_at']})
     invite['claims_count']+=1; _audit(data,'invite_claimed',invite_id=invite['id'],claim_id=claim['id']); save_data(data)
     request.session['claim_session_' + _invite_hash(token)] = claim['id']
-    return {'claim_id':claim['id'],'config':config,'vpn_link':generate_vpn_link(config),'expires_at':invite.get('profile_expires_at'),'can_reissue':invite.get('max_reissues',0)>0}
+    return {'claim_id':claim['id'],'config':config,'filename':name + '.conf','vpn_link':generate_vpn_link(config),'expires_at':invite.get('profile_expires_at'),'can_reissue':invite.get('max_reissues',0)>0}
 
 
 @app.get('/api/claim/{token}/profiles', tags=["Invites"])
 async def api_claim_profiles(token: str, request: Request):
     data = load_data(); invite = _find_invite(data, token)
-    owner_id = request.session.get('claim_owner_' + _invite_hash(token))
-    if not invite or not owner_id:
+    if not invite or not invite.get('enabled'):
         return {'profiles': []}
     profiles = []
     for claim in data.get('invite_claims', []):
-        if claim.get('invite_id') != invite['id'] or claim.get('owner_id') != owner_id:
+        if claim.get('invite_id') != invite['id']:
             continue
         try:
             server = data['servers'][claim['server_id']]
@@ -4223,7 +4234,7 @@ async def api_claim_profiles(token: str, request: Request):
             config = _manager_call(manager, 'get_client_config', claim['protocol'], claim['client_id'], server['host'], port)
             ssh.disconnect()
             if config:
-                profiles.append({'id': claim['id'], 'name': claim['device_name'], 'protocol': claim['protocol'], 'server': server.get('name') or server['host'], 'expires_at': invite.get('profile_expires_at'), 'config': config, 'vpn_link': generate_vpn_link(config), 'can_reissue': claim.get('reissues', 0) < invite.get('max_reissues', 0)})
+                profiles.append({'id': claim['id'], 'name': claim['device_name'], 'filename': claim['device_name'] + '.conf', 'protocol': claim['protocol'], 'server': server.get('name') or server['host'], 'expires_at': invite.get('profile_expires_at'), 'config': config, 'vpn_link': generate_vpn_link(config), 'can_reissue': claim.get('reissues', 0) < invite.get('max_reissues', 0)})
         except Exception:
             logger.warning('Could not load claim profile %s', claim['id'])
     return {'profiles': profiles}
@@ -4232,7 +4243,6 @@ async def api_claim_profiles(token: str, request: Request):
 @app.post('/api/claim/{token}/{claim_id}/reissue', tags=["Invites"])
 async def api_reissue_claim(token: str, claim_id: str, payload: ClaimRequest, request: Request):
     if not _claim_rate_allowed(request, token): return _public_error('Too many attempts')
-    if request.session.get('claim_session_' + _invite_hash(token)) != claim_id: return _public_error()
     data=load_data(); invite=_find_invite(data,token); claim=next((c for c in data.get('invite_claims',[]) if c['id']==claim_id),None)
     if not invite or not claim or claim.get('invite_id') != invite['id'] or not invite.get('enabled'): return _public_error()
     if claim.get('reissues',0) >= invite.get('max_reissues',0): return _public_error('Reissue limit reached')
@@ -4250,7 +4260,7 @@ async def api_reissue_claim(token: str, claim_id: str, payload: ClaimRequest, re
         if connection.get('invite_claim_id') == claim['id']:
             connection.update({'client_id': client_id, 'name': claim['device_name'], 'updated_at': claim['last_reissue_at']})
     _audit(data,'invite_reissued',invite_id=invite['id'],claim_id=claim['id']); save_data(data)
-    return {'claim_id':claim['id'],'config':config,'vpn_link':generate_vpn_link(config),'can_reissue':claim['reissues'] < invite.get('max_reissues',0)}
+    return {'claim_id':claim['id'],'config':config,'filename':claim['device_name'] + '.conf','vpn_link':generate_vpn_link(config),'can_reissue':claim['reissues'] < invite.get('max_reissues',0)}
 
 
 @app.post('/api/notifications/alerts', tags=["Notifications"])
