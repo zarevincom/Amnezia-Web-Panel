@@ -100,6 +100,7 @@ Configuration panel for system parameters and preferences:
 *   **📤 Data Interoperability**:
     *   **Remnawave Sync**: Automatically import and sync users from Remnawave.
     *   **Simple Backup**: Effortless JSON-based export and restore of all panel data.
+    *   **Profile transfer between VPS**: Move an individual client to another managed VPS with the same protocol installed. The panel creates the replacement profile first, removes the source profile only after success, updates linked users and self-service claims, and records the action in the audit log.
     *   **Backup / Migrate protocols (Alpha)**: Move protocol configurations between nodes for maintenance, recovery, and migration workflows.
 *   **🔗 Public Sharing**:
     *   Generate password-protected links for users to download their configurations without panel access.
@@ -200,7 +201,7 @@ Routes are grouped in the docs as:
 | **Authentication** | Login, captcha, session lifecycle. |
 | **Servers** | Server inventory & host-level operations (add/edit/delete, ping, reorder, reboot, clear, stats). |
 | **Protocols** | Install / uninstall / container / raw-config editing for every protocol & service on a server. |
-| **Connections** | Per-protocol VPN client connections (CRUD, enable/disable, fetch config). |
+| **Connections** | Per-protocol VPN client connections (CRUD, enable/disable, fetch config, transfer a profile to another managed VPS). |
 | **Users** | Panel user accounts and the connections assigned to them. |
 | **Self-service** | Endpoints called by a regular user for their own data (`/api/my/*`). |
 | **Sharing** | Public, token-protected configuration sharing — no panel session required. |
@@ -223,6 +224,24 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 # Cheap reachability probe for monitoring
 curl -H "Authorization: Bearer $TOKEN" http://your-panel:5000/api/servers/0/ping
 ```
+
+### Profile Transfer Between VPS
+
+An administrator can transfer an individual client profile from one managed VPS
+to another through the connection card in the server UI or through the API:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"protocol":"awg","client_id":"CLIENT_PUBLIC_KEY","target_server_id":1}' \
+  http://your-panel:5000/api/servers/0/connections/transfer
+```
+
+The source and target must be different managed servers and the target must
+already have the same protocol installed. Supported profile protocols are
+AmneziaWG variants, WireGuard, Xray, Telemt, and AIVPN. The target profile is
+created before the source profile is removed; a failed source removal triggers
+a rollback of the target client. The response includes the new configuration,
+which must replace the old one on the user's device.
 
 ### Technology Stack
 *   **Backend**: FastAPI (Python), `asyncio` for concurrent SSH/probe work

@@ -440,5 +440,13 @@
   "backup_created": "Backup created",
   "no_backups": "No backups yet",
   "no_backups_desc": "Create the first backup for this protocol.",
-  "refresh": "Refresh"
+  "refresh": "Refresh",
+  "transfer_connection": "Transfer profile",
+  "transfer_target_server": "Target VPS",
+  "transfer_protocol_hint": "Only servers with the same installed protocol are available.",
+  "transfer_warning": "A new configuration will be created on the target server, then the source profile will be removed. Download the new configuration after transfer.",
+  "transfer_no_targets": "No other server has the selected protocol installed.",
+  "transfer_confirm": "Transfer profile “{}” to the selected VPS? The old configuration will stop working.",
+  "transferring_connection": "Transferring...",
+  "connection_transferred": "Profile transferred successfully"
 }

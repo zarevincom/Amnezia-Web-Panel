@@ -57,7 +57,7 @@ OPENAPI_TAGS = [
     {"name": "Authentication", "description": "Login, captcha, and session lifecycle."},
     {"name": "Servers", "description": "Server inventory, lifecycle and host-level operations (add, edit, delete, ping, reorder, reboot, clear, stats, status check)."},
     {"name": "Protocols", "description": "Install, uninstall, container start/stop and raw config editing for the protocols/services on a server (AWG, Xray, WireGuard, Telemt, AmneziaDNS, AdGuard Home, SOCKS5)."},
-    {"name": "Connections", "description": "Per-protocol VPN client connections on a server (CRUD plus enable/disable and config retrieval)."},
+    {"name": "Connections", "description": "Per-protocol VPN client connections on a server: CRUD, enable/disable, config retrieval, and safe transfer between managed VPS running the same protocol."},
     {"name": "Users", "description": "Panel user accounts and the connections assigned to them."},
     {"name": "Self-service", "description": "Endpoints called by a regular user for their own data (the /my surface)."},
     {"name": "Sharing", "description": "Public, token-protected configuration sharing for end users — no panel session required."},
@@ -85,7 +85,7 @@ async def custom_redoc():
     the page hang for some users)."""
     from fastapi.openapi.docs import get_redoc_html
     response = get_redoc_html(
-        openapi_url=(app.openapi_url or "/openapi.json") + "?v=invites-1",
+        openapi_url=(app.openapi_url or "/openapi.json") + "?v=transfer-1",
         title=f"{app.title} — ReDoc",
         redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
         with_google_fonts=False,
@@ -1624,6 +1624,11 @@ class ConnectionActionRequest(BaseModel):
     client_id: str = ''
 
 
+class TransferConnectionRequest(ConnectionActionRequest):
+    """Move one client to a server that already runs the same protocol."""
+    target_server_id: int
+
+
 class ToggleConnectionRequest(BaseModel):
     protocol: str = 'awg'
     client_id: str = ''
@@ -2270,7 +2275,23 @@ async def server_detail(request: Request, server_id: int):
         return RedirectResponse(url='/')
     server = data['servers'][server_id]
     users_list = data.get('users', [])
-    return tpl(request, 'server.html', server=server, server_id=server_id, users=users_list)
+    transfer_targets = [
+        {
+            'id': index,
+            'name': item.get('name') or item.get('host') or f'Server {index + 1}',
+            'protocols': list((item.get('protocols') or {}).keys()),
+        }
+        for index, item in enumerate(data.get('servers', []))
+        if index != server_id
+    ]
+    return tpl(
+        request,
+        'server.html',
+        server=server,
+        server_id=server_id,
+        users=users_list,
+        transfer_targets=transfer_targets,
+    )
 
 
 @app.get('/users', response_class=HTMLResponse, tags=["System Templates"])
@@ -3445,6 +3466,173 @@ async def api_remove_connection(request: Request, server_id: int, req: Connectio
     except Exception as e:
         logger.exception("Error removing connection")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/connections/transfer', tags=["Connections"])
+async def api_transfer_connection(request: Request, server_id: int, req: TransferConnectionRequest):
+    """Move a VPN client to another managed VPS running the same protocol.
+
+    The target client is created before the source client is removed. If source
+    removal fails, the new target client is removed as a rollback so the panel
+    never reports a successful move while two active profiles exist.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(req.protocol) not in {'awg', 'awg2', 'awg_legacy', 'wireguard', 'xray', 'telemt', 'aivpn'}:
+        return JSONResponse({'error': 'This protocol does not support profile transfer'}, status_code=400)
+    if not req.client_id:
+        return JSONResponse({'error': 'Client ID is required'}, status_code=400)
+    if req.target_server_id == server_id:
+        return JSONResponse({'error': 'Choose a different target server'}, status_code=400)
+
+    source_ssh = None
+    target_ssh = None
+    new_client_id = None
+    try:
+        async with DATA_LOCK:
+            data = load_data()
+            if not 0 <= server_id < len(data['servers']):
+                return JSONResponse({'error': 'Source server not found'}, status_code=404)
+            if not 0 <= req.target_server_id < len(data['servers']):
+                return JSONResponse({'error': 'Target server not found'}, status_code=404)
+
+            source_server = data['servers'][server_id]
+            target_server = data['servers'][req.target_server_id]
+            if req.protocol not in (target_server.get('protocols') or {}):
+                return JSONResponse({'error': 'The selected server does not have this protocol installed'}, status_code=400)
+
+            source_ssh = get_ssh(source_server)
+            await asyncio.to_thread(source_ssh.connect)
+            source_manager = get_protocol_manager(source_ssh, req.protocol)
+            source_clients = await asyncio.to_thread(_manager_call, source_manager, 'get_clients', req.protocol)
+            source_client = next((item for item in source_clients if item.get('clientId') == req.client_id), None)
+            if not source_client:
+                return JSONResponse({'error': 'Connection was not found on the source server'}, status_code=404)
+
+            source_data = source_client.get('userData') or {}
+            connection = next(
+                (
+                    item for item in data.get('user_connections', [])
+                    if item.get('server_id') == server_id
+                    and item.get('protocol') == req.protocol
+                    and item.get('client_id') == req.client_id
+                ),
+                None,
+            )
+            client_name = source_data.get('clientName') or source_client.get('clientName') or (connection or {}).get('name') or req.client_id
+            enabled = source_client.get('enabled', source_data.get('enabled', True))
+
+            target_ssh = get_ssh(target_server)
+            await asyncio.to_thread(target_ssh.connect)
+            target_manager = get_protocol_manager(target_ssh, req.protocol)
+            target_clients = await asyncio.to_thread(_manager_call, target_manager, 'get_clients', req.protocol)
+            if any(
+                (item.get('userData') or {}).get('clientName') == client_name
+                or item.get('clientName') == client_name
+                for item in target_clients
+            ):
+                return JSONResponse({'error': 'A connection with this name already exists on the target server'}, status_code=409)
+
+            target_port = (target_server.get('protocols') or {}).get(req.protocol, {}).get('port', '55424')
+            base_protocol = protocol_base(req.protocol)
+            if base_protocol == 'wireguard':
+                result = await asyncio.to_thread(target_manager.add_client, client_name, target_server['host'])
+            elif base_protocol == 'telemt':
+                result = await asyncio.to_thread(
+                    _manager_call,
+                    target_manager,
+                    'add_client',
+                    req.protocol,
+                    client_name,
+                    target_server['host'],
+                    target_port,
+                    telemt_quota=source_data.get('quota'),
+                    telemt_expiry=source_data.get('expiry'),
+                    secret=source_data.get('token'),
+                )
+            elif base_protocol == 'aivpn':
+                result = await asyncio.to_thread(
+                    _manager_call,
+                    target_manager,
+                    'add_client',
+                    req.protocol,
+                    client_name,
+                    target_server['host'],
+                    target_port,
+                    expires_at=normalize_rfc3339(source_data.get('expiresAt')),
+                    one_time=bool(source_data.get('oneTime')),
+                )
+            else:
+                result = await asyncio.to_thread(
+                    _manager_call,
+                    target_manager,
+                    'add_client',
+                    req.protocol,
+                    client_name,
+                    target_server['host'],
+                    target_port,
+                )
+
+            if not isinstance(result, dict) or not result.get('client_id'):
+                raise RuntimeError('Target server did not return the new client identifier')
+            new_client_id = result['client_id']
+            if not enabled:
+                try:
+                    await asyncio.to_thread(_manager_call, target_manager, 'toggle_client', req.protocol, new_client_id, False)
+                except Exception as disable_error:
+                    await asyncio.to_thread(_manager_call, target_manager, 'remove_client', req.protocol, new_client_id)
+                    raise RuntimeError('Could not preserve the disabled state of the profile') from disable_error
+
+            try:
+                await asyncio.to_thread(_manager_call, source_manager, 'remove_client', req.protocol, req.client_id)
+            except Exception as remove_error:
+                try:
+                    await asyncio.to_thread(_manager_call, target_manager, 'remove_client', req.protocol, new_client_id)
+                except Exception:
+                    logger.exception('Failed to roll back target client %s after source removal failure', new_client_id)
+                raise RuntimeError('Could not remove the source profile; the transfer was rolled back') from remove_error
+
+            for item in data.get('user_connections', []):
+                if (item.get('server_id') == server_id and item.get('protocol') == req.protocol
+                        and item.get('client_id') == req.client_id):
+                    item.update({
+                        'server_id': req.target_server_id,
+                        'client_id': new_client_id,
+                        'name': client_name,
+                        'transferred_at': datetime.now(timezone.utc).isoformat(),
+                    })
+            for claim in data.get('invite_claims', []):
+                if (claim.get('server_id') == server_id and claim.get('protocol') == req.protocol
+                        and claim.get('client_id') == req.client_id):
+                    claim.update({'server_id': req.target_server_id, 'client_id': new_client_id})
+            _audit(
+                data,
+                'connection_transferred',
+                source_server_id=server_id,
+                target_server_id=req.target_server_id,
+                protocol=req.protocol,
+                source_client_id=req.client_id,
+                target_client_id=new_client_id,
+                client_name=client_name,
+            )
+            save_data(data)
+            config = result.get('config') or ''
+            return {
+                'status': 'success',
+                'client_id': new_client_id,
+                'server_id': req.target_server_id,
+                'name': client_name,
+                'config': config or '',
+                'vpn_link': generate_vpn_link(config) if config else '',
+            }
+    except Exception as e:
+        logger.exception('Error transferring connection')
+        return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if target_ssh:
+            await asyncio.to_thread(target_ssh.disconnect)
+        if source_ssh:
+            await asyncio.to_thread(source_ssh.disconnect)
 
 
 @app.post('/api/servers/{server_id}/connections/edit', tags=["Connections"])

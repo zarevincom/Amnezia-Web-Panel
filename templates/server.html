@@ -832,6 +832,30 @@
     </div>
 </div>
 
+<!-- ===== Transfer Connection Modal ===== -->
+<div class="modal-backdrop" id="transferConnectionModal">
+    <div class="modal" style="max-width: 520px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _('transfer_connection') }}</h2>
+            <button class="modal-close" onclick="closeModal('transferConnectionModal')">×</button>
+        </div>
+        <p class="form-hint" id="transferConnectionHint"></p>
+        <div class="form-group">
+            <label class="form-label" for="transferTargetServer">{{ _('transfer_target_server') }}</label>
+            <select class="form-select" id="transferTargetServer"></select>
+            <div class="form-hint">{{ _('transfer_protocol_hint') }}</div>
+        </div>
+        <div class="form-hint" style="margin-bottom: var(--space-md);">{{ _('transfer_warning') }}</div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('transferConnectionModal')">{{ _('cancel') }}</button>
+            <button class="btn btn-primary" onclick="transferConnection()" id="transferConnectionBtn">
+                <span id="transferConnectionBtnText">{{ _('transfer_connection') }}</span>
+                <div class="spinner hidden" id="transferConnectionSpinner"></div>
+            </button>
+        </div>
+    </div>
+</div>
+
 <!-- ===== AIVPN Profile Modal ===== -->
 <div class="modal-backdrop" id="profileModal">
     <div class="modal" style="max-width: 560px;">
@@ -970,6 +994,7 @@
 <script>
     const SERVER_ID = {{ server_id }};
     const SERVER_HOST = "{{ server.host }}";
+    const TRANSFER_TARGETS = {{ transfer_targets | tojson }};
     const MARKETPLACE_APPS = [
         { proto: 'awg2', category: 'protocols', icon: '✨', title: 'AmneziaWG 2.0', descKey: 'awg_desc', badge: 'NEW' },
         { proto: 'awg', category: 'protocols', icon: '🔮', title: 'AmneziaWG', descKey: 'awg_desc' },
@@ -2125,6 +2150,7 @@
                         <div class="client-actions">
                             ${protoBase(proto) === 'aivpn' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="showProfile('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('profile')}">👁</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || protoBase(proto) === 'aivpn'})" title="${_('config')}">📄</button>
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="openTransferConnectionModal('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('transfer_connection')}">⇄</button>
                             ${(proto === 'telemt' || protoBase(proto) === 'aivpn') ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="toggleConnection('${escapeJs(client.clientId)}', ${!enabled})" title="${toggleTitle}">${toggleIcon}</button>
                             <button class="btn btn-danger btn-sm btn-icon" onclick="removeConnection('${escapeJs(client.clientId)}')" title="${_('delete')}">🗑</button>
@@ -2288,6 +2314,67 @@
             loadConnections();
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    let transferConnectionData = null;
+
+    function openTransferConnectionModal(clientId, name) {
+        const protocol = document.getElementById('connProtoSelect').value;
+        const targets = TRANSFER_TARGETS.filter((server) => server.protocols.includes(protocol));
+        if (!targets.length) {
+            showToast(_('transfer_no_targets'), 'info');
+            return;
+        }
+        transferConnectionData = {clientId, name, protocol};
+        document.getElementById('transferConnectionHint').textContent =
+            `${name} · ${protocol.toUpperCase()}`;
+        document.getElementById('transferTargetServer').innerHTML = targets.map((server) =>
+            `<option value="${server.id}">${escapeHtml(server.name)}</option>`
+        ).join('');
+        openModal('transferConnectionModal');
+    }
+
+    async function transferConnection() {
+        if (!transferConnectionData) return;
+        const targetServerId = Number(document.getElementById('transferTargetServer').value);
+        if (!confirm(_('transfer_confirm').replace('{}', transferConnectionData.name))) return;
+
+        const button = document.getElementById('transferConnectionBtn');
+        button.disabled = true;
+        document.getElementById('transferConnectionBtnText').textContent = _('transferring_connection');
+        document.getElementById('transferConnectionSpinner').classList.remove('hidden');
+        try {
+            const result = await apiCall(`/api/servers/${SERVER_ID}/connections/transfer`, 'POST', {
+                protocol: transferConnectionData.protocol,
+                client_id: transferConnectionData.clientId,
+                target_server_id: targetServerId,
+            });
+            closeModal('transferConnectionModal');
+            showToast(_('connection_transferred'), 'success');
+            loadConnections();
+
+            if (result.config) {
+                currentConfig = result.config;
+                currentVpnLink = result.vpn_link || '';
+                currentConfigName = (result.name || transferConnectionData.name).replace(/\s+/g, '_');
+                document.getElementById('configModalTitle').textContent = `${_('config')} — ${result.name || transferConnectionData.name}`;
+                document.getElementById('configText').textContent = result.config;
+                document.getElementById('vpnLinkText').textContent = currentVpnLink;
+                document.getElementById('panel-vpn').style.display =
+                    (transferConnectionData.protocol === 'telemt' || protoBase(transferConnectionData.protocol) === 'aivpn') ? 'none' : '';
+                document.querySelectorAll('.config-tab')[1].style.display =
+                    (transferConnectionData.protocol === 'telemt' || protoBase(transferConnectionData.protocol) === 'aivpn') ? 'none' : '';
+                switchConfigTab('conf');
+                openModal('configModal');
+                generateQR(result.config);
+            }
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            button.disabled = false;
+            document.getElementById('transferConnectionBtnText').textContent = _('transfer_connection');
+            document.getElementById('transferConnectionSpinner').classList.add('hidden');
         }
     }
 
