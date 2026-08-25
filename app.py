@@ -50,6 +50,9 @@ import telegram_bot as tg_bot
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+# HTTP client URLs can include the Telegram Bot API token. Keep request-level
+# diagnostics out of normal logs while retaining application error reporting.
+logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Ordered list of OpenAPI tag groups — the order here drives the section order in /docs and /redoc.
