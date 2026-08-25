@@ -99,7 +99,7 @@ Configuration panel for system parameters and preferences:
     *   One-click check for fresh GitHub releases to stay up to date.
 *   **📤 Data Interoperability**:
     *   **Remnawave Sync**: Automatically import and sync users from Remnawave.
-    *   **Simple Backup**: Effortless JSON-based export and restore of all panel data.
+    *   **Encrypted SQLite Backup**: Download and restore a consistent `.db` snapshot of all panel state; legacy `data.json` exports remain importable for migration.
     *   **Profile transfer between VPS**: Move an individual client to another managed VPS with the same protocol installed. The panel creates the replacement profile first, removes the source profile only after success, updates linked users and self-service claims, and records the action in the audit log.
     *   **Backup / Migrate protocols (Alpha)**: Move protocol configurations between nodes for maintenance, recovery, and migration workflows.
 *   **🔗 Public Sharing**:
@@ -205,7 +205,7 @@ Routes are grouped in the docs as:
 | **Users** | Panel user accounts and the connections assigned to them. |
 | **Self-service** | Endpoints called by a regular user for their own data (`/api/my/*`). |
 | **Sharing** | Public, token-protected configuration sharing — no panel session required. |
-| **Settings** | Panel-wide settings, Telegram bot, Remnawave sync, JSON backup/restore. |
+| **Settings** | Panel-wide settings, Telegram bot, Remnawave sync, encrypted SQLite backup/restore and legacy JSON migration. |
 | **API Tokens** | Create and revoke bearer tokens for external integrations. |
 
 **Authentication for external integrations** — both session cookies and `Authorization: Bearer <token>` are accepted on every admin endpoint. Example:
@@ -246,7 +246,7 @@ which must replace the old one on the user's device.
 ### Technology Stack
 *   **Backend**: FastAPI (Python), `asyncio` for concurrent SSH/probe work
 *   **Frontend**: Vanilla JS, Jinja2, Custom CSS (Glassmorphism, full set of CSS animations for promo blocks)
-*   **Database**: Local JSON storage (`data.json`) with an `asyncio.Lock` for thread-safe writes
+*   **Database**: SQLite in WAL mode (`panel.db`) with atomic commits and portable database snapshots
 *   **SSH Engine**: Paramiko
 
 ### Project Structure
@@ -267,15 +267,30 @@ web-panel/
 ├── static/                   # CSS / favicon / vendored JS
 ├── templates/                # Jinja2 templates
 ├── translations/             # en / ru / fr / zh / fa
-└── data.json                 # Panel state (servers, users, tokens, settings)
+├── storage.py                # SQLite state storage and AES-GCM secret encryption
+└── data/panel.db             # Panel state (servers, users, tokens, settings)
 ```
 
 ## 🛡 Security Recommendations
 
 *   **Reverse Proxy**: It is highly recommended to run the panel behind Nginx/Apache with an SSL certificate.
 *   **SSH Keys**: Use SSH keys rather than passwords for connecting to your VPN servers.
+*   **Master Key**: Before starting Docker, copy `.env.example` to `.env` and set a long random `PANEL_MASTER_KEY`. VPS passwords, SSH private keys, Telegram and integration tokens are encrypted with AES-GCM before they are stored in SQLite. Keep this key outside the database and back it up securely: it is required to restore encrypted backups.
 *   **Secret Key**: Set a custom `SECRET_KEY` environment variable for secure session management.
 *   **API Tokens**: Treat each token like a password — store it in your integration's secret manager. Revoke it from `/settings` if it leaks or the integration is decommissioned. Rotate periodically; tokens inherit admin rights.
+
+### Storage Migration And Backups
+
+On its first start with the new storage, the panel imports the existing
+`data.json` into `data/panel.db`. It creates an encrypted migration snapshot
+and rewrites the legacy file with encrypted secret fields, so plaintext VPS
+credentials are not retained after a successful migration.
+
+The Settings page downloads a consistent SQLite `.db` backup, including all
+panel configuration and encrypted secrets. Restore accepts this `.db` format
+and also accepts the previous JSON export format. SQLite backups must be
+restored with the same `PANEL_MASTER_KEY`; before every restore the current
+database is saved as `panel-before-restore-<timestamp>.db`.
 
 ## 🤝 Contributing
 

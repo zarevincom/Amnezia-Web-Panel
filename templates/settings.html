@@ -351,7 +351,7 @@
                 </div>
                 <div style="border-top: 1px solid var(--border-color); padding-top: var(--space-md);">
                     <div style="display: flex; flex-direction: column; gap: var(--space-sm);">
-                        <input type="file" id="backupFile" accept=".json" style="display: none;"
+                        <input type="file" id="backupFile" accept=".db,.json,application/vnd.sqlite3,application/json" style="display: none;"
                             onchange="handleRestore(event)">
                         <button type="button" class="btn btn-secondary"
                             onclick="document.getElementById('backupFile').click()" id="restoreBtn"

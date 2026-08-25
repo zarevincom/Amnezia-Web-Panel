@@ -45,6 +45,7 @@ from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
 from managers.aivpn_manager import AIVPNManager
 from managers.backup_manager import BackupManager
+from storage import SQLiteStateStore, StorageError
 import telegram_bot as tg_bot
 
 # Configure logging
@@ -61,7 +62,7 @@ OPENAPI_TAGS = [
     {"name": "Users", "description": "Panel user accounts and the connections assigned to them."},
     {"name": "Self-service", "description": "Endpoints called by a regular user for their own data (the /my surface)."},
     {"name": "Sharing", "description": "Public, token-protected configuration sharing for end users — no panel session required."},
-    {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, JSON backup/restore."},
+    {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, encrypted SQLite backup/restore and legacy JSON migration."},
     {"name": "Notifications", "description": "Scheduled Telegram personal messages."},
     {"name": "Invites", "description": "Admin-managed public VPN profile invitations and claims."},
     {"name": "API Tokens", "description": "Bearer tokens for external integrations. Send the token in `Authorization: Bearer <token>`; tokens have admin-equivalent rights and are tied to the admin user that created them."},
@@ -85,7 +86,7 @@ async def custom_redoc():
     the page hang for some users)."""
     from fastapi.openapi.docs import get_redoc_html
     response = get_redoc_html(
-        openapi_url=(app.openapi_url or "/openapi.json") + "?v=transfer-1",
+        openapi_url=(app.openapi_url or "/openapi.json") + "?v=storage-1",
         title=f"{app.title} — ReDoc",
         redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
         with_google_fonts=False,
@@ -103,12 +104,16 @@ if getattr(sys, 'frozen', False):
 else:
     application_path = os.path.dirname(__file__)
 
-# Default stays alongside the app so existing installs are unaffected.
-# PANEL_DATA_FILE lets a deployment point this at a mounted volume — the
-# stock docker-compose mounts its volume at /app/data while the default path
-# is /app/data.json, so without an override panel data lives in the
-# container's writable layer and is lost on every image rebuild.
+# DATA_FILE remains the legacy migration path. The live state lives in SQLite;
+# PANEL_DATA_FILE is retained so existing installations migrate automatically.
 DATA_FILE = os.environ.get('PANEL_DATA_FILE') or os.path.join(application_path, 'data.json')
+DATABASE_FILE = os.environ.get('PANEL_DB_FILE') or os.path.join(application_path, 'data', 'panel.db')
+STATE_STORE = SQLiteStateStore(
+    DATABASE_FILE,
+    DATA_FILE,
+    master_key=os.environ.get('PANEL_MASTER_KEY', ''),
+    require_encryption=os.environ.get('PANEL_REQUIRE_ENCRYPTION', '').lower() in {'1', 'true', 'yes'},
+)
 CURRENT_VERSION = "v1.5.0"
 BIN_DIR = os.environ.get('TUNNEL_BIN_DIR', os.path.join(application_path, 'bin'))
 TUNNEL_STATE_FILE = os.environ.get('TUNNEL_STATE_FILE', os.path.join(application_path, 'tunnels_state.json'))
@@ -160,18 +165,14 @@ load_translations()
 
 # ======================== Helpers ========================
 
-# Global lock for data.json access to prevent race conditions during async operations
+# Global lock for multi-step state changes performed by async routes.
 DATA_LOCK = asyncio.Lock()
 NOTIFICATION_LOCK = asyncio.Lock()
 INVITE_ATTEMPTS = {}
 
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    else:
-        data = {}
+    data = STATE_STORE.load()
     data.setdefault('servers', [])
     data.setdefault('users', [])
     data.setdefault('user_connections', [])
@@ -207,17 +208,11 @@ def load_data():
 
 
 def save_data(data):
-    # Ensure the target directory exists — PANEL_DATA_FILE may point at a
-    # mounted volume path that isn't created yet on first run.
-    parent = os.path.dirname(DATA_FILE)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    STATE_STORE.save(data)
 
 
 async def save_data_async(data):
-    """Saves data to file in a thread-safe way."""
+    """Persists state under the async lock used by multi-step operations."""
     async with DATA_LOCK:
         await asyncio.to_thread(save_data, data)
 
@@ -4866,43 +4861,55 @@ async def api_revoke_token(request: Request, token_id: str):
 
 @app.get('/api/settings/backup/download', tags=["Settings"])
 async def api_backup_download(request: Request):
+    """Download a consistent encrypted SQLite snapshot of all panel state."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    if not os.path.exists(DATA_FILE):
-        return JSONResponse({'error': 'Data file not found'}, status_code=404)
-    return FileResponse(DATA_FILE, media_type='application/json', filename='data.json')
+    try:
+        snapshot = await asyncio.to_thread(STATE_STORE.export_database)
+        return StreamingResponse(
+            iter([snapshot]),
+            media_type='application/vnd.sqlite3',
+            headers={'Content-Disposition': 'attachment; filename="amnezia-panel-backup.db"'},
+        )
+    except StorageError as error:
+        logger.exception('Could not export panel database')
+        return JSONResponse({'error': str(error)}, status_code=500)
 
 
 @app.post('/api/settings/backup/restore', tags=["Settings"])
 async def api_backup_restore(request: Request, file: UploadFile = File(...)):
+    """Restore an encrypted SQLite backup or import a legacy JSON export."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         content = await file.read()
         if not content:
             return JSONResponse({'error': 'Empty file'}, status_code=400)
-        
-        try:
-            backup_data = json.loads(content)
-        except json.JSONDecodeError:
-            return JSONResponse({'error': 'Invalid JSON format'}, status_code=400)
-
-        # Basic structure validation
-        required_keys = ['servers', 'users']
-        missing = [k for k in required_keys if k not in backup_data]
-        if missing:
-            return JSONResponse({'error': f'Invalid structure. Missing keys: {", ".join(missing)}'}, status_code=400)
-
-        # Ensure types are correct
-        if not isinstance(backup_data['servers'], list) or not isinstance(backup_data['users'], list):
-            return JSONResponse({'error': 'Invalid structure: servers and users must be lists'}, status_code=400)
-
-        # Save the new data
         async with DATA_LOCK:
+            await asyncio.to_thread(STATE_STORE.backup_current_database)
+            if STATE_STORE.is_sqlite(content):
+                await asyncio.to_thread(STATE_STORE.restore_database, content)
+                # Fail before returning success if this backup was encrypted by
+                # another installation's master key.
+                load_data()
+                return {'status': 'success', 'format': 'sqlite'}
+
+            try:
+                backup_data = json.loads(content)
+            except json.JSONDecodeError:
+                return JSONResponse({'error': 'Invalid SQLite backup or legacy JSON format'}, status_code=400)
+
+            required_keys = ['servers', 'users']
+            missing = [key for key in required_keys if key not in backup_data]
+            if missing:
+                return JSONResponse({'error': f'Invalid structure. Missing keys: {", ".join(missing)}'}, status_code=400)
+            if not isinstance(backup_data['servers'], list) or not isinstance(backup_data['users'], list):
+                return JSONResponse({'error': 'Invalid structure: servers and users must be lists'}, status_code=400)
             save_data(backup_data)
-        
-        # In a real app we might want to restart or re-init background tasks
-        return {'status': 'success'}
+        return {'status': 'success', 'format': 'legacy-json'}
+    except StorageError as error:
+        logger.exception("Error restoring panel storage")
+        return JSONResponse({'error': str(error)}, status_code=400)
     except Exception as e:
         logger.exception("Error during restore")
         return JSONResponse({'error': str(e)}, status_code=500)
