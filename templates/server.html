@@ -1026,6 +1026,10 @@
     const SERVER_ID = {{ server_id }};
     const SERVER_HOST = "{{ server.host }}";
     const TRANSFER_TARGETS = {{ transfer_targets | tojson }};
+    // These values come from the panel database, not a new SSH request. They
+    // keep the screen useful while the live health check is still running.
+    const SAVED_PROTOCOLS = {{ saved_protocols | tojson }};
+    const SAVED_CONNECTIONS = {{ saved_connections | tojson }};
     const MARKETPLACE_APPS = [
         { proto: 'awg3', category: 'protocols', icon: '🛡', title: 'AmneziaWG 3.1', descKey: 'awg3_desc', badge: 'NEW' },
         { proto: 'awg2', category: 'protocols', icon: '✨', title: 'AmneziaWG 2.0', descKey: 'awg_desc' },
@@ -1285,6 +1289,59 @@
             default: title = proto;
         }
         return idx > 1 ? `${title} #${idx}` : title;
+    }
+
+    function renderSavedConnections(proto) {
+        const cached = SAVED_CONNECTIONS.filter(connection => connection.protocol === proto);
+        if (!cached.length) return;
+
+        const list = document.getElementById('connectionsListInner');
+        const empty = document.getElementById('connectionsEmpty');
+        empty.classList.add('hidden');
+        list.innerHTML = cached.map((connection, index) => {
+            const name = connection.name || `Connection ${index + 1}`;
+            return `
+                <div class="client-item" style="opacity:0.75;">
+                    <div class="client-info">
+                        <div class="client-avatar">${escapeHtml(name.charAt(0).toUpperCase())}</div>
+                        <div>
+                            <div class="client-name">${escapeHtml(name)}</div>
+                            <div class="client-meta"><span class="badge badge-warn">${_('not_checked')}</span></div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    function hydrateSavedServerState() {
+        const protocols = {};
+        Object.entries(SAVED_PROTOCOLS || {}).forEach(([proto, saved]) => {
+            // A saved protocol is known to be installed, but its container
+            // state must only be trusted after the background SSH check.
+            protocols[proto] = {
+                ...saved,
+                protocol: proto,
+                container_exists: true,
+                container_running: false,
+                status_pending: true,
+            };
+            updateProtocolCard(proto, protocols[proto]);
+        });
+        updateStatusCounts(protocols);
+
+        const vpnProtocols = orderedProtocolEntries(protocols)
+            .filter(([proto]) => ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard', 'aivpn'].includes(protoBase(proto)));
+        if (!vpnProtocols.length) return;
+
+        const select = document.getElementById('connProtoSelect');
+        select.innerHTML = vpnProtocols.map(([proto]) =>
+            `<option value="${escapeHtml(proto)}">${escapeHtml(getProtoTitle(proto))}</option>`
+        ).join('');
+        showConnectionsSection();
+        renderSavedConnections(select.value);
+        // Fetch current peer data in parallel with the full server health check.
+        loadConnections();
     }
 
     // ========== Server Stats ==========
@@ -1555,7 +1612,19 @@
 
         const isService = SERVICE_PROTOS.includes(protoBase(proto));
 
-        if (info.container_running) {
+        if (info.status_pending) {
+            installedProtocols[proto] = true;
+            statusEl.innerHTML = `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('not_checked')}</span>`;
+            if (info.port) {
+                infoEl.classList.remove('hidden');
+                infoGrid.innerHTML = `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port}</span></div>`;
+            }
+            actionsEl.innerHTML = `<button class="btn btn-secondary btn-sm" disabled style="flex:1">${_('server_checking')}</button>`;
+            if (ctrlEl) {
+                ctrlEl.style.cssText = 'display:none!important;';
+                ctrlEl.innerHTML = '';
+            }
+        } else if (info.container_running) {
             installedProtocols[proto] = true;
             statusEl.innerHTML = `<span class="badge badge-success"><span class="badge-dot"></span> ${_('run')}</span>`;
             if (info.port || info.clients_count !== undefined || isService) {
@@ -2809,7 +2878,7 @@
     }
 
     // ========== Init ==========
-    applyInstalledAppsVisibility();
+    hydrateSavedServerState();
     checkServer();
     loadServerStats();
 </script>

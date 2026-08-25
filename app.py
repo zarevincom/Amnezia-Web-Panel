@@ -2429,6 +2429,19 @@ async def server_detail(request: Request, server_id: int):
         return RedirectResponse(url='/')
     server = data['servers'][server_id]
     users_list = data.get('users', [])
+    # Render the last known state immediately. Live SSH checks still refresh it
+    # in the background, but opening a server page must not wait for them.
+    saved_connections = [
+        {
+            'id': connection.get('id'),
+            'protocol': connection.get('protocol'),
+            'client_id': connection.get('client_id'),
+            'name': connection.get('name') or connection.get('client_id') or 'Connection',
+            'user_id': connection.get('user_id'),
+        }
+        for connection in data.get('user_connections', [])
+        if connection.get('server_id') == server_id
+    ]
     transfer_targets = [
         {
             'id': index,
@@ -2445,6 +2458,8 @@ async def server_detail(request: Request, server_id: int):
         server_id=server_id,
         users=users_list,
         transfer_targets=transfer_targets,
+        saved_protocols=server.get('protocols', {}),
+        saved_connections=saved_connections,
     )
 
 
