@@ -24,7 +24,7 @@ _bot_task: Optional[asyncio.Task] = None
 _callback_refs = {}
 _pending_inputs = {}
 
-CLIENT_PROTOCOLS = {"awg", "awg2", "awg_legacy", "xray", "telemt", "wireguard"}
+CLIENT_PROTOCOLS = {"awg", "awg2", "awg3", "awg_legacy", "xray", "telemt", "wireguard", "aivpn"}
 SERVICE_PROTOCOLS = {"dns", "adguard", "socks5", "nginx"}
 
 
@@ -77,7 +77,9 @@ class TelegramAPI:
         data = r.json()
         if data.get("ok"):
             return data["result"]
-        return []
+        # Do not silently discard Telegram API failures: without this, a bot
+        # can appear to be running while it never processes a single command.
+        raise RuntimeError(data.get("description", "Telegram getUpdates failed"))
 
     async def send_message(self, chat_id, text: str, reply_markup=None, parse_mode="HTML") -> dict:
         import json
@@ -134,6 +136,7 @@ def _protocol_display_name(protocol: str) -> str:
     names = {
         "awg": "AmneziaWG",
         "awg2": "AmneziaWG 2.0",
+        "awg3": "AmneziaWG 3.1",
         "awg_legacy": "AmneziaWG Legacy",
         "xray": "Xray",
         "telemt": "Telemt",
@@ -142,6 +145,7 @@ def _protocol_display_name(protocol: str) -> str:
         "socks5": "SOCKS5",
         "adguard": "AdGuard Home",
         "nginx": "NGINX",
+        "aivpn": "AIVPN",
     }
     name = names.get(base, base)
     if "__" in str(protocol):
@@ -1021,7 +1025,7 @@ async def _run_bot(token: str, load_data_fn: Callable, generate_vpn_link_fn: Cal
                 logger.info("Telegram bot polling cancelled.")
                 return
             except Exception as e:
-                logger.warning(f"Telegram bot polling error: {e}")
+                logger.warning("Telegram bot polling error: %r", e)
                 await asyncio.sleep(5)
                 continue
 
