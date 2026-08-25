@@ -392,7 +392,7 @@ docker compose version
             api_payload['max_tcp_conns'] = val
 
         # Save config to host
-        self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), f"{self._config_path()}")
+        self.ssh.upload_file_sudo(config_content.replace('\r\n', '\n'), f"{self._config_path()}")
         
         # 2. Call API for immediate effect
         self._api_request("POST", "/v1/users", data=api_payload)
@@ -449,7 +449,7 @@ docker compose version
             api_payload['max_tcp_conns'] = val
 
         # Save config to host
-        self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), f"{self._config_path()}")
+        self.ssh.upload_file_sudo(config_content.replace('\r\n', '\n'), f"{self._config_path()}")
         
         # API call
         self._api_request("PATCH", f"/v1/users/{client_id}", data=api_payload)
@@ -553,6 +553,53 @@ docker compose version
 
         if restart:
             self.ssh.run_sudo_command(f"docker kill -s HUP {self.container_name} || docker restart {self.container_name}")
+
+    def rename_client(self, protocol_type, client_id, new_name):
+        """Rename a Telemt user. The username *is* the client identity here,
+        so every `username = ...` line in all access.* sections is rewritten
+        (preserving the `#` disabled marker) and the runtime API user is
+        re-created under the new name with the same secret. Proxy links are
+        secret-based, so existing links keep working."""
+        new_username = re.sub(r'[^a-zA-Z0-9_.-]', '', (new_name or '').replace(' ', '_'))
+        if not new_username:
+            raise RuntimeError('Invalid name')
+        if new_username == client_id:
+            return {'status': 'success', 'name': new_username}
+
+        config_text = self._get_server_config()
+        users = self._parse_users_from_config(config_text)
+        entry_name = next((u for u in users if u.lstrip('#').strip() == client_id), None)
+        if entry_name is None:
+            raise RuntimeError('Client not found')
+        if any(u.lstrip('#').strip() == new_username for u in users):
+            raise RuntimeError('A client with this name already exists')
+
+        secret = users[entry_name]
+        enabled = not entry_name.startswith('#')
+
+        lines = config_text.split('\n')
+        in_access_section = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('[access.'):
+                in_access_section = True
+            elif stripped.startswith('['):
+                in_access_section = False
+            if not in_access_section:
+                continue
+            commented = stripped.startswith('#')
+            content = stripped.lstrip('#').strip()
+            if content.startswith(f'{client_id} =') or content.startswith(f'{client_id}='):
+                new_line = content.replace(client_id, new_username, 1)
+                lines[i] = f'# {new_line}' if commented else new_line
+        self.ssh.upload_file_sudo('\n'.join(lines).replace('\r\n', '\n'), f"{self._config_path()}")
+
+        # Sync the runtime: the API keys users by username, so swap the identity.
+        self._api_request("DELETE", f"/v1/users/{client_id}")
+        if enabled:
+            self._api_request("POST", "/v1/users", data={"username": new_username, "secret": secret})
+        self.ssh.run_sudo_command(f"docker kill -s HUP {self.container_name} || docker restart {self.container_name}")
+        return {'status': 'success', 'name': new_username, 'client_id': new_username}
 
     def get_client_config(self, protocol_type, client_id, host='', port=''):
         resp = self._api_request("GET", f"/v1/users/{client_id}")

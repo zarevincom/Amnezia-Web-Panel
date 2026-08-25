@@ -172,15 +172,42 @@
 </div>
 
 <div class="protocol-cards" id="protocols-grid">
-    <!-- AWG2 Card (first - new version) -->
+    <!-- AWG3 Card (first - newest version).
+         Installed-protocol tiles are static cards toggled by
+         applyInstalledAppsVisibility(); a protocol without one is shown in the
+         marketplace but never gets a tile here. -->
+    <div class="card card-hover protocol-card protocol-awg" id="proto-awg3">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+            <div class="protocol-icon">🛡</div>
+            <div class="flex gap-sm" id="awg3-ctrl" style="display:none!important;"></div>
+        </div>
+        <div class="protocol-name">AmneziaWG 3.1 <span
+                style="font-size:0.65rem; background:var(--accent); color:#fff; padding:2px 6px; border-radius:8px; vertical-align:middle;">NEW</span>
+        </div>
+        <div class="protocol-desc">
+            {{ _('awg3_desc') }}
+        </div>
+        <div class="protocol-status" id="awg3-status">
+            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _('not_checked') }}</span>
+        </div>
+        <div id="awg3-info" class="hidden">
+            <div class="protocol-info" id="awg3-info-grid"></div>
+        </div>
+        <div class="flex gap-sm" id="awg3-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('awg3')" id="awg3-install-btn"
+                style="flex:1">
+                {{ _('install') }}
+            </button>
+        </div>
+    </div>
+
+    <!-- AWG2 Card -->
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg2">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
             <div class="protocol-icon">✨</div>
             <div class="flex gap-sm" id="awg2-ctrl" style="display:none!important;"></div>
         </div>
-        <div class="protocol-name">AmneziaWG 2.0 <span
-                style="font-size:0.65rem; background:var(--accent); color:#fff; padding:2px 6px; border-radius:8px; vertical-align:middle;">NEW</span>
-        </div>
+        <div class="protocol-name">AmneziaWG 2.0</div>
         <div class="protocol-desc">
             {{ _('awg_desc') }}
         </div>
@@ -473,6 +500,7 @@
                 style="width:auto; min-width:160px;">
                 <option value="awg">AmneziaWG</option>
                 <option value="awg2">AmneziaWG 2.0</option>
+                <option value="awg3">AmneziaWG 3.1</option>
                 <option value="awg_legacy">AWG Legacy</option>
                 <option value="xray">Xray</option>
                 <option value="telemt">Telemt</option>
@@ -914,13 +942,16 @@
         <!-- Config Panel -->
         <div class="config-panel active" id="panel-conf">
             <div class="config-display">
-                <div class="config-text" id="configText"></div>
+                <textarea class="config-text" id="configText" spellcheck="false" style="width:100%;min-height:220px;resize:vertical;font-family:monospace;"></textarea>
                 <div class="config-actions">
-                    <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(currentConfig)" style="flex:1">
+                    <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(document.getElementById('configText').value)" style="flex:1">
                         {{ _('copy') }}
                     </button>
+                    <button class="btn btn-primary btn-sm" id="saveConnConfigBtn" onclick="saveConnectionConfig()" style="flex:1">
+                        {{ _('save') }}
+                    </button>
                     <button class="btn btn-primary btn-sm"
-                        onclick="downloadFile(currentConfig, currentConfigName + '.conf')" style="flex:1">
+                        onclick="downloadFile(document.getElementById('configText').value, currentConfigName + '.conf')" style="flex:1">
                         {{ _('download_conf') }}
                     </button>
                 </div>
@@ -996,7 +1027,8 @@
     const SERVER_HOST = "{{ server.host }}";
     const TRANSFER_TARGETS = {{ transfer_targets | tojson }};
     const MARKETPLACE_APPS = [
-        { proto: 'awg2', category: 'protocols', icon: '✨', title: 'AmneziaWG 2.0', descKey: 'awg_desc', badge: 'NEW' },
+        { proto: 'awg3', category: 'protocols', icon: '🛡', title: 'AmneziaWG 3.1', descKey: 'awg3_desc', badge: 'NEW' },
+        { proto: 'awg2', category: 'protocols', icon: '✨', title: 'AmneziaWG 2.0', descKey: 'awg_desc' },
         { proto: 'awg', category: 'protocols', icon: '🔮', title: 'AmneziaWG', descKey: 'awg_desc' },
         { proto: 'awg_legacy', category: 'protocols', icon: '📡', title: 'AmneziaWG Legacy', descKey: 'awg_legacy_desc' },
         { proto: 'xray', category: 'protocols', icon: '⚡', title: 'Xray (VLESS-Reality)', descKey: 'xray_desc' },
@@ -1018,6 +1050,7 @@
     let currentConfig = '';
     let currentVpnLink = '';
     let currentConfigName = 'connection';
+    let currentConfigClientId = null;
     let installedProtocols = {};
     let currentProtocolStatus = {};
     let installedAppsLoading = true;
@@ -1037,7 +1070,7 @@
     }
 
     function isMultiInstanceBase(proto) {
-        return ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'].includes(protoBase(proto));
+        return ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'].includes(protoBase(proto));
     }
 
     function nextSuggestedPort(base, fallback) {
@@ -1239,6 +1272,7 @@
         switch (base) {
             case 'awg': title = 'AmneziaWG'; break;
             case 'awg2': title = 'AmneziaWG 2.0'; break;
+            case 'awg3': title = 'AmneziaWG 3.1'; break;
             case 'awg_legacy': title = 'AmneziaWG Legacy'; break;
             case 'xray': title = 'Xray'; break;
             case 'telemt': title = 'Telemt'; break;
@@ -1302,7 +1336,7 @@
 
                 for (const [proto, info] of orderedProtocolEntries(data.protocols)) {
                     updateProtocolCard(proto, info);
-                    const isVPN = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard', 'aivpn'].includes(protoBase(proto));
+                    const isVPN = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard', 'aivpn'].includes(protoBase(proto));
                     if (info.container_running && isVPN) {
                         const opt = document.createElement('option');
                         opt.value = proto;
@@ -2067,7 +2101,7 @@
         document.getElementById('connectionsSection').scrollIntoView({ behavior: 'smooth' });
     }
 
-    async function loadConnections() {
+    async function loadConnections(isPoll) {
         const proto = document.getElementById('connProtoSelect').value;
         const loading = document.getElementById('connectionsLoading');
         const emptyEl = document.getElementById('connectionsEmpty');
@@ -2078,17 +2112,20 @@
             return;
         }
 
-        loading.style.display = '';
+        if (window.connLoading) return; // don't stack overlapping polls
+        window.connLoading = true;
+        if (!isPoll) loading.style.display = ''; // silent refresh on polls
         emptyEl.classList.add('hidden');
-        listEl.innerHTML = '';
         try {
             const data = await apiCall(`/api/servers/${SERVER_ID}/connections?protocol=${proto}`);
             loading.style.display = 'none';
             if (!data.clients || data.clients.length === 0) {
+                listEl.innerHTML = '';
                 emptyEl.classList.remove('hidden');
                 return;
             }
             window.connectionsStore = {};
+            listEl.innerHTML = '';
             data.clients.forEach((client, idx) => {
                 const userData = client.userData || {};
                 window.connectionsStore[client.clientId] = userData;
@@ -2101,6 +2138,7 @@
                 const enabled = (client.enabled !== undefined) ? client.enabled : (userData.enabled !== false);
                 const hasPrivKey = !!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || protoBase(proto) === 'aivpn';
                 const assignedUser = client.assigned_user || '';
+                client._online = false; // reset each render; set by the handshake badge below
 
                 let metaHtml = '';
                 if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;">👤 ${escapeHtml(assignedUser)}</span>`;
@@ -2125,8 +2163,10 @@
                     if (userData.expiresAt) metaHtml += `<span class="badge" style="font-size:0.65rem;">⌛ ${formatDate(userData.expiresAt)}</span>`;
                 } else {
                     if (handshake) metaHtml += `<span>🤝 ${handshake}</span>`;
-                    if (received) metaHtml += `<span class="traffic-badge traffic-down">↓ ${received}</span>`;
-                    if (sent) metaHtml += `<span class="traffic-badge traffic-up">↑ ${sent}</span>`;
+                    // awg show reports transfer from the SERVER perspective:
+                    // "received" = client upload, "sent" = client download.
+                    if (sent) metaHtml += `<span class="traffic-badge traffic-down">↓ ${sent}</span>`;
+                    if (received) metaHtml += `<span class="traffic-badge traffic-up">↑ ${received}</span>`;
                 }
 
                 if (!enabled) metaHtml += `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`;
@@ -2141,7 +2181,7 @@
                 listEl.innerHTML += `
                     <div class="client-item" style="${disabledStyle}">
                         <div class="client-info">
-                            <div class="client-avatar">${initial}</div>
+                            <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
                                 <div class="client-name">${escapeHtml(name)}</div>
                                 <div class="client-meta">${metaHtml || `<span class="text-muted">${_('no_data')}</span>`}</div>
@@ -2149,6 +2189,7 @@
                         </div>
                         <div class="client-actions">
                             ${protoBase(proto) === 'aivpn' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="showProfile('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('profile')}">👁</button>` : ''}
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="startRenameConnection('${escapeJs(client.clientId)}', this)" title="${_('rename')}">✏️</button>
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || protoBase(proto) === 'aivpn'})" title="${_('config')}">📄</button>
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="openTransferConnectionModal('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('transfer_connection')}">⇄</button>
                             ${(proto === 'telemt' || protoBase(proto) === 'aivpn') ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
@@ -2161,6 +2202,13 @@
         } catch (err) {
             loading.style.display = 'none';
             showToast(_('connections_load_error') + ': ' + err.message, 'error');
+        } finally {
+            window.connLoading = false;
+            // Auto-refresh every 5s while the connections section is visible (live speed/handshake)
+            clearTimeout(window.connPollTimer);
+            if (document.getElementById('connectionsSection').style.display !== 'none') {
+                window.connPollTimer = setTimeout(function() { loadConnections(true); }, 5000);
+            }
         }
     }
 
@@ -2208,8 +2256,9 @@
                     currentConfig = result.config;
                     currentVpnLink = result.vpn_link || '';
                     currentConfigName = connName.replace(/\s+/g, '_');
+                    currentConfigClientId = result.client_id || null;
                     document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName}`;
-                    document.getElementById('configText').textContent = result.config;
+                    const cfgTa = document.getElementById('configText'); cfgTa.value = result.config; cfgTa.readOnly = false;
                     document.getElementById('vpnLinkText').textContent = currentVpnLink;
                     document.getElementById('panel-vpn').style.display = ((proto === 'telemt' || protoBase(proto) === 'aivpn') ? 'none' : '');
                     document.querySelectorAll('.config-tab')[1].style.display = ((proto === 'telemt' || protoBase(proto) === 'aivpn') ? 'none' : '');
@@ -2359,7 +2408,7 @@
                 currentVpnLink = result.vpn_link || '';
                 currentConfigName = (result.name || transferConnectionData.name).replace(/\s+/g, '_');
                 document.getElementById('configModalTitle').textContent = `${_('config')} — ${result.name || transferConnectionData.name}`;
-                document.getElementById('configText').textContent = result.config;
+                document.getElementById('configText').value = result.config;
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 document.getElementById('panel-vpn').style.display =
                     (transferConnectionData.protocol === 'telemt' || protoBase(transferConnectionData.protocol) === 'aivpn') ? 'none' : '';
@@ -2378,8 +2427,81 @@
         }
     }
 
+    function startRenameConnection(clientId, btn) {
+        const item = btn.closest('.client-item');
+        const nameEl = item.querySelector('.client-name');
+        const oldName = nameEl.textContent;
+        nameEl.innerHTML = `
+            <span class="rename-editor" style="display:inline-flex;gap:4px;align-items:center;">
+                <input type="text" class="form-input" style="padding:2px 8px;font-size:0.85rem;width:160px;height:auto;" value="${escapeHtml(oldName)}">
+                <button class="btn btn-secondary btn-sm btn-icon" title="${_('save')}">✔</button>
+                <button class="btn btn-secondary btn-sm btn-icon rename-cancel" title="${_('cancel')}">✖</button>
+            </span>
+        `;
+        const input = nameEl.querySelector('input');
+        const saveBtn = nameEl.querySelector('button:not(.rename-cancel)');
+        const cancelBtn = nameEl.querySelector('.rename-cancel');
+        saveBtn.addEventListener('click', () => saveRenameConnection(clientId, input.value));
+        cancelBtn.addEventListener('click', () => loadConnections());
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') saveRenameConnection(clientId, input.value);
+            if (e.key === 'Escape') loadConnections();
+        });
+        input.focus();
+        input.select();
+    }
+
+    async function saveRenameConnection(clientId, rawName) {
+        const proto = document.getElementById('connProtoSelect').value;
+        const newName = (rawName || '').trim();
+        if (!newName) {
+            showToast(_('enter_connection_name'), 'error');
+            return;
+        }
+        try {
+            const result = await apiCall(`/api/servers/${SERVER_ID}/connections/rename`, 'POST', {
+                protocol: proto, client_id: clientId, new_name: newName,
+            });
+            showToast(_('connection_renamed'), 'success');
+            // If the config modal is open for this connection, retitle it too.
+            if (currentConfigClientId === clientId &&
+                document.getElementById('configModal').classList.contains('active')) {
+                document.getElementById('configModalTitle').textContent = `${_('config')} — ${result.name}`;
+                currentConfigName = result.name.replace(/\s+/g, '_');
+            }
+            loadConnections();
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function saveConnectionConfig() {
+        const proto = document.getElementById('connProtoSelect').value;
+        const text = document.getElementById('configText').value;
+        if (!text.trim()) {
+            showToast(_('error'), 'error');
+            return;
+        }
+        try {
+            const result = await apiCall(`/api/servers/${SERVER_ID}/connections/config/save`, 'POST', {
+                protocol: proto, client_id: currentConfigClientId, config: text,
+            });
+            currentConfig = text;
+            currentVpnLink = result.vpn_link || '';
+            document.getElementById('vpnLinkText').textContent = currentVpnLink;
+            generateQR(text);
+            showToast(_('config_saved'), 'success');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
     async function showConnectionConfig(clientId, connName, hasKey) {
         const proto = document.getElementById('connProtoSelect').value;
+        currentConfigClientId = clientId;
+        const canEditCfg = ['awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard'].includes(protoBase(proto));
+        document.getElementById('saveConnConfigBtn').style.display = canEditCfg ? '' : 'none';
+        document.getElementById('configText').readOnly = !canEditCfg;
 
         // Restore tabs visibility first
         document.getElementById('panel-vpn').style.display = ((proto === 'telemt' || protoBase(proto) === 'aivpn') ? 'none' : '');
@@ -2391,9 +2513,10 @@
         if (!hasKey) {
             document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName}`;
             currentConfig = '';
+            document.getElementById('saveConnConfigBtn').style.display = 'none';
             currentVpnLink = '';
             currentConfigName = connName.replace(/\s+/g, '_');
-            document.getElementById('configText').innerHTML = `<div style="padding:var(--space-md);background:var(--bg-primary);border-radius:var(--radius-md);border:1px solid var(--border-color);"><div style="font-size:1.4rem;margin-bottom:var(--space-sm);">⚠️</div><div style="font-weight:600;margin-bottom:var(--space-sm);">${_('config_unavailable')}</div><div style="font-size:0.85rem;color:var(--text-muted);line-height:1.6;">${_('config_unavailable_desc').replace(/\\n/g, '<br>')}<br><br><strong>${_('client_public_key')}</strong><br><code style="word-break:break-all;font-size:0.78rem;">${escapeHtml(clientId)}</code></div></div>`;
+            const cfgTa = document.getElementById('configText'); cfgTa.value = `${_('config_unavailable')}\n\n${_('client_public_key')}: ${clientId}`; cfgTa.readOnly = true;
             document.getElementById('vpnLinkText').textContent = '';
             document.getElementById('panel-vpn').style.display = 'none';
             document.getElementById('panel-qr').style.display = 'none';
@@ -2414,7 +2537,7 @@
                 currentVpnLink = result.vpn_link || '';
                 currentConfigName = connName.replace(/\s+/g, '_');
                 document.getElementById('configModalTitle').textContent = `${_('config')} — ${connName}`;
-                document.getElementById('configText').textContent = result.config;
+                const cfgTa = document.getElementById('configText'); cfgTa.value = result.config; cfgTa.readOnly = false;
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
@@ -2508,7 +2631,7 @@
         currentConfigName = (currentProfileName || 'profile').replace(/\s+/g, '_');
         closeModal('profileModal');
         document.getElementById('configModalTitle').textContent = `${_('config')} — ${currentProfileName}`;
-        document.getElementById('configText').textContent = currentProfileKey;
+        document.getElementById('configText').value = currentProfileKey;
         document.getElementById('panel-vpn').style.display = 'none';
         document.querySelectorAll('.config-tab')[1].style.display = 'none';
         document.getElementById('panel-qr').style.display = '';
@@ -2596,6 +2719,49 @@
         const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
+    // ========== Peer activity / speed (wg-easy style, client-side deltas) ==========
+    // Parse "2 hours, 29 minutes, 55 seconds ago" / "Now" into total seconds
+    function parseHandshakeAgo(str) {
+        if (!str) return null;
+        const s = String(str).toLowerCase().trim();
+        if (s.startsWith('now')) return 0;
+        let total = 0, matched = false, m;
+        const mult = { day: 86400, hour: 3600, minute: 60, second: 1 };
+        const re = /(\d+)\s*(day|hour|minute|second)s?/g;
+        while ((m = re.exec(s)) !== null) {
+            matched = true;
+            total += parseInt(m[1], 10) * mult[m[2]];
+        }
+        return matched ? total : null;
+    }
+
+    // Compact fixed-ish length: "45s ago" / "3m 51s ago" / "2h 29m ago" / "2d 3h ago"
+    function formatHandshakeCompact(str) {
+        const sec = parseHandshakeAgo(str);
+        if (sec === null) return str;
+        if (sec < 60) return sec + 's ago';
+        if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's ago';
+        if (sec < 86400) return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm ago';
+        return Math.floor(sec / 86400) + 'd ' + Math.floor((sec % 86400) / 3600) + 'h ago';
+    }
+
+    // Speed = delta of cumulative bytes between two polls (same approach as wg-easy)
+    window.speedStore = window.speedStore || {};
+    function computeRates(clientId, userData) {
+        const rx = userData.dataReceivedBytes, tx = userData.dataSentBytes;
+        if (rx === undefined || tx === undefined) return null;
+        const now = Date.now();
+        const prev = window.speedStore[clientId];
+        window.speedStore[clientId] = { ts: now, rx: rx, tx: tx };
+        if (!prev) return { rx: 0, tx: 0, active: false };
+        const dt = (now - prev.ts) / 1000;
+        if (dt <= 0.5) return { rx: 0, tx: 0, active: false };
+        // Counter reset (peer re-created) must not produce negative spikes
+        const rxRate = Math.max(0, (rx - prev.rx) / dt);
+        const txRate = Math.max(0, (tx - prev.tx) / dt);
+        return { rx: rxRate, tx: txRate, active: rxRate > 0 || txRate > 0 };
     }
 
     function escapeHtml(str) {

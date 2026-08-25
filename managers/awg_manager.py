@@ -28,6 +28,9 @@ AWG_DEFAULTS = {
     'subnet_address': '10.8.1.0',
     'subnet_cidr': '24',
     'subnet_ip': '10.8.1.1',
+    # IPv6 ULA subnet used for dual-stack tunnels (NAT66, no provider prefix needed)
+    'subnet_ipv6_ip': 'fd42:8:1::1',
+    'subnet_ipv6_cidr': '64',
     'dns1': '1.1.1.1',
     'dns2': '1.0.0.1',
     # AWG obfuscation parameters
@@ -43,6 +46,31 @@ AWG_DEFAULTS = {
     'transport_packet_magic_header': '2528465083',
     'underload_packet_magic_header': '1766607858',
 }
+
+# AWG 3.1 parameters: (internal key, config key).
+# HeaderProtectionKey/ContentPaddingAddition and the timings came with 3.0,
+# RandomTrailers/DisableCookies with 3.1. Ranges use the "min-max" form.
+AWG3_PARAM_MAP = [
+    ('header_protection_key', 'HeaderProtectionKey'),
+    ('content_padding_addition', 'ContentPaddingAddition'),
+    ('rekey_after_time', 'RekeyAfterTime'),
+    ('rekey_timeout', 'RekeyTimeout'),
+    ('reject_after_time', 'RejectAfterTime'),
+    ('keepalive_timeout', 'KeepaliveTimeout'),
+    ('max_handshake_attempts', 'MaxHandshakeAttempts'),
+    ('random_trailers', 'RandomTrailers'),
+    ('disable_cookies', 'DisableCookies'),
+]
+
+# AWG 3.1 keys must not leak into legacy configs — the legacy container
+# ships tools that reject them.
+AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
+
+# With HeaderProtectionKey set, the kernel module requires every junk size
+# S1-S4 to be at least HEADER_PROTECTION_NONCE_SIZE (12) — see the S1..S4
+# checks in netlink.c. Below that `awg setconf` fails with a bare
+# "Invalid argument": the explanation only goes to net_dbg_ratelimited.
+AWG3_MIN_JUNK_SIZE = 12
 
 
 def generate_wg_keypair():
@@ -65,23 +93,27 @@ def generate_psk():
     return b64encode(secrets.token_bytes(32)).decode()
 
 
-def generate_awg_params(use_ranges=False):
+def generate_awg_params(use_ranges=False, awg3=False):
     """Generate random AWG obfuscation parameters.
     
     For AWG 2.0 (use_ranges=True): generates H1-H4 as non-overlapping
     ranges (min-max) for dynamic packet signature. Each packet gets a
     random value from its range, defeating static DPI signatures.
     For legacy AWG (use_ranges=False): generates fixed single H values.
+    For AWG 3.1 (awg3=True): additionally generates header protection key,
+    content padding and randomized protocol timings.
     """
     import random
 
     jc = random.randint(1, 10)
     jmin = random.randint(5, 20)
     jmax = random.randint(jmin + 10, jmin + 50)
-    s1 = random.randint(10, 50)
-    s2 = random.randint(10, 50)
-    s3 = random.randint(10, 50)
-    s4 = random.randint(10, 50)
+    # AWG 3.1 enables header protection, which puts a floor under the junk sizes.
+    s_min = AWG3_MIN_JUNK_SIZE if awg3 else 10
+    s1 = random.randint(s_min, 50)
+    s2 = random.randint(s_min, 50)
+    s3 = random.randint(s_min, 50)
+    s4 = random.randint(s_min, 50)
 
     if use_ranges:
         # AWG 2.0: H1-H4 as non-overlapping ranges (min-max)
@@ -106,7 +138,7 @@ def generate_awg_params(use_ranges=False):
         h3 = str(random.randint(100000000, 4294967295))
         h4 = str(random.randint(100000000, 4294967295))
 
-    return {
+    params = {
         'junk_packet_count': str(jc),
         'junk_packet_min_size': str(jmin),
         'junk_packet_max_size': str(jmax),
@@ -120,6 +152,31 @@ def generate_awg_params(use_ranges=False):
         'transport_packet_magic_header': h4,
     }
 
+    if awg3:
+        # Ranges are "min-max" (u16_range_from_string in amneziawg-tools).
+        # reject_after_time must stay above rekey_after_time, otherwise a
+        # session is dropped before the rekey window opens.
+        rekey_after = random.randint(100, 130)
+        reject_after = random.randint(rekey_after + 40, rekey_after + 70)
+        keepalive = random.randint(8, 12)
+        rekey_timeout = random.randint(4, 6)
+        attempts = random.randint(15, 20)
+        padding_min = random.randint(8, 24)
+
+        params.update({
+            'header_protection_key': generate_psk(),
+            'content_padding_addition': f"{padding_min}-{padding_min + random.randint(24, 48)}",
+            'rekey_after_time': f"{rekey_after}-{rekey_after + random.randint(10, 40)}",
+            'rekey_timeout': f"{rekey_timeout}-{rekey_timeout + random.randint(1, 3)}",
+            'reject_after_time': f"{reject_after}-{reject_after + random.randint(10, 30)}",
+            'keepalive_timeout': f"{keepalive}-{keepalive + random.randint(2, 6)}",
+            'max_handshake_attempts': f"{attempts}-{attempts + random.randint(2, 6)}",
+            'random_trailers': 'on',
+            'disable_cookies': 'on',
+        })
+
+    return params
+
 
 class AWGManager:
     """Manages AmneziaWG protocol installation and client management."""
@@ -128,6 +185,7 @@ class AWGManager:
     AWG = 'awg'          # New AWG (awg-go based, uses awg/awg-quick)
     AWG_LEGACY = 'awg_legacy'  # Legacy AWG (uses wg/wg-quick)
     AWG2 = 'awg2'        # AmneziaWG 2.0 (separate container amnezia-awg2)
+    AWG3 = 'awg3'        # AmneziaWG 3.1 (separate container amnezia-awg3)
 
     def __init__(self, ssh_manager):
         self.ssh = ssh_manager
@@ -155,6 +213,8 @@ class AWGManager:
             name = 'amnezia-awg-legacy'
         elif base == self.AWG2:
             name = 'amnezia-awg2'
+        elif base == self.AWG3:
+            name = 'amnezia-awg3'
         else:
             name = 'amnezia-awg'
         return name if idx <= 1 else f'{name}-{idx}'
@@ -217,7 +277,7 @@ class AWGManager:
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""
-        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2):
+        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2, self.AWG3):
             return 'amneziavpn/amneziawg-go:latest'
         return 'amneziavpn/amnezia-wg:latest'
 
@@ -231,7 +291,8 @@ class AWGManager:
             config = self._get_server_config(protocol_type)
             for line in config.split('\n'):
                 if line.startswith('Address'):
-                    addr = line.split('=')[1].strip()
+                    # Take the first (IPv4) part of a possibly dual-stack Address line
+                    addr = line.split('=')[1].strip().split(',')[0].strip()
                     ip = addr.split('/')[0]
                     return ip
         except Exception:
@@ -244,7 +305,8 @@ class AWGManager:
             config = self._get_server_config(protocol_type)
             for line in config.split('\n'):
                 if line.startswith('Address'):
-                    addr = line.split('=')[1].strip()
+                    # Take the first (IPv4) part of a possibly dual-stack Address line
+                    addr = line.split('=')[1].strip().split(',')[0].strip()
                     if '/' in addr:
                         return addr.split('/')[1]
         except Exception:
@@ -261,6 +323,47 @@ class AWGManager:
         net_int = struct.unpack('!I', network)[0] & mask
         net_parts = [(net_int >> 24) & 0xFF, (net_int >> 16) & 0xFF, (net_int >> 8) & 0xFF, net_int & 0xFF]
         return '.'.join(map(str, net_parts))
+
+    def _get_subnet_ipv6_ip(self, protocol_type):
+        """Get the IPv6 gateway from server config, or '' if the tunnel is IPv4-only."""
+        try:
+            config = self._get_server_config(protocol_type)
+            for line in config.split('\n'):
+                line = line.strip()
+                if line.startswith('Address'):
+                    addr = line.split('=', 1)[1]
+                    for part in addr.split(','):
+                        part = part.strip()
+                        if ':' in part:
+                            return part.split('/')[0]
+        except Exception:
+            pass
+        return ''
+
+    def _get_client_ipv6(self, protocol_type, client_ip):
+        """Derive a client's IPv6 address from its IPv4 address.
+
+        The last hextet mirrors the IPv4 last octet (in hex), so every client
+        with 10.8.1.N deterministically gets <prefix>::<hex(N)>. Returns ''
+        when the server tunnel has no IPv6 gateway configured.
+        """
+        gateway = self._get_subnet_ipv6_ip(protocol_type)
+        if not gateway:
+            return ''
+        try:
+            octet = int(client_ip.split('.')[3])
+        except (ValueError, IndexError, AttributeError):
+            return ''
+        prefix = gateway.rsplit(':', 1)[0] + ':'
+        return f"{prefix}{octet:x}"
+
+    def _detect_server_ipv6(self):
+        """Check if the host has working IPv6 (default route or any global address)."""
+        out, _, _ = self.ssh.run_sudo_command("ip -6 route show default 2>/dev/null")
+        if out.strip():
+            return True
+        out, _, _ = self.ssh.run_sudo_command("ip -6 addr show scope global 2>/dev/null")
+        return bool(out.strip())
 
     # ===================== INSTALLATION =====================
 
@@ -335,6 +438,7 @@ fi
         """Setup host firewall (mirrors setup_host_firewall.sh)."""
         script = """
 sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
 iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
 iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-USER 2>/dev/null
 """
@@ -351,7 +455,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             port = AWG_DEFAULTS['port']
 
         if awg_params is None:
-            awg_params = generate_awg_params(use_ranges=(self._base_protocol(protocol_type) in (self.AWG, self.AWG2)))
+            base_proto = self._base_protocol(protocol_type)
+            awg_params = generate_awg_params(
+                use_ranges=(base_proto in (self.AWG, self.AWG2, self.AWG3)),
+                awg3=(base_proto == self.AWG3),
+            )
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
@@ -439,7 +547,13 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
         # Step 6: Configure container (generate server keys and config)
         results.append("Configuring AWG...")
-        self._configure_container(protocol_type, port, awg_params)
+        ipv6_enabled = self._detect_server_ipv6()
+        results.append(
+            "IPv6 detected on host, enabling dual-stack tunnel"
+            if ipv6_enabled else
+            "No IPv6 on host, tunnel will be IPv4-only"
+        )
+        self._configure_container(protocol_type, port, awg_params, ipv6=ipv6_enabled)
         results.append("AWG configured")
 
         # Step 7: Upload and run start script
@@ -485,7 +599,7 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             f"(status: {last_status}). Logs:\n{logs_out}"
         )
 
-    def _configure_container(self, protocol_type, port, awg_params):
+    def _configure_container(self, protocol_type, port, awg_params, ipv6=False):
         """Configure the AWG container (generate keys and server config)."""
         container_name = self._container_name(protocol_type)
         wg_bin = self._wg_binary(protocol_type)
@@ -494,8 +608,20 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         subnet_ip = self._get_subnet_ip(protocol_type)
         subnet_cidr = self._get_subnet_cidr(protocol_type)
 
+        # AWG 3.1 parameters are written only when the protocol asks for them,
+        # so awg/awg2 installations keep byte-identical configs.
+        awg3_config_lines = ''.join(
+            f"{config_key} = {awg_params[param_key]}\n"
+            for param_key, config_key in AWG3_PARAM_MAP
+            if awg_params.get(param_key)
+        )
+
+        address_line = f"{subnet_ip}/{subnet_cidr}"
+        if ipv6:
+            address_line += f", {AWG_DEFAULTS['subnet_ipv6_ip']}/{AWG_DEFAULTS['subnet_ipv6_cidr']}"
+
         # Build the server config generation script
-        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2):
+        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2, self.AWG3):
             config_script = f"""
 mkdir -p /opt/amnezia/awg
 cd /opt/amnezia/awg
@@ -511,7 +637,7 @@ echo $WIREGUARD_PSK > /opt/amnezia/awg/wireguard_psk.key
 cat > {config_path} <<EOF
 [Interface]
 PrivateKey = $WIREGUARD_SERVER_PRIVATE_KEY
-Address = {subnet_ip}/{subnet_cidr}
+Address = {address_line}
 ListenPort = {port}
 Jc = {awg_params['junk_packet_count']}
 Jmin = {awg_params['junk_packet_min_size']}
@@ -524,7 +650,7 @@ H1 = {awg_params['init_packet_magic_header']}
 H2 = {awg_params['response_packet_magic_header']}
 H3 = {awg_params['underload_packet_magic_header']}
 H4 = {awg_params['transport_packet_magic_header']}
-# Signature Chain parameters (AWG 2.0+)
+{awg3_config_lines}# Signature Chain parameters (AWG 2.0+)
 # I1 = 0
 # I2 = 0
 # I3 = 0
@@ -550,7 +676,7 @@ echo $WIREGUARD_PSK > /opt/amnezia/awg/wireguard_psk.key
 cat > {config_path} <<EOF
 [Interface]
 PrivateKey = $WIREGUARD_SERVER_PRIVATE_KEY
-Address = {subnet_ip}/{subnet_cidr}
+Address = {address_line}
 ListenPort = {port}
 Jc = {awg_params['junk_packet_count']}
 Jmin = {awg_params['junk_packet_min_size']}
@@ -579,11 +705,14 @@ EOF
         start_script = f"""#!/bin/bash
 echo "Container startup"
 
-# Read subnet from server config dynamically
-SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | tr -d ' ')
+# Read subnet from server config dynamically (IPv4 part of the Address line)
+SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
 if [ -z "$SUBNET" ]; then
   SUBNET={AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}
 fi
+
+# IPv6 subnet, if the tunnel is dual-stack (second part of the Address line)
+SUBNET6=$(grep '^Address' {config_path} | head -1 | tr ',' '\n' | grep ':' | sed 's/^[^=]*=//' | tr -d ' ' | head -1)
 
 # kill daemons in case of restart
 {quick_bin} down {config_path} 2>/dev/null
@@ -605,6 +734,19 @@ iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
 iptables -t nat -A POSTROUTING -s $SUBNET -o eth0 -j MASQUERADE
 iptables -t nat -A POSTROUTING -s $SUBNET -o eth1 -j MASQUERADE
+
+# IPv6 forwarding + NAT66, only when the tunnel has an IPv6 subnet
+if [ -n "$SUBNET6" ] && command -v ip6tables >/dev/null 2>&1; then
+  sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
+  ip6tables -A INPUT -i $IFACE -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -j ACCEPT
+  ip6tables -A OUTPUT -o $IFACE -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -o eth0 -s $SUBNET6 -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -o eth1 -s $SUBNET6 -j ACCEPT
+  ip6tables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+  ip6tables -t nat -A POSTROUTING -s $SUBNET6 -o eth0 -j MASQUERADE
+  ip6tables -t nat -A POSTROUTING -s $SUBNET6 -o eth1 -j MASQUERADE
+fi
 
 tail -f /dev/null
 """
@@ -684,8 +826,25 @@ tail -f /dev/null
             raise RuntimeError(f"Failed to get server config: {err}")
         return out
 
+    @staticmethod
+    def _sanitize_server_config(config_content):
+        """awg-quick chokes on a bare `DNS =` key in the server config (it calls
+        resolvconf, which is missing in the container, and the interface goes
+        down). Convert active `DNS = ...` lines into `# DNS = ...` comments:
+        the panel still reads them via _get_dns(), but quick-tools ignore them."""
+        lines = []
+        for line in config_content.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('DNS') and '=' in stripped and not stripped.startswith('#'):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines.append(f"{indent}# {stripped}")
+            else:
+                lines.append(line)
+        return '\n'.join(lines)
+
     def save_server_config(self, protocol_type, config_content):
         """Save the server WireGuard config and restart container."""
+        config_content = self._sanitize_server_config(config_content)
         container_name = self._container_name(protocol_type)
         config_path = self._resolve_config_path(protocol_type)
 
@@ -699,11 +858,14 @@ tail -f /dev/null
         start_script = f"""#!/bin/bash
 echo "Container startup"
 
-# Read subnet from server config dynamically
-SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | tr -d ' ')
+# Read subnet from server config dynamically (IPv4 part of the Address line)
+SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
 if [ -z "$SUBNET" ]; then
   SUBNET={AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}
 fi
+
+# IPv6 subnet, if the tunnel is dual-stack (second part of the Address line)
+SUBNET6=$(grep '^Address' {config_path} | head -1 | tr ',' '\n' | grep ':' | sed 's/^[^=]*=//' | tr -d ' ' | head -1)
 
 # kill daemons in case of restart
 {quick_bin} down {config_path} 2>/dev/null
@@ -725,6 +887,19 @@ iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
 iptables -t nat -A POSTROUTING -s $SUBNET -o eth0 -j MASQUERADE
 iptables -t nat -A POSTROUTING -s $SUBNET -o eth1 -j MASQUERADE
+
+# IPv6 forwarding + NAT66, only when the tunnel has an IPv6 subnet
+if [ -n "$SUBNET6" ] && command -v ip6tables >/dev/null 2>&1; then
+  sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
+  ip6tables -A INPUT -i $IFACE -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -j ACCEPT
+  ip6tables -A OUTPUT -o $IFACE -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -o eth0 -s $SUBNET6 -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -o eth1 -s $SUBNET6 -j ACCEPT
+  ip6tables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+  ip6tables -t nat -A POSTROUTING -s $SUBNET6 -o eth0 -j MASQUERADE
+  ip6tables -t nat -A POSTROUTING -s $SUBNET6 -o eth1 -j MASQUERADE
+fi
 
 tail -f /dev/null
 """
@@ -781,6 +956,7 @@ tail -f /dev/null
             'I5': 'i5',
             'CPS': 'cps',
         }
+        param_map.update({config_key: param_key for param_key, config_key in AWG3_PARAM_MAP})
 
         for line in config.split('\n'):
             line = line.strip()
@@ -811,28 +987,78 @@ tail -f /dev/null
         return ips
 
     def _get_next_ip(self, protocol_type):
-        """Calculate the next available IP for a new client."""
+        """Return the first free IP in the subnet, filling gaps left by deleted clients.
+
+        The old implementation took the last IP in file order and incremented it,
+        which produced duplicate IPs when peers were not sorted by IP and never
+        reused addresses freed by deleted clients.
+        """
         used_ips = self._get_used_ips(protocol_type)
-        if not used_ips:
-            base = self._get_subnet_base(protocol_type)
-            parts = base.split('.')
-            parts[3] = '2'
-            return '.'.join(parts)
+        base = self._get_subnet_base(protocol_type)
+        parts = base.split('.')
+        prefix = '.'.join(parts[:3])
 
-        # Get the last used IP and increment
-        last_ip = used_ips[-1]
-        parts = last_ip.split('.')
-        last_octet = int(parts[3])
+        used_octets = set()
+        for ip in used_ips:
+            ip_parts = ip.split('.')
+            if len(ip_parts) != 4 or '.'.join(ip_parts[:3]) != prefix:
+                continue
+            try:
+                used_octets.add(int(ip_parts[3]))
+            except ValueError:
+                continue
 
-        if last_octet == 254:
-            next_octet = last_octet + 3
-        elif last_octet == 255:
-            next_octet = last_octet + 2
-        else:
-            next_octet = last_octet + 1
+        for octet in range(2, 255):
+            if octet not in used_octets:
+                parts[3] = str(octet)
+                return '.'.join(parts)
 
-        parts[3] = str(next_octet)
-        return '.'.join(parts)
+        raise RuntimeError("No free IP addresses left in the subnet")
+
+    @staticmethod
+    def _peer_block_ip(block):
+        """Sort key for a [Peer] config block: its first AllowedIPs IPv4 address."""
+        match = re.search(r'AllowedIPs\s*=\s*(\d+)\.(\d+)\.(\d+)\.(\d+)', block)
+        if match:
+            return tuple(int(match.group(i)) for i in range(1, 5))
+        return (255, 255, 255, 255)
+
+    def _insert_peer_sorted(self, protocol_type, peer_section):
+        """Insert a new [Peer] section into the server config keeping peers sorted by IP.
+
+        Creates a timestamped backup of the config inside the container before
+        overwriting it, then rewrites the file with all [Peer] sections ordered
+        by their AllowedIPs address.
+        """
+        container_name = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+
+        config = self._get_server_config(protocol_type)
+
+        # Backup current config inside the container before modifying it
+        ts = __import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cp {config_path} {config_path}.bak.{ts}"
+        )
+
+        head, _, rest = config.partition('[Peer]')
+        blocks = []
+        if rest:
+            for chunk in rest.split('[Peer]'):
+                chunk = chunk.strip()
+                if chunk:
+                    blocks.append('[Peer]\n' + chunk)
+
+        blocks.append(peer_section.strip())
+        blocks.sort(key=self._peer_block_ip)
+
+        new_config = head.rstrip('\n') + '\n\n' + '\n\n'.join(blocks) + '\n'
+
+        self.ssh.upload_file(new_config, "/tmp/_amnz_add_peer.conf")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_add_peer.conf {container_name}:{config_path}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_add_peer.conf")
 
     def _extract_ipv4(self, value):
         """Extract the first IPv4 address from AllowedIPs/clientIp-like values."""
@@ -1000,6 +1226,9 @@ tail -f /dev/null
 
         # Get next available IP
         client_ip = self._get_next_ip(protocol_type)
+        # Dual-stack: derive the client's IPv6 when the tunnel has an IPv6 gateway
+        client_ipv6 = self._get_client_ipv6(protocol_type, client_ip)
+        allowed_ips = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
 
         # Get AWG params from server config
         awg_params = self._get_awg_params_from_config(protocol_type)
@@ -1009,14 +1238,11 @@ tail -f /dev/null
 [Peer]
 PublicKey = {client_pub_key}
 PresharedKey = {psk}
-AllowedIPs = {client_ip}/32
+AllowedIPs = {allowed_ips}
 
 """
-        # Append peer to server config
-        escaped_peer = peer_section.replace("'", "'\\''")
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'"
-        )
+        # Insert peer into server config, keeping peers sorted by IP (with backup)
+        self._insert_peer_sorted(protocol_type, peer_section)
 
         # Sync config without restart
         self.ssh.run_sudo_command(
@@ -1036,6 +1262,8 @@ AllowedIPs = {client_ip}/32
                 'enabled': True,
             }
         }
+        if client_ipv6:
+            new_client['userData']['clientIpv6'] = client_ipv6
         clients_table.append(new_client)
         self._save_clients_table(protocol_type, clients_table)
 
@@ -1044,20 +1272,16 @@ AllowedIPs = {client_ip}/32
         if awg_params.get('port'):
             port = awg_params['port']
 
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        
-        # Check if AmneziaDNS is installed
-        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
-        if 'amnezia-dns' in out:
-            dns1 = '172.29.172.254'
-            
+        dns = self._get_dns(protocol_type)
+
         mtu = AWG_DEFAULTS['mtu']
 
-        # Standard fields
+        # Standard fields (dual-stack when the client has an IPv6 address)
+        address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
+        dns_line = dns + (", 2606:4700:4700::1111" if client_ipv6 else "")
         config_lines = [
-            f"Address = {client_ip}/32",
-            f"DNS = {dns1}, {dns2}",
+            f"Address = {address_line}",
+            f"DNS = {dns_line}",
             f"PrivateKey = {client_priv_key}",
             f"MTU = {mtu}"
         ]
@@ -1081,13 +1305,13 @@ AllowedIPs = {client_ip}/32
             ('i4', 'I4'),
             ('i5', 'I5'),
             ('cps', 'CPS')
-        ]
+        ] + AWG3_PARAM_MAP
 
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS') + AWG3_CONFIG_KEYS:
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
@@ -1121,9 +1345,13 @@ PersistentKeepalive = 25
             raise RuntimeError(f"Client {client_id} not found")
 
         ud = client.get('userData', {})
+        if ud.get('customConfig'):
+            return ud['customConfig']
         client_priv_key = ud.get('clientPrivateKey', '')
         client_ip = ud.get('clientIp', '')
         psk = ud.get('psk', '')
+        # Dual-stack: use the stored IPv6 or derive it from the IPv4 address
+        client_ipv6 = ud.get('clientIpv6', '') or self._get_client_ipv6(protocol_type, client_ip)
 
         if not client_priv_key:
             raise RuntimeError("Client private key not stored. Config cannot be reconstructed.")
@@ -1136,20 +1364,16 @@ PersistentKeepalive = 25
         if awg_params.get('port'):
             port = awg_params['port']
 
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        
-        # Check if AmneziaDNS is installed
-        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
-        if 'amnezia-dns' in out:
-            dns1 = '172.29.172.254'
-            
+        dns = self._get_dns(protocol_type, ud)
+
         mtu = AWG_DEFAULTS['mtu']
 
-        # Standard fields
+        # Standard fields (dual-stack when the client has an IPv6 address)
+        address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
+        dns_line = dns + (", 2606:4700:4700::1111" if client_ipv6 else "")
         config_lines = [
-            f"Address = {client_ip}/32",
-            f"DNS = {dns1}, {dns2}",
+            f"Address = {address_line}",
+            f"DNS = {dns_line}",
             f"PrivateKey = {client_priv_key}",
             f"MTU = {mtu}"
         ]
@@ -1173,13 +1397,13 @@ PersistentKeepalive = 25
             ('i4', 'I4'),
             ('i5', 'I5'),
             ('cps', 'CPS')
-        ]
+        ] + AWG3_PARAM_MAP
 
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS') + AWG3_CONFIG_KEYS:
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
@@ -1227,7 +1451,11 @@ PersistentKeepalive = 25
                 )
 
             ud['clientIp'] = client_ip
-            ud['allowedIps'] = f'{client_ip}/32'
+            client_ipv6 = ud.get('clientIpv6', '') or self._get_client_ipv6(protocol_type, client_ip)
+            allowed_ips = f'{client_ip}/32' + (f', {client_ipv6}/128' if client_ipv6 else '')
+            ud['allowedIps'] = allowed_ips
+            if client_ipv6:
+                ud['clientIpv6'] = client_ipv6
             table_changed = True
 
             if not psk:
@@ -1239,7 +1467,7 @@ PersistentKeepalive = 25
 [Peer]
 PublicKey = {client_id}
 PresharedKey = {psk}
-AllowedIPs = {client_ip}/32
+AllowedIPs = {allowed_ips}
 
 """
             escaped_peer = peer_section.replace("'", "'\\''")
@@ -1348,6 +1576,82 @@ AllowedIPs = {client_ip}/32
         self._save_clients_table(protocol_type, clients_table)
 
         return True
+
+    def _get_dns(self, protocol_type, user_data=None):
+        """DNS servers for generated client configs.
+
+        Priority: per-client override (userData.dns, set by saving an edited
+        config) > `DNS = ...` line in the server config (wg-quick-style key,
+        stripped by awg-quick so it does not affect syncconf) > AmneziaDNS
+        container address > built-in defaults.
+        """
+        if user_data and user_data.get('dns'):
+            return user_data['dns']
+        try:
+            server_config = self._get_server_config(protocol_type)
+            for line in server_config.split('\n'):
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    stripped = stripped.lstrip('#').strip()
+                if stripped.startswith('DNS') and '=' in stripped:
+                    return stripped.split('=', 1)[1].strip()
+        except Exception:
+            pass
+        dns1 = AWG_DEFAULTS['dns1']
+        dns2 = AWG_DEFAULTS['dns2']
+        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
+        if 'amnezia-dns' in out:
+            dns1 = '172.29.172.254'
+        return f"{dns1}, {dns2}"
+
+    def save_client_config(self, protocol_type, client_id, config_text):
+        """Persist a manually edited client config. Stored verbatim in
+        clientsTable (userData.customConfig) and returned by get_client_config
+        from now on; the DNS line is indexed into userData.dns as the
+        per-client override for future regenerations."""
+        config_text = (config_text or '').strip()
+        if not config_text:
+            raise RuntimeError('Config is empty')
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            raise RuntimeError('Client not found')
+        ud = client.setdefault('userData', {})
+        ud['customConfig'] = config_text
+        ud.pop('dns', None)
+        for line in config_text.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('DNS') and '=' in stripped:
+                ud['dns'] = stripped.split('=', 1)[1].strip()
+                break
+        self._save_clients_table(protocol_type, clients_table)
+        return {'status': 'success'}
+
+    def rename_client(self, protocol_type, client_id, new_name):
+        """Rename a client. The name lives only in the clientsTable
+        (userData.clientName); keys, IPs and the WireGuard config itself
+        are untouched, so existing configs keep working."""
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            # Peer added via the native Amnezia app is not in the table yet —
+            # persist a minimal entry so the chosen name sticks.
+            conf_peers = self._parse_peers_from_config(protocol_type)
+            if client_id not in conf_peers:
+                raise RuntimeError('Client not found')
+            client = {
+                'clientId': client_id,
+                'userData': {
+                    'clientName': new_name,
+                    'clientPrivateKey': '',
+                    'externalClient': True,
+                }
+            }
+            clients_table.append(client)
+        else:
+            client.setdefault('userData', {})['clientName'] = new_name
+        self._save_clients_table(protocol_type, clients_table)
+        return {'status': 'success', 'name': new_name}
 
     def get_server_status(self, protocol_type):
         """Get detailed status of the AWG server."""

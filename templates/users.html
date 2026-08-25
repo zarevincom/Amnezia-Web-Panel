@@ -213,12 +213,18 @@
                 </div>
                 <div class="form-group">
                     <label class="form-label">{{ _('traffic_reset_strategy_label') }}</label>
-                    <select class="form-select" id="editUserTrafficResetStrategy">
-                        <option value="never">{{ _('traffic_reset_never') }}</option>
-                        <option value="daily">{{ _('traffic_reset_daily') }}</option>
-                        <option value="weekly">{{ _('traffic_reset_weekly') }}</option>
-                        <option value="monthly">{{ _('traffic_reset_monthly') }}</option>
-                    </select>
+                    <div style="display: grid; grid-template-columns: 1fr auto; gap: var(--space-sm); align-items: center;">
+                        <select class="form-select" id="editUserTrafficResetStrategy">
+                            <option value="never">{{ _('traffic_reset_never') }}</option>
+                            <option value="daily">{{ _('traffic_reset_daily') }}</option>
+                            <option value="weekly">{{ _('traffic_reset_weekly') }}</option>
+                            <option value="monthly">{{ _('traffic_reset_monthly') }}</option>
+                        </select>
+                        <button type="button" class="btn btn-secondary btn-sm" id="resetTrafficBtn" onclick="resetUserTraffic()">
+                            <span id="resetTrafficBtnText">{{ _('reset_traffic') }}</span>
+                            <div class="spinner hidden" id="resetTrafficSpinner"></div>
+                        </button>
+                    </div>
                 </div>
             </div>
             <div class="form-group">
@@ -983,6 +989,30 @@
         setDateTimeValue('editUserExpiration', 'editUserExpirationTime', data.expiration);
         document.getElementById('editUserPass').value = '';
         openModal('editUserModal');
+    }
+
+    async function resetUserTraffic() {
+        const uid = document.getElementById('editUserId').value;
+        if (!uid || !confirm(_('reset_traffic_confirm'))) return;
+
+        const btn = document.getElementById('resetTrafficBtn');
+        const text = document.getElementById('resetTrafficBtnText');
+        const spinner = document.getElementById('resetTrafficSpinner');
+        btn.disabled = true;
+        text.textContent = _('resetting');
+        spinner.classList.remove('hidden');
+
+        try {
+            await apiCall(`/api/users/${uid}/traffic/reset`, 'POST');
+            showToast(_('traffic_reset_success'), 'success');
+            refreshUsersList();
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            text.textContent = _('reset_traffic');
+            spinner.classList.add('hidden');
+        }
     }
 
     async function saveEditUser() {

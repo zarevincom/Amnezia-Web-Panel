@@ -181,23 +181,34 @@ def load_data():
     data.setdefault('invites', [])
     data.setdefault('invite_claims', [])
     data.setdefault('audit_log', [])
-    data.setdefault('settings', {
-        'appearance': {
-            'title': 'Amnezia',
-            'logo': '❤️',
-            'subtitle': 'Web Panel'
-        },
+    settings = data.setdefault('settings', {
+        'appearance': {'title': 'Amnezia', 'logo': '❤️', 'subtitle': 'Web Panel'},
         'sync': {
-            'remnawave_url': '',
-            'remnawave_api_key': '',
-            'remnawave_sync': False,
-            'remnawave_sync_users': False,
-            'remnawave_create_conns': False,
-            'remnawave_server_id': 0,
-            'remnawave_protocol': 'awg'
-        }
+            'remnawave_url': '', 'remnawave_api_key': '', 'remnawave_sync': False,
+            'remnawave_sync_users': False, 'remnawave_create_conns': False,
+            'remnawave_server_id': 0, 'remnawave_protocol': 'awg',
+        },
     })
-    data['settings'].setdefault('alerts', {
+    settings.setdefault('captcha', {'enabled': False})
+    settings.setdefault('telegram', {'token': '', 'enabled': False})
+    settings.setdefault('ssl', {
+        'enabled': False,
+        'domain': '',
+        'cert_path': '',
+        'key_path': '',
+        'cert_text': '',
+        'key_text': '',
+        'panel_port': 5000
+    })
+    settings.setdefault('auto_backup', {
+        'enabled': False,
+        'interval_hours': 24,
+        'last_run_at': None,
+        'last_status': None,
+        'last_created_count': 0,
+        'last_error': None,
+    })
+    settings.setdefault('alerts', {
         'chat_id': '', 'disk_threshold': 90,
         'server_offline_template': '⚠️ Сервер {{server_name}} ({{server_ip}}) недоступен.',
         'disk_full_template': '⚠️ На сервере {{server_name}} осталось мало места: занято {{disk_percent}}%.',
@@ -879,8 +890,8 @@ async def wait_for_tunnel_url(provider: str, seconds: int = 20):
     return get_tunnel_status(provider)
 
 
-BASE_PROTOCOLS = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn']
-MULTI_INSTANCE_PROTOCOLS = {'awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'}
+BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn']
+MULTI_INSTANCE_PROTOCOLS = {'awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'}
 
 
 def protocol_base(protocol: str) -> str:
@@ -917,6 +928,7 @@ def protocol_display_name(protocol: str) -> str:
     names = {
         'awg': 'AmneziaWG',
         'awg2': 'AmneziaWG 2.0',
+        'awg3': 'AmneziaWG 3.1',
         'awg_legacy': 'AmneziaWG Legacy',
         'xray': 'Xray',
         'telemt': 'Telemt',
@@ -937,6 +949,7 @@ def protocol_container_name(protocol: str) -> Optional[str]:
     base_names = {
         'awg': 'amnezia-awg',
         'awg2': 'amnezia-awg2',
+        'awg3': 'amnezia-awg3',
         'awg_legacy': 'amnezia-awg-legacy',
         'xray': 'amnezia-xray',
         'telemt': 'telemt',
@@ -1623,6 +1636,16 @@ class TransferConnectionRequest(ConnectionActionRequest):
     """Move one client to a server that already runs the same protocol."""
     target_server_id: int
 
+class RenameConnectionRequest(BaseModel):
+    protocol: str = 'awg'
+    client_id: str = ''
+    new_name: str = ''
+
+class SaveConnectionConfigRequest(BaseModel):
+    protocol: str = 'awg'
+    client_id: str = ''
+    config: str = ''
+
 
 class ToggleConnectionRequest(BaseModel):
     protocol: str = 'awg'
@@ -1742,6 +1765,10 @@ class ClaimRequest(BaseModel):
     password: Optional[str] = None
     captcha: Optional[str] = None
 
+class AutoBackupSettings(BaseModel):
+    enabled: bool = False
+    interval_hours: int = 24
+
 
 
 
@@ -1762,6 +1789,7 @@ class SaveSettingsRequest(BaseModel):
     captcha: CaptchaSettings
     telegram: TelegramSettings
     ssl: SSLSettings
+    auto_backup: AutoBackupSettings = AutoBackupSettings()
 
 
 class ToggleUserRequest(BaseModel):
@@ -1880,8 +1908,27 @@ async def startup():
             'key_text': '',
             'panel_port': 5000
         }
+
+    # Auto backup settings migration
+    auto_backup = data.setdefault('settings', {}).setdefault('auto_backup', {})
+    if 'enabled' not in auto_backup:
+        auto_backup['enabled'] = False
         changed = True
-        logger.info("Migrated SSL settings")
+    if 'interval_hours' not in auto_backup:
+        auto_backup['interval_hours'] = 24
+        changed = True
+    if 'last_run_at' not in auto_backup:
+        auto_backup['last_run_at'] = None
+        changed = True
+    if 'last_status' not in auto_backup:
+        auto_backup['last_status'] = None
+        changed = True
+    if 'last_created_count' not in auto_backup:
+        auto_backup['last_created_count'] = 0
+        changed = True
+    if 'last_error' not in auto_backup:
+        auto_backup['last_error'] = None
+        changed = True
 
     if changed:
         save_data(data)
@@ -2072,12 +2119,118 @@ async def notification_scheduler():
         await asyncio.sleep(20)
 
 
+def _auto_backup_due(auto_backup: dict, now: Optional[datetime] = None) -> bool:
+    if not auto_backup.get('enabled'):
+        return False
+    try:
+        interval_hours = max(1, min(24, int(auto_backup.get('interval_hours') or 24)))
+    except (TypeError, ValueError):
+        interval_hours = 24
+    last_run_at = auto_backup.get('last_run_at')
+    if not last_run_at:
+        return True
+    try:
+        last_run = datetime.fromisoformat(str(last_run_at))
+    except ValueError:
+        return True
+    now = now or datetime.now()
+    return now - last_run >= timedelta(hours=interval_hours)
+
+
+def _create_auto_backups_once(data: dict) -> dict:
+    started_at = datetime.now()
+    created = []
+    errors = []
+
+    for server_id, server in enumerate(data.get('servers', [])):
+        protocols = server.get('protocols', {}) or {}
+        installed_protocols = [
+            proto for proto, info in protocols.items()
+            if isinstance(info, dict) and info.get('installed') and is_valid_protocol(proto) and protocol_container_name(proto)
+        ]
+        if not installed_protocols:
+            continue
+
+        ssh = None
+        try:
+            ssh = get_ssh(server)
+            ssh.connect()
+            backup_manager = BackupManager(ssh)
+            for proto in installed_protocols:
+                try:
+                    result = backup_manager.create_backup(proto, protocol_container_name(proto))
+                    if result.get('status') == 'success':
+                        created.append({
+                            'server_id': server_id,
+                            'protocol': proto,
+                            'name': result.get('backup', {}).get('name')
+                        })
+                    else:
+                        errors.append({
+                            'server_id': server_id,
+                            'protocol': proto,
+                            'error': result.get('message', 'Failed to create backup')
+                        })
+                except Exception as e:
+                    errors.append({'server_id': server_id, 'protocol': proto, 'error': str(e)})
+        except Exception as e:
+            for proto in installed_protocols:
+                errors.append({'server_id': server_id, 'protocol': proto, 'error': str(e)})
+        finally:
+            if ssh:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+    status = 'success' if not errors else ('partial' if created else 'error')
+    return {
+        'status': status,
+        'started_at': started_at.isoformat(),
+        'finished_at': datetime.now().isoformat(),
+        'created_count': len(created),
+        'created': created,
+        'errors': errors,
+        'error': '; '.join(f"server {e['server_id']} {e['protocol']}: {e['error']}" for e in errors[:5]) if errors else None
+    }
+
+
+async def run_auto_backups_if_due():
+    data = load_data()
+    auto_backup = data.get('settings', {}).get('auto_backup', {})
+    if not _auto_backup_due(auto_backup):
+        return None
+
+    logger.info("Starting scheduled auto backups...")
+    result = await asyncio.to_thread(_create_auto_backups_once, data)
+
+    async with DATA_LOCK:
+        curr_data = load_data()
+        curr_auto = curr_data.setdefault('settings', {}).setdefault('auto_backup', {})
+        curr_auto['enabled'] = bool(curr_auto.get('enabled', auto_backup.get('enabled', False)))
+        try:
+            curr_auto['interval_hours'] = max(1, min(24, int(curr_auto.get('interval_hours') or auto_backup.get('interval_hours') or 24)))
+        except (TypeError, ValueError):
+            curr_auto['interval_hours'] = 24
+        curr_auto['last_run_at'] = result['finished_at']
+        curr_auto['last_status'] = result['status']
+        curr_auto['last_created_count'] = result['created_count']
+        curr_auto['last_error'] = result.get('error')
+        save_data(curr_data)
+
+    logger.info(
+        "Auto backups finished: status=%s created=%s errors=%s",
+        result['status'], result['created_count'], len(result.get('errors', []))
+    )
+    return result
+
+
 def _scrape_server_traffic(server, sid, my_conns):
     server_updates = []
     try:
         ssh = get_ssh(server)
         ssh.connect()
-        for proto in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard']:
+        for proto in ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard']:
             if proto in server.get('protocols', {}):
                 manager = get_protocol_manager(ssh, proto)
                 clients = _manager_call(manager, 'get_clients', proto)
@@ -2190,7 +2343,10 @@ async def periodic_background_tasks():
                 logger.info(f"Traffic limit reached, disabling users: {to_disable_uids}")
                 await perform_mass_operations(toggle_uids=[(uid, False) for uid in to_disable_uids])
 
-            # --- 2. REMNAWAVE SYNC ---
+            # --- 2. AUTO BACKUP ---
+            await run_auto_backups_if_due()
+
+            # --- 3. REMNAWAVE SYNC ---
             logger.info("Starting background Remnawave sync...")
             data = load_data()
             if data.get('settings', {}).get('sync', {}).get('remnawave_sync_users'):
@@ -3034,6 +3190,7 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
 CONTAINER_NAMES = {
     'awg': 'amnezia-awg',
     'awg2': 'amnezia-awg2',
+    'awg3': 'amnezia-awg3',
     'awg_legacy': 'amnezia-awg-legacy',
     'xray': 'amnezia-xray',
     'telemt': 'telemt',
@@ -3473,7 +3630,7 @@ async def api_transfer_connection(request: Request, server_id: int, req: Transfe
     """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    if protocol_base(req.protocol) not in {'awg', 'awg2', 'awg_legacy', 'wireguard', 'xray', 'telemt', 'aivpn'}:
+    if protocol_base(req.protocol) not in {'awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'xray', 'telemt', 'aivpn'}:
         return JSONResponse({'error': 'This protocol does not support profile transfer'}, status_code=400)
     if not req.client_id:
         return JSONResponse({'error': 'Client ID is required'}, status_code=400)
@@ -3667,6 +3824,67 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
         return result
     except Exception as e:
         logger.exception("Error editing connection")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/connections/rename', tags=["Connections"])
+async def api_rename_connection(request: Request, server_id: int, req: RenameConnectionRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        new_name = (req.new_name or '').strip()
+        if not new_name:
+            return JSONResponse({'error': 'New name is required'}, status_code=400)
+        if not req.client_id:
+            return JSONResponse({'error': 'Client ID is required'}, status_code=400)
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, req.protocol)
+        result = _manager_call(manager, 'rename_client', req.protocol, req.client_id, new_name) or {}
+        ssh.disconnect()
+        # Telemt rename may also change client_id (username is the identity there)
+        new_client_id = result.get('client_id', req.client_id)
+        stored_name = result.get('name', new_name)
+        changed = False
+        for conn in data.get('user_connections', []):
+            if conn.get('client_id') == req.client_id and conn.get('server_id') == server_id and conn.get('protocol') == req.protocol:
+                conn['name'] = stored_name
+                conn['client_id'] = new_client_id
+                changed = True
+        if changed:
+            save_data(data)
+        return {'status': 'success', 'name': stored_name, 'client_id': new_client_id}
+    except Exception as e:
+        logger.exception("Error renaming connection")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/connections/config/save', tags=["Connections"])
+async def api_save_connection_config(request: Request, server_id: int, req: SaveConnectionConfigRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        config_text = (req.config or '').strip()
+        if not config_text:
+            return JSONResponse({'error': 'Config is required'}, status_code=400)
+        if not req.client_id:
+            return JSONResponse({'error': 'Client ID is required'}, status_code=400)
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, req.protocol)
+        _manager_call(manager, 'save_client_config', req.protocol, req.client_id, config_text)
+        ssh.disconnect()
+        return {'status': 'success', 'vpn_link': generate_vpn_link(config_text)}
+    except Exception as e:
+        logger.exception("Error saving connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
@@ -4015,6 +4233,29 @@ async def api_toggle_user(request: Request, user_id: str, req: ToggleUserRequest
         return {'status': 'success', 'enabled': req.enabled}
     except Exception as e:
         logger.exception("Error toggling user")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/users/{user_id}/traffic/reset', tags=["Users"])
+async def api_reset_user_traffic(request: Request, user_id: str):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        user = next((u for u in data.get('users', []) if u.get('id') == user_id), None)
+        if not user:
+            return JSONResponse({'error': 'User not found'}, status_code=404)
+
+        user['traffic_used'] = 0
+        user['last_reset_at'] = datetime.now().isoformat()
+        save_data(data)
+        return {
+            'status': 'success',
+            'traffic_used': user['traffic_used'],
+            'last_reset_at': user['last_reset_at']
+        }
+    except Exception as e:
+        logger.exception("Error resetting user traffic")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
@@ -4669,13 +4910,25 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
-    data['settings']['appearance'] = payload.appearance.dict()
-    data['settings']['sync'] = payload.sync.dict()
-    data['settings']['captcha'] = payload.captcha.dict()
-    data['settings']['telegram'] = payload.telegram.dict()
-    data['settings']['ssl'] = payload.ssl.dict()
+    settings = data.setdefault('settings', {})
+    settings['appearance'] = payload.appearance.dict()
+    settings['sync'] = payload.sync.dict()
+    settings['captcha'] = payload.captcha.dict()
+    settings['telegram'] = payload.telegram.dict()
+    settings['ssl'] = payload.ssl.dict()
+
+    old_auto_backup = settings.get('auto_backup', {}) or {}
+    interval_hours = max(1, min(24, int(payload.auto_backup.interval_hours or 24)))
+    settings['auto_backup'] = {
+        'enabled': bool(payload.auto_backup.enabled),
+        'interval_hours': interval_hours,
+        'last_run_at': old_auto_backup.get('last_run_at'),
+        'last_status': old_auto_backup.get('last_status'),
+        'last_created_count': old_auto_backup.get('last_created_count', 0),
+        'last_error': old_auto_backup.get('last_error')
+    }
     save_data(data)
-    logger.info("Settings saved (including captcha and telegram)")
+    logger.info("Settings saved (including captcha, telegram and auto backup)")
 
     # Handle bot start/stop based on new telegram settings
     tg_cfg = payload.telegram

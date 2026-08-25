@@ -400,9 +400,12 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
         tag = self._get_vless_inbound_tag(config)
         if not tag:
             return False
+        _ib = self._get_vless_inbound(config) or {}
         payload = {
             "inbounds": [{
                 "tag": tag,
+                "port": _ib.get('port', 443),
+                "listen": "0.0.0.0",
                 "protocol": "vless",
                 "settings": {
                     "clients": [client],
@@ -411,7 +414,7 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
             }]
         }
         ok, message = self._run_xray_api_json('adu', payload)
-        if not ok:
+        if not ok or 'Added 0 user' in (message or ''):
             logger.warning(f"Xray API add user failed: {message}")
             return False
         return True
@@ -798,3 +801,16 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
         clients_table = [c for c in clients_table if c['clientId'] != client_id]
         self._save_clients_table(clients_table)
         return True
+
+    def rename_client(self, protocol, client_id, new_name):
+        """Rename a client. The display name lives in clientsTable
+        (userData.clientName) and is embedded into the VLESS URL fragment on
+        the fly, so updating the table is enough — UUID, keys and server.json
+        stay untouched and existing links keep working."""
+        clients_table = self._get_clients_table()
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            raise RuntimeError('Client not found')
+        client.setdefault('userData', {})['clientName'] = new_name
+        self._save_clients_table(clients_table)
+        return {'status': 'success', 'name': new_name}
