@@ -117,7 +117,7 @@ STATE_STORE = SQLiteStateStore(
     master_key=os.environ.get('PANEL_MASTER_KEY', ''),
     require_encryption=os.environ.get('PANEL_REQUIRE_ENCRYPTION', '').lower() in {'1', 'true', 'yes'},
 )
-CURRENT_VERSION = "v1.5.0"
+CURRENT_VERSION = "v1.6.0"
 BIN_DIR = os.environ.get('TUNNEL_BIN_DIR', os.path.join(application_path, 'bin'))
 TUNNEL_STATE_FILE = os.environ.get('TUNNEL_STATE_FILE', os.path.join(application_path, 'tunnels_state.json'))
 
