@@ -358,7 +358,8 @@ docker compose version
             
         secret = kwargs.get('secret') or secrets.token_hex(16)
         
-        # 1. Update config file for persistence (but don't restart yet)
+        # Persist first: Telemt refuses to start with an empty [access.users]
+        # section, so its runtime API cannot be relied on for the first user.
         config_text = self._insert_into_section(config_text, "access.users", f'{username} = "{secret}"')
         
         api_payload = {
@@ -391,11 +392,15 @@ docker compose version
             config_text = self._insert_into_section(config_text, "access.user_max_tcp_conns", f'{username} = {val}')
             api_payload['max_tcp_conns'] = val
 
-        # Save config to host
-        self.ssh.upload_file_sudo(config_content.replace('\r\n', '\n'), f"{self._config_path()}")
-        
-        # 2. Call API for immediate effect
-        self._api_request("POST", "/v1/users", data=api_payload)
+        # Apply the persistent configuration before asking Telemt for its
+        # generated link. This also recovers a container stuck in a restart
+        # loop because it previously had no configured users.
+        self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), f"{self._config_path()}")
+        _, restart_error, restart_code = self.ssh.run_sudo_command(
+            f"docker restart {self.container_name}"
+        )
+        if restart_code != 0:
+            raise RuntimeError(restart_error or 'Failed to restart Telemt')
         
         # Fetch the official link from API (it includes TLS emulation padding like 'ee...' if enabled)
         link = self.get_client_config(protocol_type, username, host, port)
@@ -448,11 +453,14 @@ docker compose version
             config_text = self._update_line_in_section(config_text, "access.user_max_tcp_conns", client_id, val)
             api_payload['max_tcp_conns'] = val
 
-        # Save config to host
-        self.ssh.upload_file_sudo(config_content.replace('\r\n', '\n'), f"{self._config_path()}")
-        
-        # API call
-        self._api_request("PATCH", f"/v1/users/{client_id}", data=api_payload)
+        # Reload from the saved file so edits also work when the API is
+        # temporarily unavailable during a container restart.
+        self.ssh.upload_file_sudo(config_text.replace('\r\n', '\n'), f"{self._config_path()}")
+        _, restart_error, restart_code = self.ssh.run_sudo_command(
+            f"docker restart {self.container_name}"
+        )
+        if restart_code != 0:
+            raise RuntimeError(restart_error or 'Failed to restart Telemt')
         return {"status": "success"}
 
     def _update_line_in_section(self, config_text, section_name, client_id, value):
