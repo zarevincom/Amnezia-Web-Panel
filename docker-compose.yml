@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   amnezia_panel:
+    build: .
     image: prvtpro/amnezia-panel:latest
     container_name: amnezia_panel
 
@@ -12,12 +13,10 @@ services:
       PANEL_DB_FILE: /app/data/panel.db
       PANEL_MASTER_KEY: ${PANEL_MASTER_KEY:?Set PANEL_MASTER_KEY in .env before starting the panel}
       PANEL_REQUIRE_ENCRYPTION: "true"
+      DATA_FILE: /app/data/data.json
 
     volumes:
       - amnezia_data:/app/data
-
-    environment:
-      DATA_FILE: /app/data/data.json
     restart: unless-stopped
 
     healthcheck:
