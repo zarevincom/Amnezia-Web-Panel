@@ -636,12 +636,5 @@
   "start_peer_title": "Включить",
   "ssh_cooldown_title": "SSH cooldown (сек)",
   "ssh_cooldown_hint": "Начальная пауза перед повторным подключением к недоступному серверу. Не меняйте, если сервер работает корректно.",
-  "telegram_invite_title": "Приглашение в Telegram: {}",
-  "telegram_invite_hint": "Ссылка откроет бота и привяжет Telegram пользователя к этому профилю. Она одноразовая и показывается только сейчас.",
-  "telegram_invite_expiry": "Действует до",
-  "telegram_invite_link": "Ссылка для Telegram",
-  "telegram_invite_generate": "Создать ссылку",
-  "telegram_invite_replace": "Выпустить новую ссылку",
-  "telegram_invite_pending": "Ожидает привязки Telegram",
-  "telegram_invite_copied": "Ссылка приглашения скопирована"
+  "telegram_invite_pending": "Ожидает привязки Telegram"
 }

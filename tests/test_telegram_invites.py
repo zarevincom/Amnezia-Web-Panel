@@ -19,6 +19,20 @@ def _start_update(telegram_id, payload, chat_type="private"):
     }
 
 
+def _callback_update(telegram_id, callback_data, chat_type="private", chat_id=None):
+    return {
+        "callback_query": {
+            "id": "callback-1",
+            "from": {"id": telegram_id, "first_name": "Admin"},
+            "message": {
+                "chat": {"id": chat_id if chat_id is not None else telegram_id, "type": chat_type},
+                "message_id": 11,
+            },
+            "data": callback_data,
+        }
+    }
+
+
 def _invite(payload, user_id="user-1", expires_at=None):
     return {
         "id": "invite-1",
@@ -110,6 +124,91 @@ class TestTelegramBotInvites:
         assert "unavailable" in self.api.send_message.call_args.args[1].lower()
 
 
+class TestTelegramBotInviteIssuing:
+    def setup_method(self):
+        self.data = {
+            "users": [
+                {
+                    "id": "admin-1",
+                    "username": "admin",
+                    "role": "admin",
+                    "enabled": True,
+                    "telegramId": "222",
+                },
+                {
+                    "id": "user-1",
+                    "username": "alice",
+                    "role": "none",
+                    "enabled": True,
+                },
+            ],
+            "user_connections": [],
+            "telegram_invites": [],
+            "audit_log": [],
+        }
+        self.api = AsyncMock()
+        self.saved = []
+
+    async def _dispatch(self, update):
+        await tg_bot._dispatch(
+            self.api,
+            update,
+            lambda: self.data,
+            lambda config: f"vpn://{config}",
+            lambda data: self.saved.append(copy.deepcopy(data)),
+            bot_username="panel_bot",
+        )
+
+    def test_admin_creates_named_user_and_non_expiring_invitation_in_bot(self):
+        asyncio.run(self._dispatch(_callback_update(222, "adm:create_telegram_user")))
+        asyncio.run(self._dispatch({
+            "message": {
+                "chat": {"id": 222, "type": "private"},
+                "from": {"id": 222, "first_name": "Admin"},
+                "text": "Alice iPhone",
+            }
+        }))
+
+        user = next(item for item in self.data["users"] if item["username"] == "Alice iPhone")
+        invite = self.data["telegram_invites"][0]
+        serialized_state = json.dumps(self.data)
+        messages = [call.args[1] for call in self.api.send_message.call_args_list]
+        payload = messages[-1].split("?start=", 1)[1].split("</code>", 1)[0]
+
+        assert user["role"] == "none"
+        assert not user["telegramId"]
+        assert invite["user_id"] == user["id"]
+        assert invite["expires_at"] is None
+        assert invite["token_hash"] == tg_bot._telegram_invite_hash(payload)
+        assert payload not in serialized_state
+        assert [event["event"] for event in self.data["audit_log"][-2:]] == [
+            "telegram_user_created",
+            "telegram_invite_created",
+        ]
+        assert self.saved
+
+    def test_reissuing_from_an_existing_user_revokes_previous_link(self):
+        first_ref = tg_bot._ref("telegram_invite_create", {"uid": "user-1"})
+        asyncio.run(self._dispatch(_callback_update(222, first_ref)))
+        second_ref = tg_bot._ref("telegram_invite_create", {"uid": "user-1"})
+        asyncio.run(self._dispatch(_callback_update(222, second_ref)))
+
+        first, second = self.data["telegram_invites"]
+        assert not first["enabled"]
+        assert first["revoked_at"]
+        assert second["enabled"]
+        assert second["expires_at"] is None
+
+    def test_group_chat_cannot_start_user_creation(self):
+        asyncio.run(self._dispatch(
+            _callback_update(222, "adm:create_telegram_user", chat_type="group", chat_id=-100)
+        ))
+
+        assert len(self.data["users"]) == 2
+        assert not self.data["telegram_invites"]
+        assert "private" in self.api.send_message.call_args.args[1].lower()
+
+
 class TestTelegramInviteApi:
     def setup_method(self):
         self.data = {
@@ -139,6 +238,8 @@ class TestTelegramInviteApi:
         assert result["url"].startswith("https://t.me/panel_bot?start=tg_")
         assert invite["token_hash"] == panel._telegram_invite_hash(payload)
         assert payload not in json.dumps(invite)
+        assert invite["expires_at"] is None
+        assert "expires_at" not in result
         assert invite["created_by"] == "admin-1"
         assert self.data["audit_log"][-1]["event"] == "telegram_invite_created"
         save_data.assert_called_once_with(self.data)

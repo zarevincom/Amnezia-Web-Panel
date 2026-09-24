@@ -595,12 +595,5 @@
   "start_peer_title": "فعال‌سازی",
   "ssh_cooldown_title": "SSH cooldown (ثانیه)",
   "ssh_cooldown_hint": "تأخیر اولیه قبل از اتصال مجدد به سرور در دسترس‌نبوده. اگر سرور درست کار می‌کند، تغییر ندهید.",
-  "telegram_invite_title": "دعوت‌نامه تلگرام: {}",
-  "telegram_invite_hint": "این پیوند ربات را باز می‌کند و حساب تلگرام کاربر را به این پروفایل متصل می‌کند. پیوند یک‌بار مصرف است و فقط اکنون نمایش داده می‌شود.",
-  "telegram_invite_expiry": "معتبر تا",
-  "telegram_invite_link": "پیوند تلگرام",
-  "telegram_invite_generate": "ایجاد پیوند",
-  "telegram_invite_replace": "ایجاد پیوند جدید",
-  "telegram_invite_pending": "در انتظار اتصال تلگرام",
-  "telegram_invite_copied": "پیوند دعوت کپی شد"
+  "telegram_invite_pending": "در انتظار اتصال تلگرام"
 }

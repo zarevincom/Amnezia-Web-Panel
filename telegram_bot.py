@@ -5,7 +5,6 @@ Runs as a background asyncio task alongside the FastAPI app.
 """
 import asyncio
 from datetime import datetime, timezone
-import hashlib
 import hmac
 import html
 import logging
@@ -27,6 +26,14 @@ from connection_service import (
     self_service_protocol_display_name,
     server_self_service_protocols,
 )
+from telegram_invite_service import (
+    TELEGRAM_INVITE_PREFIX,
+    TelegramInviteError,
+    create_telegram_invite,
+    create_telegram_user,
+    telegram_invite_hash as _telegram_invite_hash,
+    telegram_invite_is_active as _telegram_invite_is_active,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +54,6 @@ _EXTRA_PROTOCOL_DISPLAY_NAMES = {
     "aivpn": "AIVPN",
 }
 SERVICE_PROTOCOLS = {"dns", "adguard", "socks5", "nginx", "exit"}
-TELEGRAM_INVITE_PREFIX = "tg_"
 TELEGRAM_INVITE_PAYLOAD_RE = re.compile(r"tg_[A-Za-z0-9_-]{24,60}$")
 
 TG_TRANSLATIONS = {
@@ -56,9 +62,18 @@ TG_TRANSLATIONS = {
         "account_not_linked": "Your Telegram account is not linked to any panel user.",
         "contact_admin_to_link": "Please contact your administrator — they need to add your Telegram ID to your profile.",
         "your_telegram_id": "Your Telegram ID",
-        "telegram_invite_invalid": "This Telegram invitation is unavailable or has expired.",
+        "telegram_invite_invalid": "This Telegram invitation is unavailable.",
         "telegram_invite_linked": "Your Telegram account is now linked to <b>{username}</b>.",
         "telegram_invite_private_only": "Open this invitation in a private chat with the bot.",
+        "btn_create_telegram_invite": "Create Telegram invitation",
+        "btn_create_telegram_user": "Create user",
+        "send_telegram_user_name": "Send the new user's name. It will be shown in the panel and bound when they open the invitation.\n\nSend <code>/cancel</code> to cancel.",
+        "telegram_user_created": "User <b>{username}</b> was created.",
+        "telegram_user_name_invalid": "Enter a user name up to 80 characters.",
+        "telegram_user_name_taken": "A user with this name already exists.",
+        "telegram_invite_created": "Invitation for <b>{username}</b> is ready. Forward this link without opening it:\n<code>{url}</code>",
+        "telegram_invite_unavailable": "A Telegram invitation cannot be created for this user.",
+        "telegram_invite_bot_unavailable": "Telegram bot information is unavailable. Restart the bot from Settings and try again.",
         "registered_admin": "You are registered as <b>{username}</b> with <b>Admin</b> role.",
         "choose_action": "Choose an action:",
         "registered_as": "You are registered as <b>{username}</b>.",
@@ -169,9 +184,18 @@ TG_TRANSLATIONS = {
         "account_not_linked": "Ваш аккаунт Telegram не привязан ни к одному пользователю панели.",
         "contact_admin_to_link": "Обратитесь к администратору — он должен добавить ваш Telegram ID в профиль.",
         "your_telegram_id": "Ваш Telegram ID",
-        "telegram_invite_invalid": "Это Telegram-приглашение недоступно или срок его действия истёк.",
+        "telegram_invite_invalid": "Это Telegram-приглашение недоступно.",
         "telegram_invite_linked": "Ваш аккаунт Telegram привязан к пользователю <b>{username}</b>.",
         "telegram_invite_private_only": "Откройте это приглашение в личном чате с ботом.",
+        "btn_create_telegram_invite": "Создать Telegram-приглашение",
+        "btn_create_telegram_user": "Создать пользователя",
+        "send_telegram_user_name": "Отправьте имя нового пользователя. Оно будет видно в панели и привязано к получателю при открытии приглашения.\n\nОтправьте <code>/cancel</code> для отмены.",
+        "telegram_user_created": "Пользователь <b>{username}</b> создан.",
+        "telegram_user_name_invalid": "Введите имя пользователя до 80 символов.",
+        "telegram_user_name_taken": "Пользователь с таким именем уже существует.",
+        "telegram_invite_created": "Приглашение для <b>{username}</b> готово. Перешлите ссылку получателю, не открывая её:\n<code>{url}</code>",
+        "telegram_invite_unavailable": "Для этого пользователя нельзя создать Telegram-приглашение.",
+        "telegram_invite_bot_unavailable": "Не удалось получить данные Telegram-бота. Перезапустите бота в настройках и повторите попытку.",
         "registered_admin": "Вы зарегистрированы как <b>{username}</b> с ролью <b>Admin</b>.",
         "choose_action": "Выберите действие:",
         "registered_as": "Вы зарегистрированы как <b>{username}</b>.",
@@ -424,10 +448,6 @@ def _find_user(load_data_fn: Callable, tg_id: str, username: Optional[str] = Non
     return None
 
 
-def _telegram_invite_hash(payload: str) -> str:
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 def _start_payload(text: str) -> Optional[str]:
     """Return a Telegram deep-link payload from a /start command, if present."""
     parts = (text or "").strip().split(maxsplit=1)
@@ -435,19 +455,6 @@ def _start_payload(text: str) -> Optional[str]:
         return None
     payload = parts[1].strip()
     return payload if TELEGRAM_INVITE_PAYLOAD_RE.fullmatch(payload) else None
-
-
-def _telegram_invite_is_active(invite: dict) -> bool:
-    if not invite.get("enabled", True) or invite.get("accepted_at"):
-        return False
-    try:
-        expires_at = datetime.fromisoformat(str(invite["expires_at"]).replace("Z", "+00:00"))
-    except (KeyError, TypeError, ValueError):
-        return False
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    return expires_at > datetime.now(timezone.utc)
-
 
 async def _claim_telegram_invite(
     api: TelegramAPI,
@@ -652,7 +659,10 @@ def _user_label(user: dict) -> str:
 
 
 def _users_keyboard(data: dict, back_callback: str = "adm:menu", lang: str = "en") -> dict:
-    rows = []
+    rows = [[{
+        "text": f"➕ {_tt(lang, 'btn_create_telegram_user')}",
+        "callback_data": "adm:create_telegram_user",
+    }]]
     for user in data.get("users", [])[:40]:
         rows.append([{"text": f" {_user_label(user)}", "callback_data": _ref("user", {"uid": user.get("id")})}])
     rows.append([{"text": f"⬅️ {_tt(lang, 'btn_back')}", "callback_data": back_callback}])
@@ -672,6 +682,7 @@ def _admin_main_keyboard(lang: str = "en") -> dict:
         "inline_keyboard": [
             [{"text": f"🖥 {_tt(lang, 'btn_servers')}", "callback_data": "adm:servers"}],
             [{"text": f"👤 {_tt(lang, 'btn_users')}", "callback_data": "adm:users"}],
+            [{"text": f"➕ {_tt(lang, 'btn_create_telegram_user')}", "callback_data": "adm:create_telegram_user"}],
             [{"text": f"🔐 {_tt(lang, 'btn_my_connections')}", "callback_data": "adm:myconns"}],
             [{"text": f"➕ {_tt(lang, 'btn_how_add_server')}", "callback_data": "adm:addserver_help"}],
         ]
@@ -1124,9 +1135,85 @@ async def _admin_user_detail(api: TelegramAPI, chat_id: int, message_id: int, us
         if isinstance(sid, int) and sid < len(servers):
             server_name = servers[sid].get("name") or servers[sid].get("host") or "Unknown"
         rows.append([{"text": f"🔐 {c.get('name', 'Connection')} · {c.get('protocol', '').upper()} · {server_name}", "callback_data": f"cfg:{c.get('id')}"}])
+    if user.get("enabled", True) and not user.get("telegramId"):
+        rows.append([{
+            "text": f"✈️ {_tt(lang, 'btn_create_telegram_invite')}",
+            "callback_data": _ref("telegram_invite_create", {"uid": user_id}),
+        }])
     rows.append([{"text": f"⬅️ {_tt(lang, 'btn_users')}", "callback_data": "adm:users"}])
     rows.append([{"text": f"⬅️ {_tt(lang, 'btn_admin_menu')}", "callback_data": "adm:menu"}])
     await api.edit_message(chat_id, message_id, "\n".join(lines), reply_markup={"inline_keyboard": rows})
+
+
+async def _admin_create_telegram_user_start(
+    api: TelegramAPI,
+    chat_id: int,
+    message_id: int,
+    tg_id: str,
+    panel_user: dict,
+    save_data_fn: Optional[Callable],
+    lang: str = "en",
+):
+    """Start a private, one-message wizard that creates and invites a user."""
+    if not save_data_fn:
+        await api.edit_message(chat_id, message_id, f"❌ {_tt(lang, 'saving_not_available')}")
+        return
+    _pending_inputs[_pending_key(chat_id, tg_id)] = {
+        "kind": "create_telegram_user",
+        "ts": time.time(),
+    }
+    await api.edit_message(
+        chat_id,
+        message_id,
+        f"➕ <b>{_tt(lang, 'btn_create_telegram_user')}</b>\n\n"
+        f"{_tt(lang, 'send_telegram_user_name')}",
+        reply_markup={"inline_keyboard": [[{
+            "text": f"❌ {_tt(lang, 'btn_cancel')}",
+            "callback_data": "adm:users",
+        }]]},
+    )
+
+
+async def _admin_create_telegram_invite(
+    api: TelegramAPI,
+    chat_id: int,
+    message_id: int,
+    user_id: str,
+    panel_user: dict,
+    bot_username: Optional[str],
+    load_data_fn: Callable,
+    save_data_fn: Optional[Callable],
+    lang: str = "en",
+):
+    """Issue a link with the same shared service used by the HTTP API."""
+    if not save_data_fn:
+        await api.edit_message(chat_id, message_id, f"❌ {_tt(lang, 'saving_not_available')}")
+        return
+    if not bot_username:
+        await api.edit_message(chat_id, message_id, f"❌ {_tt(lang, 'telegram_invite_bot_unavailable')}")
+        return
+
+    data = load_data_fn()
+    try:
+        _, raw_payload = create_telegram_invite(data, user_id, str(panel_user.get("id") or ""))
+        save_data_fn(data)
+    except TelegramInviteError:
+        await api.edit_message(chat_id, message_id, f"❌ {_tt(lang, 'telegram_invite_unavailable')}")
+        return
+
+    user = next((item for item in data.get("users", []) if item.get("id") == user_id), None)
+    username = _e((user or {}).get("username") or "-")
+    url = f"https://t.me/{str(bot_username).lstrip('@')}?start={raw_payload}"
+    text = _tt(lang, "telegram_invite_created", username=username, url=_e(url))
+    await api.edit_message(
+        chat_id,
+        message_id,
+        text,
+        reply_markup={"inline_keyboard": [[{
+            "text": f"⬅️ {_tt(lang, 'btn_users')}",
+            "callback_data": "adm:users",
+        }]]},
+    )
 
 
 async def _admin_server_detail(api: TelegramAPI, chat_id: int, message_id: int, server_id: int, load_data_fn: Callable, lang: str = "en"):
@@ -1416,7 +1503,15 @@ async def _admin_remove_client(api: TelegramAPI, chat_id: int, message_id: int, 
         await api.edit_message(chat_id, message_id, f" {_tt(lang, 'error')}: {_e(e)}")
 
 
-async def _handle_pending_input(api: TelegramAPI, msg: dict, load_data_fn: Callable, save_data_fn: Optional[Callable], generate_vpn_link_fn: Callable, self_service_svc=None) -> bool:
+async def _handle_pending_input(
+    api: TelegramAPI,
+    msg: dict,
+    load_data_fn: Callable,
+    save_data_fn: Optional[Callable],
+    generate_vpn_link_fn: Callable,
+    self_service_svc=None,
+    bot_username: Optional[str] = None,
+) -> bool:
     chat_id = msg["chat"]["id"]
     from_id = msg["from"]["id"]
     lang = _tg_lang(msg.get("from"))
@@ -1433,6 +1528,50 @@ async def _handle_pending_input(api: TelegramAPI, msg: dict, load_data_fn: Calla
     if text.startswith("/"):
         _pending_inputs.pop(key, None)
         return False
+
+    if state.get("kind") == "create_telegram_user":
+        _pending_inputs.pop(key, None)
+        if not _is_private_chat(msg.get("chat")):
+            await _reject_non_private(api, chat_id, lang)
+            return True
+        panel_user = _require_admin(
+            load_data_fn, str(msg["from"]["id"]), msg["from"].get("username")
+        )
+        if not panel_user:
+            await api.send_message(chat_id, f"❌ {_tt(lang, 'access_denied')}")
+            return True
+        if not save_data_fn:
+            await api.send_message(chat_id, f"❌ {_tt(lang, 'saving_not_available')}")
+            return True
+        if not bot_username:
+            await api.send_message(chat_id, f"❌ {_tt(lang, 'telegram_invite_bot_unavailable')}")
+            return True
+
+        try:
+            data = load_data_fn()
+            user = create_telegram_user(data, text[:80], str(panel_user.get("id") or ""))
+            _, raw_payload = create_telegram_invite(data, user["id"], str(panel_user.get("id") or ""))
+            save_data_fn(data)
+        except TelegramInviteError as error:
+            key_name = {
+                "invalid_username": "telegram_user_name_invalid",
+                "username_taken": "telegram_user_name_taken",
+            }.get(str(error), "telegram_invite_unavailable")
+            await api.send_message(chat_id, f"❌ {_tt(lang, key_name)}")
+            return True
+
+        username = _e(user.get("username"))
+        url = f"https://t.me/{str(bot_username).lstrip('@')}?start={raw_payload}"
+        await api.send_message(
+            chat_id,
+            f"✅ {_tt(lang, 'telegram_user_created', username=username)}\n\n"
+            f"{_tt(lang, 'telegram_invite_created', username=username, url=_e(url))}",
+            reply_markup={"inline_keyboard": [[{
+                "text": f"⬅️ {_tt(lang, 'btn_users')}",
+                "callback_data": "adm:users",
+            }]]},
+        )
+        return True
 
     if state.get("kind") == "add_client_name":
         panel_user = _require_admin(load_data_fn, str(msg["from"]["id"]), msg["from"].get("username"))
@@ -1762,7 +1901,8 @@ async def _run_bot(token: str, load_data_fn: Callable, generate_vpn_link_fn: Cal
         if not me.get("ok"):
             logger.error(f"Telegram bot: invalid token or API error: {me}")
             return
-        logger.info(f"Telegram bot logged in as @{me['result']['username']}")
+        bot_username = str(me["result"].get("username") or "").lstrip("@")
+        logger.info(f"Telegram bot logged in as @{bot_username}")
         await _set_default_commands(api)
 
         while True:
@@ -1779,14 +1919,30 @@ async def _run_bot(token: str, load_data_fn: Callable, generate_vpn_link_fn: Cal
             for update in updates:
                 offset = update["update_id"] + 1
                 try:
-                    await _dispatch(api, update, load_data_fn, generate_vpn_link_fn, save_data_fn, self_service_svc)
+                    await _dispatch(
+                        api,
+                        update,
+                        load_data_fn,
+                        generate_vpn_link_fn,
+                        save_data_fn,
+                        self_service_svc,
+                        bot_username,
+                    )
                 except asyncio.CancelledError:
                     return
                 except Exception as e:
                     logger.exception(f"Telegram bot: error handling update {update['update_id']}: {e}")
 
 
-async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, generate_vpn_link_fn: Callable, save_data_fn: Optional[Callable] = None, self_service_svc=None):
+async def _dispatch(
+    api: TelegramAPI,
+    update: dict,
+    load_data_fn: Callable,
+    generate_vpn_link_fn: Callable,
+    save_data_fn: Optional[Callable] = None,
+    self_service_svc=None,
+    bot_username: Optional[str] = None,
+):
     if "message" in update:
         msg = update["message"]
         text = msg.get("text", "")
@@ -1796,7 +1952,15 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         if text.startswith(("/start", "/connections", "/connect", "/disconnect")) and not _is_private_chat(msg.get("chat")):
             await _reject_non_private(api, chat_id, lang)
             return
-        if await _handle_pending_input(api, msg, load_data_fn, save_data_fn, generate_vpn_link_fn, self_service_svc):
+        if await _handle_pending_input(
+            api,
+            msg,
+            load_data_fn,
+            save_data_fn,
+            generate_vpn_link_fn,
+            self_service_svc,
+            bot_username,
+        ):
             return
         if text.startswith("/start") or text.startswith("/admin"):
             await _handle_start(api, msg, load_data_fn, save_data_fn)
@@ -1900,11 +2064,20 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         await api.answer_callback(callback_id)
 
         if data_str == "adm:menu":
+            _pending_inputs.pop(_pending_key(chat_id, tg_id), None)
             await api.edit_message(chat_id, message_id, f"<b>{_tt(lang, 'admin_menu')}</b>", reply_markup=_admin_main_keyboard(lang))
         elif data_str == "adm:servers":
             await _admin_servers(api, chat_id, message_id, load_data_fn, lang)
         elif data_str == "adm:users":
+            _pending_inputs.pop(_pending_key(chat_id, tg_id), None)
             await _admin_users(api, chat_id, message_id, load_data_fn, lang)
+        elif data_str == "adm:create_telegram_user":
+            if not _is_private_chat(chat):
+                await _reject_non_private(api, chat_id, lang, callback_id)
+                return
+            await _admin_create_telegram_user_start(
+                api, chat_id, message_id, tg_id, panel_user, save_data_fn, lang
+            )
         elif data_str == "adm:myconns":
             await _send_user_connections(api, chat_id, panel_user, load_data_fn, lang=lang)
         elif data_str == "adm:addserver_help":
@@ -1928,6 +2101,21 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
             proto = payload.get("proto", "awg")
             if action == "user":
                 await _admin_user_detail(api, chat_id, message_id, payload.get("uid"), load_data_fn, lang)
+            elif action == "telegram_invite_create":
+                if not _is_private_chat(chat):
+                    await _reject_non_private(api, chat_id, lang, callback_id)
+                    return
+                await _admin_create_telegram_invite(
+                    api,
+                    chat_id,
+                    message_id,
+                    payload.get("uid", ""),
+                    panel_user,
+                    bot_username,
+                    load_data_fn,
+                    save_data_fn,
+                    lang,
+                )
             elif action == "proto":
                 await _admin_protocol_detail(api, chat_id, message_id, sid, proto, load_data_fn, lang)
             elif action == "toggle_proto":

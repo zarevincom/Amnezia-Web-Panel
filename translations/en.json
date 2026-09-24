@@ -636,12 +636,5 @@
   "start_peer_title": "Enable",
   "ssh_cooldown_title": "SSH cooldown (sec)",
   "ssh_cooldown_hint": "Initial delay before reconnecting to an unreachable server. Do not change if the server works fine.",
-  "telegram_invite_title": "Telegram invitation: {}",
-  "telegram_invite_hint": "This link opens the bot and binds the user's Telegram account to this profile. It is one-time and shown only now.",
-  "telegram_invite_expiry": "Valid until",
-  "telegram_invite_link": "Telegram link",
-  "telegram_invite_generate": "Create link",
-  "telegram_invite_replace": "Issue a new link",
-  "telegram_invite_pending": "Waiting for Telegram to be linked",
-  "telegram_invite_copied": "Invitation link copied"
+  "telegram_invite_pending": "Waiting for Telegram to be linked"
 }
