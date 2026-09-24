@@ -82,7 +82,7 @@ OPENAPI_TAGS = [
     {"name": "Sharing", "description": "Public, token-protected configuration sharing for end users — no panel session required."},
     {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, encrypted SQLite backup/restore and legacy JSON migration."},
     {"name": "Notifications", "description": "Scheduled Telegram personal messages."},
-    {"name": "Invites", "description": "Admin-managed public VPN profile invitations and claims."},
+    {"name": "Invites", "description": "Admin-managed public VPN profile invitations, claims, and one-time Telegram account binding links."},
     {"name": "API Tokens", "description": "Bearer tokens for external integrations. Send the token in `Authorization: Bearer <token>`; tokens have admin-equivalent rights and are tied to the admin user that created them."},
 ]
 
@@ -238,6 +238,7 @@ def load_data():
     data.setdefault('notifications', [])
     data.setdefault('invites', [])
     data.setdefault('invite_claims', [])
+    data.setdefault('telegram_invites', [])
     data.setdefault('audit_log', [])
     settings = data.setdefault('settings', {
         'appearance': {'title': 'Amnezia', 'logo': '❤️', 'subtitle': 'Web Panel'},
@@ -1637,6 +1638,60 @@ def _invite_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+TELEGRAM_INVITE_PREFIX = 'tg_'
+TELEGRAM_INVITE_DEFAULT_TTL = timedelta(days=7)
+TELEGRAM_INVITE_MAX_TTL = timedelta(days=30)
+
+
+def _telegram_invite_hash(token: str) -> str:
+    """Hash a Telegram deep-link payload; raw payloads must never be stored."""
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def _telegram_invite_expiry(value: Optional[str]) -> datetime:
+    now = datetime.now(timezone.utc)
+    if not value:
+        return now + TELEGRAM_INVITE_DEFAULT_TTL
+    try:
+        expiry = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError('Invalid invitation expiry date') from exc
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    expiry = expiry.astimezone(timezone.utc)
+    if expiry <= now or expiry > now + TELEGRAM_INVITE_MAX_TTL:
+        raise ValueError('Invitation expiry must be between now and 30 days')
+    return expiry
+
+
+def _telegram_invite_is_active(invite: dict, now: Optional[datetime] = None) -> bool:
+    if not invite.get('enabled', True) or invite.get('accepted_at'):
+        return False
+    try:
+        expiry = datetime.fromisoformat(invite['expires_at'].replace('Z', '+00:00'))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry > (now or datetime.now(timezone.utc))
+
+
+async def _get_telegram_bot_username(token: str) -> str:
+    """Resolve the bot username without persisting or logging its API token."""
+    if not token:
+        raise ValueError('Configure the Telegram bot token first')
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(f'https://api.telegram.org/bot{token}/getMe')
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ValueError('Could not verify the Telegram bot') from exc
+    username = payload.get('result', {}).get('username') if payload.get('ok') else None
+    if not username:
+        raise ValueError('Could not verify the Telegram bot')
+    return str(username).lstrip('@')
+
+
 def _find_invite(data: dict, token: str):
     return next((i for i in data.get('invites', []) if secrets.compare_digest(i.get('token_hash', ''), _invite_hash(token))), None)
 
@@ -2425,6 +2480,11 @@ class InviteRequest(BaseModel):
     password: Optional[str] = None
     max_reissues: int = 1
     reissue_cooldown_hours: int = 24
+
+
+class TelegramInviteRequest(BaseModel):
+    """A short-lived link for binding a panel user to a Telegram account."""
+    expires_at: Optional[str] = None
 
 
 class ClaimRequest(BaseModel):
@@ -5600,6 +5660,11 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
     data = load_data()
     all_users = data.get('users', [])
     conns = data.get('user_connections', [])
+    active_telegram_invites = {
+        invite.get('user_id'): invite
+        for invite in data.get('telegram_invites', [])
+        if _telegram_invite_is_active(invite)
+    }
     
     # Filter
     filtered = []
@@ -5620,11 +5685,14 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
     
     users = []
     for u in page_items:
+        telegram_invite = active_telegram_invites.get(u['id'])
         users.append({
             'id': u['id'], 'username': u['username'], 'role': u['role'],
             'enabled': u.get('enabled', True),
             'created_at': u.get('created_at', ''),
             'telegramId': u.get('telegramId'),
+            'telegram_invite_pending': bool(telegram_invite),
+            'telegram_invite_expires_at': telegram_invite.get('expires_at') if telegram_invite else None,
             'email': u.get('email'),
             'description': u.get('description'),
             'connections_count': sum(1 for c in conns if c['user_id'] == u['id']),
@@ -5645,6 +5713,73 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
         'page': page,
         'size': size,
         'pages': (total + size - 1) // size
+    }
+
+
+@app.post('/api/users/{user_id}/telegram-invites', tags=["Invites"])
+async def api_create_telegram_invite(
+    request: Request,
+    user_id: str,
+    payload: TelegramInviteRequest,
+):
+    """Issue a one-time Telegram deep-link that binds one existing panel user.
+
+    Requires an admin session. The response contains the raw link exactly once;
+    only its SHA-256 hash is retained in the encrypted panel state.
+    """
+    current_user = get_current_user(request)
+    if not current_user or current_user.get('role') != 'admin':
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+
+    data = load_data()
+    user = next((item for item in data.get('users', []) if item.get('id') == user_id), None)
+    if not user:
+        return JSONResponse({'error': 'User not found'}, status_code=404)
+    if not user.get('enabled', True):
+        return JSONResponse({'error': 'User is disabled'}, status_code=400)
+    if user.get('telegramId'):
+        return JSONResponse({'error': 'Telegram is already linked for this user'}, status_code=409)
+
+    telegram_settings = data.get('settings', {}).get('telegram', {})
+    if not telegram_settings.get('enabled'):
+        return JSONResponse({'error': 'Enable the Telegram bot before creating an invitation'}, status_code=400)
+
+    try:
+        expires_at = _telegram_invite_expiry(payload.expires_at)
+        bot_username = await _get_telegram_bot_username(
+            str(telegram_settings.get('token', ''))
+        )
+    except ValueError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=400)
+
+    # A replacement link revokes every pending link for this user before a new
+    # token is emitted, leaving at most one usable deep-link at a time.
+    for invite in data.get('telegram_invites', []):
+        if invite.get('user_id') == user_id and _telegram_invite_is_active(invite):
+            invite['enabled'] = False
+            invite['revoked_at'] = datetime.now(timezone.utc).isoformat()
+            invite['revoked_by'] = current_user.get('id')
+
+    raw_payload = TELEGRAM_INVITE_PREFIX + secrets.token_urlsafe(24)
+    invite = {
+        'id': str(uuid.uuid4()),
+        'user_id': user_id,
+        'token_hash': _telegram_invite_hash(raw_payload),
+        'enabled': True,
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'expires_at': expires_at.isoformat(),
+        'created_by': current_user.get('id'),
+        'accepted_at': None,
+        'telegram_id': None,
+    }
+    data.setdefault('telegram_invites', []).append(invite)
+    _audit(data, 'telegram_invite_created', user_id=user_id, invite_id=invite['id'], expires_at=invite['expires_at'])
+    save_data(data)
+
+    return {
+        'invite_id': invite['id'],
+        'expires_at': invite['expires_at'],
+        'url': f'https://t.me/{bot_username}?start={raw_payload}',
     }
 
 
