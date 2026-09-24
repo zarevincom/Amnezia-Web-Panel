@@ -174,6 +174,7 @@ class TestTelegramBotInviteIssuing:
         serialized_state = json.dumps(self.data)
         messages = [call.args[1] for call in self.api.send_message.call_args_list]
         payload = messages[-1].split("?start=", 1)[1].split("</code>", 1)[0]
+        copy_button = self.api.send_message.call_args.kwargs["reply_markup"]["inline_keyboard"][0][0]
 
         assert user["role"] == "none"
         assert not user["telegramId"]
@@ -181,6 +182,9 @@ class TestTelegramBotInviteIssuing:
         assert invite["expires_at"] is None
         assert invite["token_hash"] == tg_bot._telegram_invite_hash(payload)
         assert payload not in serialized_state
+        assert copy_button["copy_text"] == {
+            "text": f"https://t.me/panel_bot?start={payload}",
+        }
         assert [event["event"] for event in self.data["audit_log"][-2:]] == [
             "telegram_user_created",
             "telegram_invite_created",
@@ -198,6 +202,8 @@ class TestTelegramBotInviteIssuing:
         assert first["revoked_at"]
         assert second["enabled"]
         assert second["expires_at"] is None
+        copy_button = self.api.edit_message.call_args.kwargs["reply_markup"]["inline_keyboard"][0][0]
+        assert copy_button["copy_text"]["text"].startswith("https://t.me/panel_bot?start=tg_")
 
     def test_group_chat_cannot_start_user_creation(self):
         asyncio.run(self._dispatch(

@@ -66,6 +66,7 @@ TG_TRANSLATIONS = {
         "telegram_invite_linked": "Your Telegram account is now linked to <b>{username}</b>.",
         "telegram_invite_private_only": "Open this invitation in a private chat with the bot.",
         "btn_create_telegram_invite": "Create Telegram invitation",
+        "btn_copy_telegram_invite": "Copy invitation link",
         "btn_create_telegram_user": "Create user",
         "send_telegram_user_name": "Send the new user's name. It will be shown in the panel and bound when they open the invitation.\n\nSend <code>/cancel</code> to cancel.",
         "telegram_user_created": "User <b>{username}</b> was created.",
@@ -188,6 +189,7 @@ TG_TRANSLATIONS = {
         "telegram_invite_linked": "Ваш аккаунт Telegram привязан к пользователю <b>{username}</b>.",
         "telegram_invite_private_only": "Откройте это приглашение в личном чате с ботом.",
         "btn_create_telegram_invite": "Создать Telegram-приглашение",
+        "btn_copy_telegram_invite": "Скопировать ссылку приглашения",
         "btn_create_telegram_user": "Создать пользователя",
         "send_telegram_user_name": "Отправьте имя нового пользователя. Оно будет видно в панели и привязано к получателю при открытии приглашения.\n\nОтправьте <code>/cancel</code> для отмены.",
         "telegram_user_created": "Пользователь <b>{username}</b> создан.",
@@ -1174,6 +1176,21 @@ async def _admin_create_telegram_user_start(
     )
 
 
+def _telegram_invite_keyboard(url: str, lang: str = "en") -> dict:
+    return {
+        "inline_keyboard": [
+            [{
+                "text": f"📋 {_tt(lang, 'btn_copy_telegram_invite')}",
+                "copy_text": {"text": url},
+            }],
+            [{
+                "text": f"⬅️ {_tt(lang, 'btn_users')}",
+                "callback_data": "adm:users",
+            }],
+        ]
+    }
+
+
 async def _admin_create_telegram_invite(
     api: TelegramAPI,
     chat_id: int,
@@ -1209,10 +1226,7 @@ async def _admin_create_telegram_invite(
         chat_id,
         message_id,
         text,
-        reply_markup={"inline_keyboard": [[{
-            "text": f"⬅️ {_tt(lang, 'btn_users')}",
-            "callback_data": "adm:users",
-        }]]},
+        reply_markup=_telegram_invite_keyboard(url, lang),
     )
 
 
@@ -1566,10 +1580,7 @@ async def _handle_pending_input(
             chat_id,
             f"✅ {_tt(lang, 'telegram_user_created', username=username)}\n\n"
             f"{_tt(lang, 'telegram_invite_created', username=username, url=_e(url))}",
-            reply_markup={"inline_keyboard": [[{
-                "text": f"⬅️ {_tt(lang, 'btn_users')}",
-                "callback_data": "adm:users",
-            }]]},
+            reply_markup=_telegram_invite_keyboard(url, lang),
         )
         return True
 

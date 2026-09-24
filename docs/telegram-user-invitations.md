@@ -30,13 +30,14 @@ the existing long-polling connection.
 3. Send the display name for the new panel user.
 4. The bot creates a record-only user (`role: none`) and sends the one-time
    `t.me/<bot>?start=tg_...` URL.
-5. Forward the URL to the recipient without opening it yourself.
+5. Use **Copy invitation link** to copy it, then forward the URL to the
+   recipient without opening it yourself.
 
 ### Invite an existing user
 
 1. Select **Users** and choose a user that does not have a Telegram ID.
 2. Select **Create Telegram invitation**.
-3. Forward the returned URL to the intended recipient.
+3. Use **Copy invitation link** and forward the URL to the intended recipient.
 
 Links do not expire automatically. A link becomes invalid after it is used,
 when its user is disabled, or when an administrator creates a replacement
