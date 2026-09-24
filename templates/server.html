@@ -1,18 +1,12 @@
 {% extends "base.html" %}
 
 {% block title_extra %} — {{ server.name }}{% endblock %}
+{% block page_class %}page page--server-detail{% endblock %}
 
 {% block head_extra %}
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/codemirror.min.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/theme/material-darker.min.css">
 <style>
-    .client-actions {
-        display: flex !important;
-        flex-direction: row !important;
-        flex-wrap: nowrap !important;
-        gap: var(--space-xs) !important;
-        align-items: center;
-    }
     .marketplace-grid {
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -64,6 +58,7 @@
         align-items: center;
         gap: var(--space-sm);
         margin-left: auto;
+        flex-wrap: wrap;
     }
     .installed-app-hidden,
     .promo-block.installed-app-hidden,
@@ -72,6 +67,12 @@
     }
     .protocol-card.installed-app-visible {
         display: block !important;
+    }
+    /* While the status check runs, hide every protocol tile so the grid
+       does not flash the full marketplace list before real data arrives */
+    .protocol-cards.apps-pending .protocol-card,
+    .protocol-cards.apps-pending .promo-block {
+        display: none !important;
     }
     .apps-loading {
         margin-bottom: var(--space-xl);
@@ -110,6 +111,31 @@
         white-space: pre;
         padding: var(--space-sm);
     }
+    @media (max-width: 768px) {
+        .config-editor-wrap .CodeMirror,
+        .config-editor-fallback {
+            height: 220px;
+            min-height: 220px;
+        }
+        .clients-header {
+            flex-direction: column;
+            align-items: stretch;
+            gap: var(--space-md);
+        }
+        .config-actions {
+            flex-direction: column;
+        }
+        .config-actions .btn {
+            flex: none !important;
+            width: 100%;
+        }
+        .rename-editor .form-input {
+            width: 100% !important;
+        }
+        .rename-editor label {
+            flex: 1 1 100%;
+        }
+    }
     .config-editor-hint {
         margin-top: var(--space-xs);
         color: var(--text-muted);
@@ -119,11 +145,11 @@
 {% endblock %}
 
 {% block content %}
-<a href="/" class="back-link">{{ _('back_to_servers') }}</a>
+<a href="/" class="back-link page-back-link">{{ _('back_to_servers') }}</a>
 
 <!-- Server Info Header -->
-<div class="card" style="margin-bottom: var(--space-xl);">
-    <div class="flex items-center justify-between" style="flex-wrap: wrap; gap: var(--space-md);">
+<div class="card page-header-card">
+    <div class="page-header page-header--card">
         <div class="flex items-center gap-md">
             <div class="server-icon" style="width:56px; height:56px; font-size:1.6rem;">🖥</div>
             <div>
@@ -132,7 +158,7 @@
                     }}</div>
             </div>
         </div>
-        <div class="flex gap-sm items-center">
+        <div class="page-header__actions">
             <div class="flex gap-sm items-center" id="serverStats" style="display:none;"></div>
             <button class="btn btn-secondary btn-sm" onclick="checkServer()" id="checkBtn">
                 <span id="checkBtnText">{{ _('server_check') }}</span>
@@ -150,6 +176,12 @@
                 </button>
                 <button class="btn btn-secondary btn-sm" onclick="openManagementModal()" id="managementBtn">
                     <span>⚙️</span> {{ _('management') }}
+                </button>
+                <button class="btn btn-secondary btn-sm" onclick="openHostTuning()" id="hostTuningBtn">
+                    <span>📊</span> {{ _('host_tuning') }}
+                </button>
+                <button class="btn btn-secondary btn-sm" onclick="openWgEasyImport()" id="wgeasyImportBtn">
+                    <span>📥</span> {{ _('wgeasy_import') }}
                 </button>
             </div>
         </div>
@@ -171,19 +203,17 @@
     </button>
 </div>
 
-<div class="protocol-cards" id="protocols-grid">
+<div class="protocol-cards apps-pending" id="protocols-grid">
     <!-- AWG3 Card (first - newest version).
          Installed-protocol tiles are static cards toggled by
          applyInstalledAppsVisibility(); a protocol without one is shown in the
          marketplace but never gets a tile here. -->
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg3">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">🛡</div>
-            <div class="flex gap-sm" id="awg3-ctrl" style="display:none!important;"></div>
+        <div class="protocol-card-head">
+            <div class="protocol-icon"><img src="/static/img/amnezia.svg" alt="AmneziaWG"></div>
+            <div class="protocol-name">AmneziaWG 3.1 <span style="font-size:0.65rem; background:var(--accent); color:#fff; padding:2px 6px; border-radius:8px; vertical-align:middle;">NEW</span></div>
         </div>
-        <div class="protocol-name">AmneziaWG 3.1 <span
-                style="font-size:0.65rem; background:var(--accent); color:#fff; padding:2px 6px; border-radius:8px; vertical-align:middle;">NEW</span>
-        </div>
+        <div class="flex gap-sm protocol-ctrl" id="awg3-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('awg3_desc') }}
         </div>
@@ -203,11 +233,11 @@
 
     <!-- AWG2 Card -->
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg2">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">✨</div>
-            <div class="flex gap-sm" id="awg2-ctrl" style="display:none!important;"></div>
+        <div class="protocol-card-head">
+            <div class="protocol-icon"><img src="/static/img/amnezia.svg" alt="AmneziaWG"></div>
+            <div class="protocol-name">AmneziaWG 2.0</div>
         </div>
-        <div class="protocol-name">AmneziaWG 2.0</div>
+        <div class="flex gap-sm protocol-ctrl" id="awg2-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('awg_desc') }}
         </div>
@@ -227,11 +257,11 @@
 
     <!-- AWG Card -->
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">🔮</div>
-            <div class="flex gap-sm" id="awg-ctrl" style="display:none!important;"></div>
+        <div class="protocol-card-head">
+            <div class="protocol-icon"><img src="/static/img/amnezia.svg" alt="AmneziaWG"></div>
+            <div class="protocol-name">AmneziaWG</div>
         </div>
-        <div class="protocol-name">AmneziaWG</div>
+        <div class="flex gap-sm protocol-ctrl" id="awg-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('awg_desc') }}
         </div>
@@ -251,11 +281,11 @@
 
     <!-- AWG Legacy Card -->
     <div class="card card-hover protocol-card protocol-legacy" id="proto-awg-legacy">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">📡</div>
-            <div class="flex gap-sm" id="awg-legacy-ctrl" style="display:none!important;"></div>
+        <div class="protocol-card-head">
+            <div class="protocol-icon"><img src="/static/img/amnezia.svg" alt="AmneziaWG"></div>
+            <div class="protocol-name">AmneziaWG Legacy</div>
         </div>
-        <div class="protocol-name">AmneziaWG Legacy</div>
+        <div class="flex gap-sm protocol-ctrl" id="awg-legacy-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('awg_legacy_desc') }}
         </div>
@@ -275,11 +305,11 @@
 
     <!-- Xray Card -->
     <div class="card card-hover protocol-card protocol-xray" id="proto-xray">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">⚡</div>
-            <div class="flex gap-sm" id="xray-ctrl" style="display:none!important;"></div>
+        <div class="protocol-card-head">
+            <div class="protocol-icon"><img src="/static/img/xray.png" alt="Xray"></div>
+            <div class="protocol-name">Xray (VLESS-Reality)</div>
         </div>
-        <div class="protocol-name">Xray (VLESS-Reality)</div>
+        <div class="flex gap-sm protocol-ctrl" id="xray-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('xray_desc') }}
         </div>
@@ -299,11 +329,11 @@
 
     <!-- Telemt Card -->
     <div class="card card-hover protocol-card protocol-telemt" id="proto-telemt">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+        <div class="protocol-card-head">
             <div class="protocol-icon">✈</div>
-            <div class="flex gap-sm" id="telemt-ctrl" style="display:none!important;"></div>
+            <div class="protocol-name">Telemt (Telegram Proxy)</div>
         </div>
-        <div class="protocol-name">Telemt (Telegram Proxy)</div>
+        <div class="flex gap-sm protocol-ctrl" id="telemt-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('telemt_desc') }}
         </div>
@@ -323,11 +353,11 @@
 
     <!-- WireGuard Card -->
     <div class="card card-hover protocol-card protocol-wireguard" id="proto-wireguard">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
-            <div class="protocol-icon">🔒</div>
-            <div class="flex gap-sm" id="wireguard-ctrl" style="display:none!important;"></div>
+        <div class="protocol-card-head">
+            <div class="protocol-icon"><img src="/static/img/wireguard.webp" alt="WireGuard"></div>
+            <div class="protocol-name">WireGuard</div>
         </div>
-        <div class="protocol-name">WireGuard</div>
+        <div class="flex gap-sm protocol-ctrl" id="wireguard-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('wireguard_desc') }}
         </div>
@@ -371,11 +401,11 @@
 
     <!-- DNS Card -->
     <div class="card card-hover protocol-card protocol-dns" id="proto-dns">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+        <div class="protocol-card-head">
             <div class="protocol-icon">🔍</div>
-            <div class="flex gap-sm" id="dns-ctrl" style="display:none!important;"></div>
+            <div class="protocol-name">AmneziaDNS</div>
         </div>
-        <div class="protocol-name">AmneziaDNS</div>
+        <div class="flex gap-sm protocol-ctrl" id="dns-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('dns_desc') }}
         </div>
@@ -395,11 +425,11 @@
 
     <!-- AdGuard Home Card -->
     <div class="card card-hover protocol-card protocol-adguard" id="proto-adguard">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+        <div class="protocol-card-head">
             <div class="protocol-icon">🛡️</div>
-            <div class="flex gap-sm" id="adguard-ctrl" style="display:none!important;"></div>
+            <div class="protocol-name">AdGuard Home</div>
         </div>
-        <div class="protocol-name">AdGuard Home</div>
+        <div class="flex gap-sm protocol-ctrl" id="adguard-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('adguard_desc') }}
         </div>
@@ -419,11 +449,11 @@
 
     <!-- SOCKS5 Card -->
     <div class="card card-hover protocol-card protocol-socks5" id="proto-socks5">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+        <div class="protocol-card-head">
             <div class="protocol-icon">🧦</div>
-            <div class="flex gap-sm" id="socks5-ctrl" style="display:none!important;"></div>
+            <div class="protocol-name">SOCKS5 Proxy</div>
         </div>
-        <div class="protocol-name">SOCKS5 Proxy</div>
+        <div class="flex gap-sm protocol-ctrl" id="socks5-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('socks5_desc') }}
         </div>
@@ -442,13 +472,38 @@
     </div>
 
 
+    <!-- Exit Node Card -->
+    <div class="card card-hover protocol-card protocol-exit" id="proto-exit">
+        <div class="protocol-card-head">
+            <div class="protocol-icon">🚪</div>
+            <div class="protocol-name">Exit Node</div>
+        </div>
+        <div class="flex gap-sm protocol-ctrl" id="exit-ctrl" style="display:none!important;"></div>
+        <div class="protocol-desc">
+            {{ _('exit_desc') }}
+        </div>
+        <div class="protocol-status" id="exit-status">
+            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _('not_checked') }}</span>
+        </div>
+        <div id="exit-info" class="hidden">
+            <div class="protocol-info" id="exit-info-grid"></div>
+        </div>
+        <div class="flex gap-sm" id="exit-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('exit')" id="exit-install-btn"
+                style="flex:1">
+                {{ _('install') }}
+            </button>
+        </div>
+    </div>
+
+
     <!-- NGINX Card -->
     <div class="card card-hover protocol-card protocol-nginx" id="proto-nginx">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+        <div class="protocol-card-head">
             <div class="protocol-icon">🌐</div>
-            <div class="flex gap-sm" id="nginx-ctrl" style="display:none!important;"></div>
+            <div class="protocol-name">NGINX</div>
         </div>
-        <div class="protocol-name">NGINX</div>
+        <div class="flex gap-sm protocol-ctrl" id="nginx-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
             {{ _('nginx_desc') }}
         </div>
@@ -490,14 +545,14 @@
 
 <!-- Connections Section (renamed from Clients) -->
 <div class="clients-section" id="connectionsSection" style="display:none;">
-    <div class="clients-header">
-        <h2 class="section-title" style="margin-bottom:0;">
+    <div class="clients-header page-header page-header--secondary">
+        <h2 class="section-title page-header__title">
             <span class="icon">🔗</span>
             {{ _('connections') }}
         </h2>
-        <div class="flex gap-sm items-center">
+        <div class="page-header__actions">
             <select class="form-select" id="connProtoSelect" onchange="loadConnections()"
-                style="width:auto; min-width:160px;">
+                style="width:auto;">
                 <option value="awg">AmneziaWG</option>
                 <option value="awg2">AmneziaWG 2.0</option>
                 <option value="awg3">AmneziaWG 3.1</option>
@@ -528,6 +583,74 @@
 </div>
 
 <!-- ===== Marketplace Modal ===== -->
+<!-- wg-easy Import Modal -->
+<div class="modal-backdrop" id="wgeasyImportModal">
+    <div class="modal" style="max-width: 640px;">
+        <div class="modal-header">
+            <h2 class="modal-title">📥 {{ _('wgeasy_import_title') }}</h2>
+            <button class="modal-close" onclick="closeModal('wgeasyImportModal')">×</button>
+        </div>
+        <div class="modal-body">
+            <div class="form-group">
+                <label class="form-label">{{ _('wgeasy_web_port') }}</label>
+                <input type="number" class="form-input" id="wgeasyWebPort" value="51821" min="1" max="65535">
+            </div>
+            <div class="form-group">
+                <label class="form-label">{{ _('wgeasy_password') }}</label>
+                <input type="password" class="form-input" id="wgeasyPassword" autocomplete="off">
+            </div>
+            <div class="form-group" id="wgeasyUsernameGroup" style="display:none;">
+                <label class="form-label">{{ _('wgeasy_username') }}</label>
+                <input type="text" class="form-input" id="wgeasyUsername" value="admin" autocomplete="off">
+            </div>
+            <div id="wgeasyPreviewArea" class="hidden" style="margin-top: var(--space-md);">
+                <div class="text-muted text-sm" id="wgeasyPreviewInfo" style="margin-bottom: var(--space-sm);"></div>
+                <div style="max-height: 260px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: var(--radius-md);">
+                    <table style="width:100%; border-collapse: collapse; font-size: 0.85rem;">
+                        <thead>
+                            <tr style="position:sticky; top:0; background: var(--bg-secondary, #1f2937);">
+                                <th style="padding:6px 10px; text-align:left;"><input type="checkbox" id="wgeasyCheckAll" checked></th>
+                                <th style="padding:6px 10px; text-align:left;">{{ _('name') }}</th>
+                                <th style="padding:6px 10px; text-align:left;">IP</th>
+                                <th style="padding:6px 10px; text-align:left;">{{ _('status') }}</th>
+                            </tr>
+                        </thead>
+                        <tbody id="wgeasyClientsBody"></tbody>
+                    </table>
+                </div>
+                <div class="text-muted text-sm" style="margin-top: var(--space-sm);">⚠️ {{ _('wgeasy_import_warning') }}</div>
+            </div>
+            <pre id="wgeasyLog" class="hidden" style="margin-top: var(--space-md); max-height: 220px; overflow-y: auto; background: var(--bg-secondary, #111827); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 10px 12px; font-size: 0.78rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;"></pre>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('wgeasyImportModal')">{{ _('cancel') }}</button>
+            <button class="btn btn-primary" onclick="wgeasyPreview()" id="wgeasyPreviewBtn">{{ _('wgeasy_fetch') }}</button>
+            <button class="btn btn-primary hidden" onclick="wgeasyDoImport()" id="wgeasyImportGoBtn">{{ _('wgeasy_import_btn') }}</button>
+        </div>
+    </div>
+</div>
+
+<!-- Rename Instance Modal -->
+<div class="modal-backdrop" id="renameProtoModal">
+    <div class="modal" style="max-width: 420px;">
+        <div class="modal-header">
+            <h2 class="modal-title">✏️ {{ _('rename_instance') }}</h2>
+            <button class="modal-close" onclick="closeModal('renameProtoModal')">×</button>
+        </div>
+        <div class="modal-body">
+            <div class="form-group">
+                <label class="form-label">{{ _('instance_name') }}</label>
+                <input type="text" class="form-input" id="renameProtoInput" maxlength="64">
+                <div class="text-muted text-sm" style="margin-top: var(--space-xs);">{{ _('rename_instance_hint') }}</div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('renameProtoModal')">{{ _('cancel') }}</button>
+            <button class="btn btn-primary" onclick="saveRenameProtocol()" id="renameProtoSaveBtn">{{ _('save') }}</button>
+        </div>
+    </div>
+</div>
+
 <div class="modal-backdrop" id="marketplaceModal">
     <div class="modal" style="max-width: 980px;">
         <div class="modal-header">
@@ -570,6 +693,46 @@
                 <div class="form-hint" id="installPortHint">{{ _('port_default_hint') }}</div>
             </div>
 
+            <div id="awgOptions"
+                style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">{{ _('awg_mtu') }}</label>
+                        <input class="form-input" type="number" id="installAwgMtu" value="1376" min="576" max="65535">
+                        <div class="form-hint">{{ _('awg_mtu_hint') }}</div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DNS 1</label>
+                        <input class="form-input" type="text" id="installAwgDns1" value="1.1.1.1">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DNS 2</label>
+                        <input class="form-input" type="text" id="installAwgDns2" value="1.0.0.1">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DNS IPv6</label>
+                        <input class="form-input" type="text" id="installAwgDns6" value="2606:4700:4700::1111">
+                        <div class="form-hint">{{ _('awg_dns6_hint') }}</div>
+                    </div>
+                </div>
+                <div id="installAwgJunk">
+                    <div class="form-group">
+                        <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                            {{ _('awg_special_junk') }}
+                            <button type="button" class="btn btn-secondary btn-sm"
+                                onclick="resetSpecialJunkFields('installAwg')">{{ _('awg_special_junk_reset') }}</button>
+                        </label>
+                        <div class="form-hint" style="margin-bottom:var(--space-xs);">{{ _('awg_special_junk_hint') }}</div>
+                        <input class="form-input" type="text" id="installAwgI1" spellcheck="false" placeholder="I1">
+                        <input class="form-input mt-xs" type="text" id="installAwgI2" spellcheck="false" placeholder="I2">
+                        <input class="form-input mt-xs" type="text" id="installAwgI3" spellcheck="false" placeholder="I3">
+                        <input class="form-input mt-xs" type="text" id="installAwgI4" spellcheck="false" placeholder="I4">
+                        <input class="form-input mt-xs" type="text" id="installAwgI5" spellcheck="false" placeholder="I5">
+                        <div class="form-hint">{{ _('awg_special_junk_syntax') }}</div>
+                    </div>
+                </div>
+            </div>
+
             <div id="telemtOptions"
                 style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
                 <div class="form-group">
@@ -593,6 +756,20 @@
                 </div>
             </div>
 
+            <div id="exitOptions"
+                style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+                <div class="form-group">
+                    <label class="form-label">{{ _('exit_subnet') }}</label>
+                    <input class="form-input" type="text" id="installExitSubnet" value="10.9.0.0/24" spellcheck="false">
+                    <div class="form-hint">{{ _('exit_subnet_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" style="display:flex; align-items:center; gap:var(--space-sm);">
+                        <input type="checkbox" id="installExitObfuscation"> {{ _('exit_obfuscation') }}
+                    </label>
+                    <div class="form-hint">{{ _('exit_obfuscation_hint') }}</div>
+                </div>
+            </div>
             <div id="socks5Options"
                 style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
                 <div class="form-group">
@@ -693,6 +870,110 @@
     </div>
 </div>
 
+<!-- ===== AmneziaWG Settings Modal ===== -->
+<div class="modal-backdrop" id="awgSettingsModal">
+    <div class="modal" style="max-width:640px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="awgSettingsTitle">{{ _('awg_settings_title') }}</h2>
+            <button class="modal-close" onclick="closeModal('awgSettingsModal')">×</button>
+        </div>
+        <div class="form-hint" style="margin-bottom:var(--space-md);">{{ _('awg_settings_desc') }}</div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">{{ _('awg_mtu') }}</label>
+                <input class="form-input" type="number" id="awgSetMtu" min="576" max="65535">
+                <div class="form-hint">{{ _('awg_mtu_hint') }}</div>
+                <div class="form-hint hidden" id="awgSetMtuExitHint"></div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">DNS 1</label>
+                <input class="form-input" type="text" id="awgSetDns1">
+            </div>
+            <div class="form-group">
+                <label class="form-label">DNS 2</label>
+                <input class="form-input" type="text" id="awgSetDns2">
+            </div>
+            <div class="form-group">
+                <label class="form-label">DNS IPv6</label>
+                <input class="form-input" type="text" id="awgSetDns6" placeholder="2606:4700:4700::1111">
+                <div class="form-hint">{{ _('awg_dns6_hint') }}</div>
+            </div>
+        </div>
+        <div class="form-group" id="awgSetJunkGroup">
+            <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                {{ _('awg_special_junk') }}
+                <button type="button" class="btn btn-secondary btn-sm"
+                    onclick="resetSpecialJunkFields('awgSet')">{{ _('awg_special_junk_reset') }}</button>
+            </label>
+            <div class="form-hint" style="margin-bottom:var(--space-xs);">{{ _('awg_special_junk_hint') }}</div>
+            <input class="form-input" type="text" id="awgSetI1" spellcheck="false" placeholder="I1">
+            <input class="form-input mt-xs" type="text" id="awgSetI2" spellcheck="false" placeholder="I2">
+            <input class="form-input mt-xs" type="text" id="awgSetI3" spellcheck="false" placeholder="I3">
+            <input class="form-input mt-xs" type="text" id="awgSetI4" spellcheck="false" placeholder="I4">
+            <input class="form-input mt-xs" type="text" id="awgSetI5" spellcheck="false" placeholder="I5">
+            <div class="form-hint">{{ _('awg_special_junk_syntax') }}</div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('awgSettingsModal')">{{ _('cancel') }}</button>
+            <button class="btn btn-primary" onclick="saveAwgSettings()" id="awgSaveBtn">
+                <span id="awgSaveBtnText">{{ _('save') }}</span>
+                <div class="spinner hidden" id="awgSaveSpinner"></div>
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Exit Node: peers ===== -->
+<div class="modal-backdrop" id="exitPeersModal">
+    <div class="modal" style="max-width:760px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _('exit_peers_title') }}</h2>
+            <button class="modal-close" onclick="closeModal('exitPeersModal')">×</button>
+        </div>
+        <div id="exitPeersInfo" class="form-hint" style="margin-bottom:var(--space-md);"></div>
+        <div id="exitPeersList"></div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="showExitPeers(currentExitPeersProto)">{{ _('refresh') }}</button>
+            <button class="btn btn-primary" onclick="closeModal('exitPeersModal')">{{ _('cancel') }}</button>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Exit Node: link an AWG instance ===== -->
+<div class="modal-backdrop" id="exitLinkModal">
+    <div class="modal" style="max-width:560px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="exitLinkTitle">{{ _('exit_link_title') }}</h2>
+            <button class="modal-close" onclick="closeModal('exitLinkModal')">×</button>
+        </div>
+        <div class="form-hint" style="margin-bottom:var(--space-md);">{{ _('exit_link_desc') }}</div>
+        <div id="exitLinkState" style="margin-bottom:var(--space-md);"></div>
+        <div id="exitLinkEgress"></div>
+        <div id="exitLinkWarnings"></div>
+        <div class="form-group">
+            <label class="form-label">{{ _('exit_link_select') }}</label>
+            <select class="form-input" id="exitLinkSelect"></select>
+            <div class="form-hint" id="exitLinkSelectHint"></div>
+        </div>
+        <div class="form-group hidden" id="exitDnsGroup">
+            <label class="form-label" style="display:flex; align-items:center; gap:var(--space-sm);">
+                <input type="checkbox" id="exitDnsViaExit" onchange="saveExitDns(this.checked)"> {{ _('exit_dns_via_exit') }}
+            </label>
+            <div class="form-hint">{{ _('exit_dns_via_exit_hint') }}</div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('exitLinkModal')">{{ _('cancel') }}</button>
+            <button class="btn btn-secondary hidden" onclick="checkExitEgress()" id="exitEgressBtn">{{ _('exit_egress_check') }}</button>
+            <button class="btn btn-secondary hidden" onclick="repairExitLink()" id="exitRepairBtn">{{ _('exit_link_repair') }}</button>
+            <button class="btn btn-danger hidden" onclick="removeExitLink()" id="exitUnlinkBtn">{{ _('exit_unlink_btn') }}</button>
+            <button class="btn btn-primary" onclick="saveExitLink(false)" id="exitLinkBtn">
+                <span id="exitLinkBtnText">{{ _('exit_link_btn') }}</span>
+                <div class="spinner hidden" id="exitLinkSpinner"></div>
+            </button>
+        </div>
+    </div>
+</div>
+
 <!-- ===== SOCKS5 Settings Modal ===== -->
 <div class="modal-backdrop" id="socks5SettingsModal">
     <div class="modal">
@@ -764,10 +1045,14 @@
         </div>
         <input type="hidden" id="backupProto" value="" />
         <div class="form-hint" style="margin-bottom:var(--space-md);">{{ _('backup_desc') }}</div>
-        <div class="config-actions" style="margin-bottom:var(--space-md);">
-            <button class="btn btn-primary btn-sm" onclick="createProtocolBackup()" id="createBackupBtn" style="flex:1">
+        <div class="backup-toolbar">
+            <button class="btn btn-primary btn-sm" onclick="createProtocolBackup()" id="createBackupBtn">
                 {{ _('create_backup') }}
             </button>
+            <button class="btn btn-secondary btn-sm" onclick="document.getElementById('backupUploadFile').click()" id="uploadBackupBtn">
+                {{ _('upload_backup') }}
+            </button>
+            <input type="file" id="backupUploadFile" class="hidden" accept=".tar.gz,application/gzip,application/x-gzip">
             <button class="btn btn-secondary btn-sm" onclick="loadProtocolBackups()">{{ _('refresh') }}</button>
         </div>
         <div id="backupLoading" class="form-hint hidden">{{ _('loading') }}</div>
@@ -776,7 +1061,7 @@
             <div class="empty-title">{{ _('no_backups') }}</div>
             <div class="empty-desc">{{ _('no_backups_desc') }}</div>
         </div>
-        <div id="backupList" style="display:flex; flex-direction:column; gap:var(--space-sm);"></div>
+        <div id="backupList" class="backup-list"></div>
     </div>
 </div>
 
@@ -797,7 +1082,9 @@
 
         <div class="form-group">
             <label class="form-label">{{ _('assign_to_user') }}</label>
-            <select class="form-select" id="connectionUserId">
+            <select class="form-select" id="connectionUserId" data-searchable
+                data-search-placeholder="{{ _('select_search_placeholder') }}"
+                data-search-empty="{{ _('select_search_empty') }}">
                 <option value="">{{ _('no_assign') }}</option>
                 {% for u in users %}
                 <option value="{{ u.id }}">{{ u.username }} ({{ u.role }})</option>
@@ -808,28 +1095,28 @@
         <div id="telemtConnOptions"
             style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
             <div class="form-group">
-                <label class="form-label">Secret (Hex 32 chars)</label>
+                <label class="form-label">{{ _('telemt_secret_label') }}</label>
                 <input class="form-input" type="text" id="telemtSecret" placeholder="Optional (auto-generated if empty)">
             </div>
             <div class="form-group">
-                <label class="form-label">AD Tag (Hex 32 chars)</label>
+                <label class="form-label">{{ _('telemt_ad_tag_label') }}</label>
                 <input class="form-input" type="text" id="telemtAdTag" placeholder="Optional">
             </div>
             <div class="form-group">
-                <label class="form-label">Max TCP Conns</label>
+                <label class="form-label">{{ _('telemt_max_conns_label') }}</label>
                 <input class="form-input" type="number" id="telemtMaxConns" placeholder="Optional (e.g. 1000)" min="0">
             </div>
             <div class="form-group">
-                <label class="form-label">Quota (Bytes)</label>
-                <input class="form-input" type="number" id="telemtQuota" placeholder="Optional (e.g. 1073741824)"
+                <label class="form-label">{{ _('telemt_quota_label') }}</label>
+                <input class="form-input" type="number" id="telemtQuota" placeholder="{{ _('optional') }} (e.g. 1073741824)"
                     min="0">
             </div>
             <div class="form-group">
-                <label class="form-label">Max Unique IPs</label>
+                <label class="form-label">{{ _('telemt_max_ips_label') }}</label>
                 <input class="form-input" type="number" id="telemtMaxIps" placeholder="Optional (e.g. 16)" min="1">
             </div>
             <div class="form-group">
-                <label class="form-label">Expiration Date (ISO 8601)</label>
+                <label class="form-label">{{ _('telemt_expiry_label') }}</label>
                 <input class="form-input" type="text" id="telemtExpiry" placeholder="e.g. 2026-12-31T23:59:59Z">
             </div>
         </div>
@@ -974,8 +1261,15 @@
         <!-- QR Code Panel -->
         <div class="config-panel" id="panel-qr">
             <div class="qr-container">
+                <div class="qr-format hidden" id="qrFormat">
+                    <button type="button" class="qr-format-btn active" data-fmt="amnezia"
+                        onclick="setQrFormat('amnezia')">{{ _('qr_format_amnezia') }}</button>
+                    <button type="button" class="qr-format-btn" data-fmt="wireguard"
+                        onclick="setQrFormat('wireguard')">{{ _('qr_format_wireguard') }}</button>
+                </div>
                 <div id="qrCode"></div>
                 <div class="qr-hint">{{ _('qr_hint') }}</div>
+                <div class="qr-hint" id="qrFormatHint"></div>
             </div>
         </div>
     </div>
@@ -1012,24 +1306,41 @@
         </div>
     </div>
 </div>
+<!-- ===== Host Tuning Modal ===== -->
+<div class="modal-backdrop" id="hostTuningModal">
+    <div class="modal" style="max-width:520px;">
+        <div class="modal-header">
+            <h2 class="modal-title">📊 {{ _('host_tuning') }}</h2>
+            <button class="modal-close" onclick="closeModal('hostTuningModal')">×</button>
+        </div>
+        <div id="hostTuningBody" style="margin-top:var(--space-md); font-size:12px; line-height:1.6;"></div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/nginx/nginx.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/css/css.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/properties/properties.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
+<script src="/static/vendor/codemirror/codemirror.min.js"></script>
+<script src="/static/vendor/codemirror/mode/nginx/nginx.min.js"></script>
+<script src="/static/vendor/codemirror/mode/xml/xml.min.js"></script>
+<script src="/static/vendor/codemirror/mode/javascript/javascript.min.js"></script>
+<script src="/static/vendor/codemirror/mode/css/css.min.js"></script>
+<script src="/static/vendor/codemirror/mode/properties/properties.min.js"></script>
+<script src="/static/vendor/codemirror/mode/htmlmixed/htmlmixed.min.js"></script>
 <script>
     const SERVER_ID = {{ server_id }};
+    let SSH_COOLDOWN_BASE = {{ (server.get('ssh_cooldown_base') or 30) | tojson }};
+    document.body.dataset.serverUid = {{ (server.uid or '') | tojson }};
     const SERVER_HOST = "{{ server.host }}";
     const TRANSFER_TARGETS = {{ transfer_targets | tojson }};
     // These values come from the panel database, not a new SSH request. They
     // keep the screen useful while the live health check is still running.
     const SAVED_PROTOCOLS = {{ saved_protocols | tojson }};
     const SAVED_CONNECTIONS = {{ saved_connections | tojson }};
+    const CUSTOM_PROTO_NAMES = {
+        {%- for proto, info in (server.get('protocols') or {}).items() if info.get('custom_name') %}
+        {{ proto|tojson }}: {{ info.get('custom_name')|tojson }},
+        {%- endfor %}
+    };
     const MARKETPLACE_APPS = [
         { proto: 'awg3', category: 'protocols', icon: '🛡', title: 'AmneziaWG 3.1', descKey: 'awg3_desc', badge: 'NEW' },
         { proto: 'awg2', category: 'protocols', icon: '✨', title: 'AmneziaWG 2.0', descKey: 'awg_desc' },
@@ -1042,6 +1353,7 @@
         { proto: 'dns', category: 'services', icon: '🔍', title: 'AmneziaDNS', descKey: 'dns_desc' },
         { proto: 'adguard', category: 'services', icon: '🛡️', title: 'AdGuard Home', descKey: 'adguard_desc' },
         { proto: 'socks5', category: 'services', icon: '🧦', title: 'SOCKS5 Proxy', descKey: 'socks5_desc' },
+        { proto: 'exit', category: 'services', icon: '🚪', title: 'Exit Node', descKey: 'exit_desc', badge: 'NEW' },
         { proto: 'nginx', category: 'web_servers', icon: '🌐', title: 'NGINX', descKey: 'nginx_desc' },
     ];
     const MARKETPLACE_CATEGORIES = [
@@ -1059,6 +1371,25 @@
     let currentProtocolStatus = {};
     let installedAppsLoading = true;
     let currentSocks5Proto = 'socks5';
+    let currentAwgProto = 'awg2';
+
+    const AWG_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy'];
+    const SPECIAL_JUNK_KEYS = ['i1', 'i2', 'i3', 'i4', 'i5'];
+    // Same value the desktop client ships as its default I1.
+    const AWG_DEFAULT_I1 = '<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>';
+
+    // The install form and the settings modal name their inputs differently
+    // (installAwgI1 vs awgSetI1), so callers pass the whole id prefix.
+    function specialJunkField(prefix, key) {
+        return document.getElementById(prefix + key.toUpperCase());
+    }
+
+    function resetSpecialJunkFields(prefix) {
+        SPECIAL_JUNK_KEYS.forEach((key, idx) => {
+            const el = specialJunkField(prefix, key);
+            if (el) el.value = idx === 0 ? AWG_DEFAULT_I1 : '';
+        });
+    }
 
     function protoBase(proto) {
         return String(proto || 'awg').split('__')[0];
@@ -1088,6 +1419,63 @@
         let port = parseInt(fallback, 10) || 55424;
         while (used.has(port)) port += 1;
         return String(port);
+    }
+
+    // ---- Used-port awareness for the install modal ----
+    // Fetches real listening ports from the server (not just same-family
+    // protocol records) so the suggested port is actually free.
+    const UDP_INSTALL_PROTOS = new Set(['awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'exit']);
+    const SKIP_PORT_CHECK = new Set(['dns', 'adguard']); // internal bindings
+    window.usedPorts = { ts: 0, udp: {}, tcp: {} };
+
+    async function refreshUsedPorts(force) {
+        if (!force && Date.now() - window.usedPorts.ts < 15000) return;
+        try {
+            const r = await fetch(`/api/servers/${SERVER_ID}/used-ports`);
+            if (r.ok) {
+                const d = await r.json();
+                window.usedPorts.udp = d.udp || {};
+                window.usedPorts.tcp = d.tcp || {};
+                window.usedPorts.ts = Date.now();
+            }
+        } catch (e) { /* keep stale data */ }
+    }
+
+    function installPortTransport(proto) {
+        return UDP_INSTALL_PROTOS.has(protoBase(proto)) ? 'udp' : 'tcp';
+    }
+
+    function portTakenBy(port, proto) {
+        const p = parseInt(port, 10);
+        if (Number.isNaN(p)) return null;
+        const table = window.usedPorts[installPortTransport(proto)] || {};
+        return table[String(p)] || null;
+    }
+
+    function firstFreePort(from, proto) {
+        let p = parseInt(from, 10) || 55424;
+        let guard = 0;
+        while (portTakenBy(p, proto) && guard++ < 1000) p += 1;
+        return String(p);
+    }
+
+    function validateInstallPort() {
+        const portInput = document.getElementById('installPort');
+        const portHint = document.getElementById('installPortHint');
+        const btn = document.getElementById('installBtn');
+        if (portInput.disabled || SKIP_PORT_CHECK.has(protoBase(currentInstallProto))) return;
+        const owner = portTakenBy(portInput.value, currentInstallProto);
+        if (owner) {
+            portInput.style.borderColor = '#ef4444';
+            portHint.style.color = '#ef4444';
+            portHint.textContent = _('port_in_use_by').replace('{port}', portInput.value).replace('{owner}', owner);
+            btn.disabled = true;
+        } else {
+            portInput.style.borderColor = '';
+            portHint.style.color = '';
+            if (portHint.dataset.orig) portHint.textContent = portHint.dataset.orig;
+            btn.disabled = false;
+        }
     }
 
     function orderedProtocolEntries(protocols) {
@@ -1132,10 +1520,40 @@
                     <span style="font-size: 1.2rem; margin-right: 8px;">🧹</span> ${_('clear_server')}
                 </button>
                 <button class="btn btn-danger" onclick="closeModal('managementModal'); deleteServer();" style="justify-content: flex-start; padding: 12px 20px;">
-                    <span style="font-size: 1.2rem; margin-right: 8px;">🗑️</span> ${_('remove_server')}
+                    <span class="btn-text-with-icon">${ICON_TRASH}</span> ${_('remove_server')}
                 </button>
+                <div style="margin-top: var(--space-md); padding-top: var(--space-md); border-top: 1px solid var(--border);">
+                    <label for="sshCooldownInput" style="display:block; font-size:0.85rem; margin-bottom:6px;">${_('ssh_cooldown_title')}</label>
+                    <div class="flex" style="gap:8px;">
+                        <input class="form-input" id="sshCooldownInput" type="number" min="5" max="300" step="1" value="${SSH_COOLDOWN_BASE}" style="max-width:120px;">
+                        <button class="btn btn-secondary btn-sm" onclick="saveSshCooldown()" id="sshCooldownSaveBtn">💾</button>
+                    </div>
+                    <div class="text-muted" style="font-size:0.78rem; margin-top:6px;">${_('ssh_cooldown_hint')}</div>
+                </div>
             </div>
         `;
+    }
+
+    async function saveSshCooldown() {
+        const input = document.getElementById('sshCooldownInput');
+        const btn = document.getElementById('sshCooldownSaveBtn');
+        if (!input) return;
+        const seconds = parseFloat(input.value);
+        if (!Number.isFinite(seconds) || seconds < 5 || seconds > 300) {
+            showToast(_('ssh_cooldown_title') + ': 5–300', 'error');
+            return;
+        }
+        if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spinner"></div>'; }
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/ssh_cooldown`, 'POST', { seconds });
+            SSH_COOLDOWN_BASE = res.ssh_cooldown_base;
+            input.value = res.ssh_cooldown_base;
+            showToast('✓', 'success');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = '💾'; }
+        }
     }
 
     function openManagementModal() {
@@ -1205,8 +1623,10 @@
         installedAppsLoading = !!isLoading;
         const loading = document.getElementById('installedAppsLoading');
         const empty = document.getElementById('installedAppsEmpty');
+        const grid = document.getElementById('protocols-grid');
         if (loading) loading.classList.toggle('hidden', !installedAppsLoading);
         if (empty && installedAppsLoading) empty.classList.add('hidden');
+        if (grid) grid.classList.toggle('apps-pending', installedAppsLoading);
     }
 
     function applyInstalledAppsVisibility() {
@@ -1267,9 +1687,12 @@
         if (empty) empty.classList.toggle('hidden', installedAppsLoading || installedCount > 0);
         const loading = document.getElementById('installedAppsLoading');
         if (loading) loading.classList.toggle('hidden', !installedAppsLoading);
+        if (grid) grid.classList.toggle('apps-pending', installedAppsLoading);
+        applyCustomTitles();
     }
 
     function getProtoTitle(proto) {
+        if (CUSTOM_PROTO_NAMES[proto]) return CUSTOM_PROTO_NAMES[proto];
         const base = protoBase(proto);
         const idx = protoInstance(proto);
         let title;
@@ -1286,6 +1709,7 @@
             case 'socks5': title = 'SOCKS5 Proxy'; break;
             case 'adguard': title = 'AdGuard Home'; break;
             case 'nginx': title = 'NGINX'; break;
+            case 'exit': title = 'Exit Node'; break;
             default: title = proto;
         }
         return idx > 1 ? `${title} #${idx}` : title;
@@ -1342,6 +1766,20 @@
         renderSavedConnections(select.value);
         // Fetch current peer data in parallel with the full server health check.
         loadConnections();
+    }
+
+    // Apply custom instance names to the visible card titles (static cards
+    // keep hardcoded names in HTML, so they need an explicit override).
+    function applyCustomTitles() {
+        Object.entries(CUSTOM_PROTO_NAMES).forEach(([proto, name]) => {
+            const card = document.getElementById(`proto-${protoDomKey(proto)}`);
+            const nameEl = card && card.querySelector('.protocol-name');
+            if (nameEl) {
+                const pencil = nameEl.querySelector('.proto-rename');
+                nameEl.textContent = name;
+                if (pencil) nameEl.appendChild(pencil);
+            }
+        });
     }
 
     // ========== Server Stats ==========
@@ -1473,7 +1911,7 @@
             mode: options.mode || 'nginx',
             theme: 'material-darker',
             lineNumbers: true,
-            lineWrapping: false,
+            lineWrapping: true,
             indentUnit: 4,
             tabSize: 4,
             indentWithTabs: false,
@@ -1524,7 +1962,7 @@
 
     // Services that don't have per-user "connections" — they expose a single
     // shared endpoint (DNS/proxy/admin UI) rather than per-client configs.
-    const SERVICE_PROTOS = ['dns', 'socks5', 'adguard', 'nginx'];
+    const SERVICE_PROTOS = ['dns', 'socks5', 'adguard', 'nginx', 'exit'];
 
     function buildServiceInfoGrid(proto, info) {
         // Custom info-grid markup for non-VPN services. Returns HTML for the grid body.
@@ -1550,6 +1988,16 @@
                 <div class="protocol-info-item"><span class="protocol-info-label">${_('adguard_mode')}</span><span class="protocol-info-value">${mode}</span></div>
                 <div class="protocol-info-item"><span class="protocol-info-label">${_('adguard_internal_ip')}</span><span class="protocol-info-value">${ip}</span></div>
                 <div class="protocol-info-item"><span class="protocol-info-label">${_('adguard_web_ui')}</span><span class="protocol-info-value"><a href="${url}" target="_blank" rel="noopener">${url}</a></span></div>
+            `;
+        }
+        if (base === 'exit') {
+            const key = info.public_key ? `<span title="${escapeHtml(info.public_key)}">${escapeHtml(info.public_key.slice(0, 12))}…</span>` : '—';
+            return `
+                <div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${info.port || '—'}/UDP</span></div>
+                <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_subnet')}</span><span class="protocol-info-value">${escapeHtml(info.subnet || '—')}</span></div>
+                <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_peers')}</span><span class="protocol-info-value">${info.peers_count ?? 0}</span></div>
+                <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_obfuscation_short')}</span><span class="protocol-info-value">${info.obfuscation ? _('on') : _('off')}</span></div>
+                <div class="protocol-info-item"><span class="protocol-info-label">${_('exit_public_key')}</span><span class="protocol-info-value">${key}</span></div>
             `;
         }
         if (base === 'nginx') {
@@ -1638,6 +2086,9 @@
                 if (!isService && info.clients_count !== undefined) {
                     grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('connections')}</span><span class="protocol-info-value">${info.clients_count}</span></div>`;
                 }
+                if (!isService && info.exit_link) {
+                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('exit_link_via')}</span><span class="protocol-info-value">${escapeHtml(info.exit_link.exit_name || '')} ${exitStatusBadge(info.exit_link_status, info.exit_link)}</span></div>`;
+                }
                 infoGrid.innerHTML = grid;
             }
             if (protoBase(proto) === 'socks5') {
@@ -1668,6 +2119,12 @@
                     <button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')" style="flex:1">${_('backup')}</button>
                     <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">${_('uninstall')}</button>
                 `;
+            } else if (protoBase(proto) === 'exit') {
+                actionsEl.innerHTML = `
+                    <button class="btn btn-secondary btn-sm" onclick="showExitPeers('${proto}')" style="flex:1">${_('exit_peers')}</button>
+                    <button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')">${_('backup')}</button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">${_('uninstall')}</button>
+                `;
             } else {
                 actionsEl.innerHTML = `
                     <button class="btn btn-secondary btn-sm" onclick="selectProtocolForConns('${proto}')" style="flex:1">${_('connections')}</button>
@@ -1691,7 +2148,15 @@
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
                 } else {
+                    const awgBtn = AWG_PROTOCOLS.includes(protoBase(proto))
+                        ? `<button class="btn btn-secondary btn-sm" onclick="openAwgSettings('${proto}')" title="${_('awg_settings_title')}">${_('awg_settings_btn')}</button>`
+                        : '';
+                    const exitBtn = AWG_PROTOCOLS.includes(protoBase(proto))
+                        ? `<button class="btn btn-secondary btn-sm" onclick="openExitLinkModal('${proto}')" title="${_('exit_link_title')}">🚪${info.exit_link ? ' ' + escapeHtml(info.exit_link.exit_name || '') : ''}</button>`
+                        : '';
                     ctrlEl.innerHTML = `
+                        ${awgBtn}
+                        ${exitBtn}
                         <button class="btn btn-secondary btn-sm" onclick="showServerConfig('${proto}')" title="${_('server_config')}">${_('config_btn')}</button>
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
@@ -1742,6 +2207,21 @@
                 ctrlEl.innerHTML = '';
             }
         }
+        // Small pencil next to the instance name (visible on name hover).
+        // data-proto is (re)assigned here because cloned multi-instance cards
+        // inherit the base card's stale value.
+        const nameEl = document.querySelector(`#proto-${protoDomKey(proto)} .protocol-name`);
+        if (nameEl) {
+            let pencil = nameEl.querySelector('.proto-rename');
+            if (!pencil) {
+                pencil = document.createElement('span');
+                pencil.className = 'proto-rename';
+                pencil.title = _('rename_instance');
+                pencil.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>';
+                nameEl.appendChild(pencil);
+            }
+            pencil.dataset.proto = proto;
+        }
     }
 
     // Toggle Docker container start/stop
@@ -1751,7 +2231,15 @@
         if (!confirm(`${isRunning ? _('stop_container_confirm') : _('start_container_confirm')}`.replace('{}', name))) return;
         try {
             showToast(`${action} ${name}...`, 'info');
-            const res = await apiCall(`/api/servers/${SERVER_ID}/container/toggle`, 'POST', { protocol: proto });
+            let res;
+            try {
+                res = await apiCall(`/api/servers/${SERVER_ID}/container/toggle`, 'POST', { protocol: proto });
+            } catch (err) {
+                if (err.message !== 'exit_in_use') throw err;
+                // Entry nodes route through this exit: their clients land on the kill-switch
+                if (!confirm(_('exit_stop_confirm'))) return;
+                res = await apiCall(`/api/servers/${SERVER_ID}/container/toggle`, 'POST', { protocol: proto, force: true });
+            }
             showToast(`${name} ${res.action === 'stopped' ? _('stopped') : _('started')}`, 'success');
             // Recheck after a short delay
             setTimeout(() => checkServer(), 1500);
@@ -1774,6 +2262,209 @@
             refreshConfigEditor('serverConfigText');
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    // Host network tuning modal (server-level)
+    async function openHostTuning() {
+        try {
+            showToast(_('loading'), 'info');
+            const res = await apiCall(`/api/servers/${SERVER_ID}/host_tuning`, 'POST', {});
+            renderHostTuning(res);
+            openModal('hostTuningModal');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    function renderHostTuning(t) {
+        const el = document.getElementById('hostTuningBody');
+        if (!el) return;
+        if (!t) { el.innerHTML = ''; return; }
+        const esc = s => String(s ?? '—').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+        const row = (k, v) => `<div class="row-between" style="gap:12px;"><span style="opacity:.7">${k}</span><code style="word-break:break-all;text-align:end;">${esc(v)}</code></div>`;
+        let html = '';
+        const h = t.host || {};
+        html += `<div style="opacity:.85;font-weight:600;margin-bottom:2px;">Host</div>`;
+        if (t.panel && t.panel.ssh_cooldown_base != null) {
+            html += row('ssh cooldown (panel)', `${t.panel.ssh_cooldown_base}s`);
+        }
+        html += row('congestion control', h.cc);
+        html += row('qdisc', h.qdisc);
+        html += row('conntrack', `${h.conntrack_count || 0} / ${h.conntrack || '—'}`);
+        html += row('netdev_max_backlog', h.netdev_max_backlog);
+        html += row('somaxconn', h.somaxconn);
+        html += row('amneziawg module', h.awg_module ? `kernel v${h.awg_module}` : 'userspace (amneziawg-go)');
+        for (const c of (t.containers || [])) {
+            html += `<div style="font-weight:600;margin:12px 0 2px;">🐳 ${esc(c.name)} ${c.running ? '<span style="color:var(--success,#3fb950)">● online</span>' : '<span style="color:var(--danger,#f85149)">● stopped</span>'}</div>`;
+            if (c.running && c.ct) {
+                html += row('rmem_max / wmem_max', `${c.ct['net.core.rmem_max'] || '—'} / ${c.ct['net.core.wmem_max'] || '—'}`);
+                html += row('tcp_fastopen', c.ct['net.ipv4.tcp_fastopen']);
+                html += row('tcp_mtu_probing', c.ct['net.ipv4.tcp_mtu_probing']);
+                html += row('nofile (ulimit -n)', c.ct['nofile']);
+            }
+        }
+        if (!(t.containers || []).length) html += `<div style="opacity:.6;margin-top:8px;">No AWG containers</div>`;
+        el.innerHTML = html;
+    }
+
+    // ---------- rename protocol instance ----------
+    let renameProtoTarget = null;
+
+    // Pencils live inside .protocol-name and are (re)built on every status
+    // refresh, so one delegated listener covers static and cloned cards.
+    document.addEventListener('click', (e) => {
+        const el = e.target.closest('.proto-rename');
+        if (el && el.dataset.proto) openRenameProtocol(el.dataset.proto);
+    });
+
+    function openRenameProtocol(proto) {
+        renameProtoTarget = proto;
+        document.getElementById('renameProtoInput').value = CUSTOM_PROTO_NAMES[proto] || getProtoTitle(proto);
+        openModal('renameProtoModal');
+    }
+
+    async function saveRenameProtocol() {
+        const proto = renameProtoTarget;
+        if (!proto) return;
+        const name = document.getElementById('renameProtoInput').value.trim();
+        const btn = document.getElementById('renameProtoSaveBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner" style="display:inline-block;width:14px;height:14px;vertical-align:-2px;border:2px solid rgba(255,255,255,0.25);border-top-color:#fff;border-radius:50%;animation:spin 0.6s linear infinite;"></span>';
+        document.getElementById('renameProtoInput').disabled = true;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/protocol/rename`, 'POST', { protocol: proto, name });
+            if (name) {
+                CUSTOM_PROTO_NAMES[proto] = name;
+            } else {
+                delete CUSTOM_PROTO_NAMES[proto];
+            }
+            closeModal('renameProtoModal');
+            showToast(_('success') || 'Saved', 'success');
+            setTimeout(() => location.reload(), 800);
+        } catch (err) {
+            showToast((_('error') || 'Error') + ': ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            // textContent + the runtime helper: a locale whose "save" carries
+            // a quote would break a server-rendered JS string literal.
+            btn.textContent = _('save') || 'Save';
+            document.getElementById('renameProtoInput').disabled = false;
+        }
+    }
+
+    // ---------- wg-easy import ----------
+    let wgeasyClients = [];
+
+    function openWgEasyImport() {
+        document.getElementById('wgeasyPreviewArea').classList.add('hidden');
+        document.getElementById('wgeasyImportGoBtn').classList.add('hidden');
+        document.getElementById('wgeasyPreviewBtn').classList.remove('hidden');
+        document.getElementById('wgeasyUsernameGroup').style.display = 'none';
+        const logEl = document.getElementById('wgeasyLog');
+        logEl.classList.add('hidden');
+        logEl.textContent = '';
+        wgeasyClients = [];
+        openModal('wgeasyImportModal');
+    }
+
+    async function wgeasyPreview() {
+        const btn = document.getElementById('wgeasyPreviewBtn');
+        const oldText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '...';
+        try {
+            const body = {
+                web_port: parseInt(document.getElementById('wgeasyWebPort').value, 10) || 51821,
+                password: document.getElementById('wgeasyPassword').value,
+                username: document.getElementById('wgeasyUsername').value || 'admin',
+            };
+            const res = await apiCall(`/api/servers/${SERVER_ID}/wgeasy/preview`, 'POST', body);
+            wgeasyClients = res.clients || [];
+            if (res.release >= 15) {
+                document.getElementById('wgeasyUsernameGroup').style.display = '';
+            }
+            renderWgEasyPreview(res);
+            document.getElementById('wgeasyPreviewArea').classList.remove('hidden');
+            document.getElementById('wgeasyImportGoBtn').classList.remove('hidden');
+        } catch (err) {
+            showToast((_('error') || 'Error') + ': ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = oldText;
+        }
+    }
+
+    function renderWgEasyPreview(res) {
+        const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+        const info = document.getElementById('wgeasyPreviewInfo');
+        const targetLabel = res.recommended_target === 'awg2'
+            ? ('{{ _("wgeasy_target_awg") }}')
+            : ('{{ _("wgeasy_target_wg") }}');
+        info.textContent = `wg-easy API v${res.release} • ${esc(res.server_address)} • :${res.listen_port} • ${res.clients.length} ${_('clients') || 'clients'} → ${targetLabel}`;
+        const tbody = document.getElementById('wgeasyClientsBody');
+        tbody.innerHTML = res.clients.map(c => `
+            <tr>
+                <td style="padding:5px 10px;"><input type="checkbox" class="wgeasy-client-check" data-id="${esc(c.id)}" checked></td>
+                <td style="padding:5px 10px;">${esc(c.name)}</td>
+                <td style="padding:5px 10px;" class="font-mono">${esc(c.address)}</td>
+                <td style="padding:5px 10px;">${c.enabled ? '🟢' : '⚫'}</td>
+            </tr>`).join('');
+        const checkAll = document.getElementById('wgeasyCheckAll');
+        checkAll.checked = true;
+        checkAll.onchange = () => {
+            tbody.querySelectorAll('.wgeasy-client-check').forEach(cb => cb.checked = checkAll.checked);
+        };
+    }
+
+    async function wgeasyDoImport() {
+        const ids = [...document.querySelectorAll('.wgeasy-client-check:checked')].map(cb => cb.dataset.id);
+        if (!ids.length) {
+            showToast(_('wgeasy_no_clients') || 'No clients selected', 'error');
+            return;
+        }
+        if (!confirm((_('wgeasy_confirm') || 'Import selected clients? The old wg-easy container will be stopped.'))) {
+            return;
+        }
+        const btn = document.getElementById('wgeasyImportGoBtn');
+        const logEl = document.getElementById('wgeasyLog');
+        const showLog = (lines, isError) => {
+            logEl.classList.remove('hidden');
+            logEl.style.color = isError ? 'var(--danger, #f87171)' : 'inherit';
+            logEl.textContent = lines.join('\n');
+            logEl.scrollTop = logEl.scrollHeight;
+        };
+        btn.disabled = true;
+        btn.textContent = '...';
+        logEl.classList.remove('hidden');
+        logEl.style.color = 'inherit';
+        logEl.textContent = '⏳ ' + (_('wgeasy_importing') || 'Importing, this may take a few minutes...');
+        try {
+            const body = {
+                web_port: parseInt(document.getElementById('wgeasyWebPort').value, 10) || 51821,
+                password: document.getElementById('wgeasyPassword').value,
+                username: document.getElementById('wgeasyUsername').value || 'admin',
+                client_ids: ids,
+            };
+            const res = await apiCall(`/api/servers/${SERVER_ID}/wgeasy/import`, 'POST', body);
+            const lines = (res.log || []).concat([
+                `✅ ${res.imported} ↑ / ${res.disabled} ⏸ • ${res.target} :${res.port} ${res.subnet}`,
+            ]);
+            showLog(lines, false);
+            showToast(_('success') || 'Done', 'success');
+            btn.classList.add('hidden');
+            // Keep the modal open so the log stays readable; closing it
+            // (× or the footer button) reloads the page to show the instance.
+            const modal = document.getElementById('wgeasyImportModal');
+            modal.querySelector('.modal-close')
+                .addEventListener('click', () => location.reload(), { once: true });
+            modal.querySelector('.modal-footer .btn-secondary').onclick = () => location.reload();
+        } catch (err) {
+            const lines = ((err.payload && err.payload.log) || []).concat([`❌ ${err.message}`]);
+            showLog(lines, true);
+            showToast((_('error') || 'Error') + ': ' + err.message, 'error');
+            btn.disabled = false;
+            btn.textContent = _('wgeasy_import_btn');
         }
     }
 
@@ -1877,11 +2568,15 @@
         const socks5Opts = document.getElementById('socks5Options');
         const adguardOpts = document.getElementById('adguardOptions');
         const nginxOpts = document.getElementById('nginxOptions');
+        const awgOpts = document.getElementById('awgOptions');
+        const exitOpts = document.getElementById('exitOptions');
 
         telemtOpts.style.display = 'none';
         socks5Opts.style.display = 'none';
         adguardOpts.style.display = 'none';
         nginxOpts.style.display = 'none';
+        awgOpts.style.display = 'none';
+        exitOpts.style.display = 'none';
 
         if (base === 'dns') {
             portLabel.textContent = _('port') + ' (Internal)';
@@ -1923,16 +2618,43 @@
             portInput.value = currentInstallAnother ? nextSuggestedPort(currentInstallProto, 443) : '443';
             portInput.disabled = false;
             portHint.textContent = currentInstallAnother ? _('port_next_instance_hint') : _('aivpn_port_hint');
+        } else if (base === 'exit') {
+            portLabel.textContent = _('port') + ' (UDP)';
+            portInput.value = '55520';
+            portInput.disabled = false;
+            portHint.textContent = _('exit_port_hint');
+            exitOpts.style.display = 'block';
         } else {
             portLabel.textContent = _('port') + ' (UDP)';
             portInput.value = currentInstallAnother ? nextSuggestedPort(currentInstallProto, 55424) : '55424';
             portInput.disabled = false;
             portHint.textContent = currentInstallAnother ? _('port_next_instance_hint') : _('port_default_hint');
+            awgOpts.style.display = 'block';
+            // AWG Legacy predates the special junk packets, only MTU/DNS apply.
+            document.getElementById('installAwgJunk').style.display = base === 'awg_legacy' ? 'none' : '';
+            document.getElementById('installAwgMtu').value = '1376';
+            document.getElementById('installAwgDns1').value = '1.1.1.1';
+            document.getElementById('installAwgDns2').value = '1.0.0.1';
+            document.getElementById('installAwgDns6').value = '2606:4700:4700::1111';
+            resetSpecialJunkFields('installAwg');
         }
 
         document.getElementById('installForm').classList.remove('hidden');
         document.getElementById('installProgress').classList.add('hidden');
         document.getElementById('installDone').style.display = 'none';
+
+        // Live port validation + auto-suggest a truly free port
+        portHint.dataset.orig = portHint.textContent;
+        portInput.oninput = validateInstallPort;
+        validateInstallPort();
+        refreshUsedPorts().then(() => {
+            if (!portInput.disabled && !SKIP_PORT_CHECK.has(protoBase(currentInstallProto))
+                    && portTakenBy(portInput.value, currentInstallProto)) {
+                portInput.value = firstFreePort(portInput.value, currentInstallProto);
+            }
+            validateInstallPort();
+        });
+
         openModal('installModal');
     }
 
@@ -1989,13 +2711,30 @@
             } else if (protoBase(currentInstallProto) === 'nginx') {
                 params.nginx_domain = document.getElementById('installNginxDomain').value.trim();
                 params.nginx_email = document.getElementById('installNginxEmail').value.trim();
+            } else if (protoBase(currentInstallProto) === 'exit') {
+                params.exit_subnet = document.getElementById('installExitSubnet').value.trim();
+                params.exit_obfuscation = document.getElementById('installExitObfuscation').checked;
+            } else if (AWG_PROTOCOLS.includes(protoBase(currentInstallProto))) {
+                params.awg_mtu = document.getElementById('installAwgMtu').value.trim();
+                params.awg_dns1 = document.getElementById('installAwgDns1').value.trim();
+                params.awg_dns2 = document.getElementById('installAwgDns2').value.trim();
+                params.awg_dns6 = document.getElementById('installAwgDns6').value.trim();
+                if (protoBase(currentInstallProto) !== 'awg_legacy') {
+                    ['i1', 'i2', 'i3', 'i4', 'i5'].forEach(key => {
+                        params['awg_' + key] = specialJunkField('installAwg', key).value.trim();
+                    });
+                }
             }
             const result = await apiCall(`/api/servers/${SERVER_ID}/install`, 'POST', params);
             clearInterval(progressInterval);
             fillEl.style.width = '100%';
             if (result.log) {
                 result.log.forEach(line => {
-                    logEl.innerHTML += `<div class="log-line success">✓ ${line}</div>`;
+                    // Installers mark a line that succeeded with a caveat by
+                    // prefixing it with "!" - a green tick would hide it.
+                    logEl.innerHTML += line.startsWith('!')
+                        ? `<div class="log-line warning">⚠ ${line.slice(1).trim()}</div>`
+                        : `<div class="log-line success">✓ ${line}</div>`;
                 });
             }
             logEl.scrollTop = logEl.scrollHeight;
@@ -2028,6 +2767,17 @@
         await loadProtocolBackups();
     }
 
+    document.getElementById('backupList').addEventListener('click', function (event) {
+        const btn = event.target.closest('[data-backup-action]');
+        if (!btn || !document.getElementById('backupList').contains(btn)) return;
+        const proto = btn.getAttribute('data-proto');
+        const filename = btn.getAttribute('data-filename');
+        const action = btn.getAttribute('data-backup-action');
+        if (action === 'restore') restoreProtocolBackup(proto, filename);
+        else if (action === 'download') downloadProtocolBackup(proto, filename);
+        else if (action === 'delete') deleteProtocolBackup(proto, filename);
+    });
+
     async function loadProtocolBackups() {
         const proto = document.getElementById('backupProto').value;
         const list = document.getElementById('backupList');
@@ -2044,12 +2794,16 @@
                 return;
             }
             list.innerHTML = backups.map(b => `
-                <div class="protocol-info-item" style="align-items:center; gap:var(--space-sm);">
-                    <div style="min-width:0; flex:1;">
-                        <div class="protocol-info-value" style="word-break:break-all;">${b.name}</div>
-                        <div class="protocol-info-label">${formatBytes(b.size)} • ${formatBackupTime(b.mtime)}</div>
+                <div class="backup-row">
+                    <div class="backup-row-meta">
+                        <div class="backup-row-name" title="${escapeHtml(b.name)}">${escapeHtml(b.name)}</div>
+                        <div class="backup-row-info">${formatBytes(b.size)} · ${formatBackupTime(b.mtime)}</div>
                     </div>
-                    <button class="btn btn-secondary btn-sm" onclick="downloadProtocolBackup('${proto}', '${b.name}')">${_('download')}</button>
+                    <div class="backup-row-actions">
+                        <button type="button" class="btn btn-secondary btn-sm" data-backup-action="restore" data-proto="${escapeHtml(proto)}" data-filename="${escapeHtml(b.name)}">${_('restore')}</button>
+                        <button type="button" class="btn btn-secondary btn-sm" data-backup-action="download" data-proto="${escapeHtml(proto)}" data-filename="${escapeHtml(b.name)}">${_('download')}</button>
+                        <button type="button" class="btn btn-danger btn-sm" data-backup-action="delete" data-proto="${escapeHtml(proto)}" data-filename="${escapeHtml(b.name)}">${_('delete')}</button>
+                    </div>
                 </div>
             `).join('');
         } catch (err) {
@@ -2068,6 +2822,42 @@
         try {
             await apiCall(`/api/servers/${SERVER_ID}/backups/create`, 'POST', { protocol: proto });
             showToast(_('backup_created'), 'success');
+            await loadProtocolBackups();
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = oldText;
+        }
+    }
+
+    document.getElementById('backupUploadFile').addEventListener('change', uploadProtocolBackup);
+
+    async function uploadProtocolBackup(event) {
+        const file = event.target.files && event.target.files[0];
+        event.target.value = '';
+        if (!file) return;
+        const proto = document.getElementById('backupProto').value;
+        const btn = document.getElementById('uploadBackupBtn');
+        const oldText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = _('uploading_backup');
+        try {
+            const body = new FormData();
+            body.append('protocol', proto);
+            body.append('file', file);
+            const res = await fetch(`/api/servers/${SERVER_ID}/backups/upload`, {
+                method: 'POST',
+                body
+            });
+            let data = {};
+            try {
+                data = await res.json();
+            } catch (_) {}
+            if (!res.ok) {
+                throw new Error(data.error || 'Upload failed');
+            }
+            showToast(_('backup_uploaded'), 'success');
             await loadProtocolBackups();
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
@@ -2106,6 +2896,46 @@
         }
     }
 
+    async function restoreProtocolBackup(proto, filename) {
+        if (!confirm(_('restore_confirm_protocol'))) return;
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/backups/restore`, 'POST', {
+                protocol: proto,
+                filename: filename
+            });
+            showToast(_('restore_success'), 'success');
+            // an archive can carry a different exit-link state than the panel has
+            const relinked = (res.exit_entries_relinked || []).filter(e => e.status === 'success').length;
+            const failed = (res.exit_entries_relinked || []).filter(e => e.status !== 'success').length;
+            if (relinked) showToast(_('exit_restore_entries_relinked').replace('{n}', relinked), 'info');
+            if (failed) showToast(_('exit_restore_entries_failed').replace('{n}', failed), 'error');
+            if (res.exit_link_restored === 'relinked') showToast(_('exit_restore_relinked'), 'info');
+            if (res.exit_link_restored === 'stale') showToast(_('exit_restore_stale'), 'error');
+            if (res.exit_link_restored === 'removed') showToast(_('exit_restore_removed'), 'info');
+            if (res.exit_link_restored === 'orphan') showToast(_('exit_restore_orphan'), 'error');
+            await loadProtocolBackups();
+            if (typeof loadConnections === 'function') {
+                await loadConnections();
+            }
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function deleteProtocolBackup(proto, filename) {
+        if (!confirm(_('delete_backup_confirm'))) return;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/backups/delete`, 'POST', {
+                protocol: proto,
+                filename: filename
+            });
+            showToast(_('backup_deleted'), 'success');
+            await loadProtocolBackups();
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
     async function uninstallProtocol(proto) {
         const name = getProtoTitle(proto);
         if (!confirm(_('uninstall_confirm').replace('{}', name))) return;
@@ -2119,6 +2949,280 @@
     }
 
     // ========== SOCKS5 Settings ==========
+    async function openAwgSettings(proto) {
+        currentAwgProto = proto;
+        try {
+            const data = await apiCall(`/api/servers/${SERVER_ID}/awg/settings`, 'POST', { protocol: proto });
+            document.getElementById('awgSettingsTitle').textContent = `${_('awg_settings_title')} — ${getProtoTitle(proto)}`;
+            document.getElementById('awgSetMtu').value = data.mtu || '1376';
+            document.getElementById('awgSetDns1').value = data.dns1 || '';
+            document.getElementById('awgSetDns2').value = data.dns2 || '';
+            document.getElementById('awgSetDns6').value = data.dns6 || '';
+            const exitHint = document.getElementById('awgSetMtuExitHint');
+            exitHint.classList.toggle('hidden', !data.exit_linked);
+            if (data.exit_linked) {
+                const over = Number(data.mtu) > Number(data.exit_mtu);
+                exitHint.textContent = _('awg_mtu_exit_hint').replace('{exit_mtu}', data.exit_mtu);
+                exitHint.style.color = over ? 'var(--danger, #f87171)' : '';
+            }
+            const junkGroup = document.getElementById('awgSetJunkGroup');
+            junkGroup.style.display = data.supports_special_junk ? '' : 'none';
+            SPECIAL_JUNK_KEYS.forEach(key => {
+                const el = specialJunkField('awgSet', key);
+                if (el) el.value = data[key] || '';
+            });
+            openModal('awgSettingsModal');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function saveAwgSettings() {
+        const btn = document.getElementById('awgSaveBtn');
+        const text = document.getElementById('awgSaveBtnText');
+        const spinner = document.getElementById('awgSaveSpinner');
+        const payload = {
+            protocol: currentAwgProto,
+            mtu: document.getElementById('awgSetMtu').value.trim(),
+            dns1: document.getElementById('awgSetDns1').value.trim(),
+            dns2: document.getElementById('awgSetDns2').value.trim(),
+            dns6: document.getElementById('awgSetDns6').value.trim(),
+        };
+        if (document.getElementById('awgSetJunkGroup').style.display !== 'none') {
+            SPECIAL_JUNK_KEYS.forEach(key => {
+                payload[key] = specialJunkField('awgSet', key).value.trim();
+            });
+        }
+        btn.disabled = true;
+        text.textContent = _('saving') || 'Saving...';
+        spinner.classList.remove('hidden');
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/awg/settings/save`, 'POST', payload);
+            showToast(_('awg_settings_saved'), 'success');
+            closeModal('awgSettingsModal');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            text.textContent = _('save');
+            spinner.classList.add('hidden');
+        }
+    }
+
+    // ========== Exit node ==========
+    let currentExitPeersProto = 'exit';
+    let currentExitLinkProto = null;
+    let currentExitLinkState = null;
+    const EXIT_LINK_ERROR_KEYS = ['exit_no_handshake', 'exit_mtu_too_big', 'exit_self', 'exit_legacy_obfuscation',
+        'exit_not_found', 'exit_apply_failed', 'exit_in_use', 'exit_egress_failed', 'exit_dns_needs_dns',
+        'not_linked'];
+
+    function exitStatusBadge(status, link) {
+        const badge = (cls, text, title = '') => `<span class="badge ${cls}" title="${escapeHtml(title)}"><span class="badge-dot"></span> ${escapeHtml(text)}</span>`;
+        if (link && link.stale) return badge('badge-danger', _('exit_status_down'), _('exit_link_stale'));
+        if (!status) return badge('badge-secondary', _('exit_status_down'));
+        if (status.error) return badge('badge-danger', _('exit_status_down'), status.error);
+        const age = status.handshake_age;
+        const ago = (age === null || age === undefined) ? '' : ' · ' + _('exit_handshake_ago').replace('{s}', age);
+        if (status.up) return badge('badge-success', _('exit_status_up') + ago, `${formatBytes(status.rx_bytes || 0)} ↓ ${formatBytes(status.tx_bytes || 0)} ↑`);
+        return badge('badge-warn', _('exit_status_stale') + ago);
+    }
+
+    function exitLinkErrorText(err) {
+        return EXIT_LINK_ERROR_KEYS.includes(err.message) ? _(err.message) : err.message;
+    }
+
+    async function showExitPeers(proto = 'exit') {
+        currentExitPeersProto = proto || 'exit';
+        const list = document.getElementById('exitPeersList');
+        const infoEl = document.getElementById('exitPeersInfo');
+        list.innerHTML = `<div class="empty-state">${_('loading')}</div>`;
+        openModal('exitPeersModal');
+        try {
+            const data = await apiCall(`/api/servers/${SERVER_ID}/exit/peers`, 'POST', { protocol: currentExitPeersProto });
+            const info = data.info || {};
+            infoEl.textContent = `${_('port')}: ${info.port || '—'}/UDP · ${_('exit_subnet')}: ${info.subnet || '—'} · ${_('exit_obfuscation_short')}: ${info.obfuscation ? _('on') : _('off')}`;
+            const e = escapeHtml;
+            if (!data.peers || !data.peers.length) {
+                list.innerHTML = `<div class="empty-state">${_('exit_no_peers')}</div>`;
+                return;
+            }
+            list.innerHTML = `<div class="table-wrap"><table class="table"><thead><tr>
+                <th>${_('exit_peer_name')}</th><th>${_('exit_transit_ip')}</th><th>${_('exit_public_key')}</th><th>${_('exit_handshake')}</th><th>${_('exit_transfer')}</th><th></th>
+                </tr></thead><tbody>` + data.peers.map(p => `<tr${p.external ? ' style="opacity:.7"' : ''}>
+                <td>${e(p.name || p.peer_id || '—')}${p.external ? ` <span class="badge badge-warn">${_('exit_peer_external')}</span>` : ''}</td>
+                <td>${e(p.transit_ip || '—')}</td>
+                <td><code title="${e(p.public_key)}">${e((p.public_key || '').slice(0, 12))}…</code></td>
+                <td>${e(p.latest_handshake || '—')}</td>
+                <td>${e(p.rx || '0 B')} ↓ ${e(p.tx || '0 B')} ↑</td>
+                <td><button class="btn btn-danger btn-sm" data-key="${e(p.public_key)}" onclick="removeExitPeer(this.dataset.key)">${_('uninstall')}</button></td>
+                </tr>`).join('') + `</tbody></table></div>`;
+        } catch (err) {
+            list.innerHTML = `<div class="empty-state">${_('error')}: ${escapeHtml(err.message)}</div>`;
+        }
+    }
+
+    async function removeExitPeer(publicKey) {
+        if (!confirm(_('exit_peer_remove_confirm'))) return;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/exit/peers/remove`, 'POST', { protocol: currentExitPeersProto, public_key: publicKey });
+            showToast(_('exit_peer_removed'), 'success');
+            showExitPeers(currentExitPeersProto);
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    function renderExitLinkState(state) {
+        const el = document.getElementById('exitLinkState');
+        const warn = document.getElementById('exitLinkWarnings');
+        const link = state.exit_link;
+        const unlinkBtn = document.getElementById('exitUnlinkBtn');
+        const repairBtn = document.getElementById('exitRepairBtn');
+        unlinkBtn.classList.toggle('hidden', !link);
+        document.getElementById('exitEgressBtn').classList.toggle('hidden', !link);
+        document.getElementById('exitDnsGroup').classList.toggle('hidden', !link);
+        document.getElementById('exitDnsViaExit').checked = !!(link && link.dns_via_exit);
+        repairBtn.classList.toggle('hidden', !(link && (link.stale || !(state.exit_link_status && state.exit_link_status.up))));
+        if (!link) {
+            el.innerHTML = `<div class="form-hint">${_('exit_link_none')}</div>`;
+        } else {
+            el.innerHTML = `<div>${escapeHtml(_('exit_link_current').replace('{name}', link.exit_name || '').replace('{ip}', link.transit_ip || ''))} ${exitStatusBadge(state.exit_link_status, link)}</div>`
+                + (link.stale ? `<div class="form-hint" style="color:var(--danger, #f87171)">${_('exit_link_stale')}</div>` : '');
+        }
+        let warnings = '';
+        if (state.ipv6) warnings += `<div class="form-hint">⚠ ${_('exit_link_ipv6_warning')}</div>`;
+        if (state.mtu && state.exit_mtu && state.mtu > state.exit_mtu) {
+            warnings += `<div class="form-hint" style="color:var(--danger, #f87171)">⚠ ${_('exit_link_mtu_warning').replace('{mtu}', state.mtu).replace('{exit_mtu}', state.exit_mtu)}</div>`;
+        }
+        warn.innerHTML = warnings;
+    }
+
+    async function openExitLinkModal(proto) {
+        currentExitLinkProto = proto;
+        document.getElementById('exitLinkTitle').textContent = `${_('exit_link_title')} — ${getProtoTitle(proto)}`;
+        const select = document.getElementById('exitLinkSelect');
+        const hint = document.getElementById('exitLinkSelectHint');
+        select.innerHTML = '';
+        hint.textContent = '';
+        document.getElementById('exitLinkState').innerHTML = `<div class="form-hint">${_('loading')}</div>`;
+        document.getElementById('exitLinkWarnings').innerHTML = '';
+        document.getElementById('exitLinkEgress').innerHTML = '';
+        // hidden until the state says this instance is linked
+        document.getElementById('exitEgressBtn').classList.add('hidden');
+        openModal('exitLinkModal');
+        try {
+            const [nodes, state] = await Promise.all([
+                apiCall('/api/exit-nodes'),
+                apiCall(`/api/servers/${SERVER_ID}/exit-link/status`, 'POST', { protocol: proto }),
+            ]);
+            currentExitLinkState = state;
+            const own = document.body.dataset.serverUid || '';
+            const candidates = (nodes.exit_nodes || []).filter(n => n.uid !== own);
+            if (!candidates.length) {
+                hint.textContent = _('exit_no_exit_nodes');
+            }
+            const legacy = protoBase(proto) === 'awg_legacy';
+            candidates.forEach(n => {
+                const opt = document.createElement('option');
+                opt.value = n.uid;
+                opt.textContent = `${n.name} (${n.host}:${n.port || '?'})${n.obfuscation ? ' [AWG]' : ''}`;
+                if (legacy && n.obfuscation) { opt.disabled = true; opt.title = _('exit_legacy_obfuscation'); }
+                if (state.exit_link && state.exit_link.exit_uid === n.uid) opt.selected = true;
+                select.appendChild(opt);
+            });
+            document.getElementById('exitLinkBtn').disabled = !candidates.length;
+            renderExitLinkState(state);
+        } catch (err) {
+            document.getElementById('exitLinkState').innerHTML = `<div class="form-hint">${_('error')}: ${escapeHtml(err.message)}</div>`;
+        }
+    }
+
+    async function exitLinkRequest(path, body, successKey) {
+        const btn = document.getElementById('exitLinkBtn');
+        const spinner = document.getElementById('exitLinkSpinner');
+        btn.disabled = true;
+        spinner.classList.remove('hidden');
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/exit-link${path}`, 'POST', body);
+            (res.warnings || []).forEach(w => showToast(_(w), 'info'));
+            showToast(_(successKey), 'success');
+            closeModal('exitLinkModal');
+            setTimeout(() => checkServer(), 500);
+            return res;
+        } catch (err) {
+            const text = exitLinkErrorText(err);
+            if (err.message === 'exit_no_handshake' || err.message === 'exit_mtu_too_big') {
+                if (confirm(`${text}\n\n${_('exit_link_force')}?`)) {
+                    return exitLinkRequest(path, { ...body, force: true }, successKey);
+                }
+            } else {
+                showToast(_('error') + ': ' + text, 'error');
+            }
+        } finally {
+            btn.disabled = false;
+            spinner.classList.add('hidden');
+        }
+    }
+
+    async function saveExitLink(force = false) {
+        const uid = document.getElementById('exitLinkSelect').value;
+        if (!uid) return;
+        if (currentExitLinkState && currentExitLinkState.ipv6 && !confirm(_('exit_link_ipv6_confirm'))) return;
+        await exitLinkRequest('', { protocol: currentExitLinkProto, exit_uid: uid, force }, 'exit_link_saved');
+    }
+
+    async function removeExitLink() {
+        if (!confirm(_('exit_unlink_confirm'))) return;
+        await exitLinkRequest('/remove', { protocol: currentExitLinkProto }, 'exit_unlinked');
+    }
+
+    async function checkExitEgress() {
+        const box = document.getElementById('exitLinkEgress');
+        const btn = document.getElementById('exitEgressBtn');
+        box.innerHTML = `<div class="form-hint">${_('exit_egress_checking')}</div>`;
+        btn.disabled = true;
+        try {
+            const r = await apiCall(`/api/servers/${SERVER_ID}/exit-link/check-egress`, 'POST', { protocol: currentExitLinkProto });
+            const via = escapeHtml(r.via_exit || '');
+            let text, color;
+            if (!r.via_exit) {
+                text = _('exit_egress_unknown'); color = 'var(--danger, #f87171)';
+            } else if (r.leaks) {
+                text = _('exit_egress_direct').replace('{ip}', via); color = 'var(--danger, #f87171)';
+            } else if (r.matches) {
+                text = _('exit_egress_match').replace('{ip}', via).replace('{name}', escapeHtml(r.exit_name || '')); color = 'var(--success, #4ade80)';
+            } else {
+                text = _('exit_egress_mismatch').replace('{ip}', via).replace('{expected}', escapeHtml(r.expected_ip || r.expected || '')); color = 'var(--warning, #fbbf24)';
+            }
+            box.innerHTML = `<div class="form-hint" style="color:${color}">${text}</div>`;
+        } catch (err) {
+            box.innerHTML = `<div class="form-hint" style="color:var(--danger, #f87171)">${_('error')}: ${escapeHtml(exitLinkErrorText(err))}</div>`;
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function saveExitDns(enabled) {
+        const box = document.getElementById('exitDnsViaExit');
+        box.disabled = true;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/exit-link/dns`, 'POST',
+                          { protocol: currentExitLinkProto, enabled: !!enabled });
+            showToast(_(enabled ? 'exit_dns_via_exit_on' : 'exit_dns_via_exit_off'), 'success');
+            if (currentExitLinkState && currentExitLinkState.exit_link) currentExitLinkState.exit_link.dns_via_exit = !!enabled;
+        } catch (err) {
+            box.checked = !enabled;
+            showToast(_('error') + ': ' + exitLinkErrorText(err), 'error');
+        } finally {
+            box.disabled = false;
+        }
+    }
+
+    async function repairExitLink() {
+        await exitLinkRequest('/relink', { protocol: currentExitLinkProto }, 'exit_link_saved');
+    }
+
     async function openSocks5Settings(proto = 'socks5') {
         currentSocks5Proto = proto || 'socks5';
         try {
@@ -2170,7 +3274,7 @@
         document.getElementById('connectionsSection').scrollIntoView({ behavior: 'smooth' });
     }
 
-    async function loadConnections(isPoll) {
+    async function loadConnections(isPoll, force) {
         const proto = document.getElementById('connProtoSelect').value;
         const loading = document.getElementById('connectionsLoading');
         const emptyEl = document.getElementById('connectionsEmpty');
@@ -2181,12 +3285,26 @@
             return;
         }
 
+        // Skip poll re-renders while the rename editor is open — a full innerHTML
+        // rebuild would destroy the input mid-typing. `force` bypasses this for
+        // the editor's own save path, which wants an immediate silent refresh.
+        if (isPoll && !force && document.querySelector('#connectionsListInner .rename-editor')) {
+            clearTimeout(window.connPollTimer);
+            if (document.getElementById('connectionsSection').style.display !== 'none') {
+                window.connPollTimer = setTimeout(function() { loadConnections(true); }, 5000);
+            }
+            return;
+        }
+
         if (window.connLoading) return; // don't stack overlapping polls
         window.connLoading = true;
         if (!isPoll) loading.style.display = ''; // silent refresh on polls
         emptyEl.classList.add('hidden');
         try {
             const data = await apiCall(`/api/servers/${SERVER_ID}/connections?protocol=${proto}`);
+            // The rename editor may have opened while this poll was in flight —
+            // re-rendering now would destroy it mid-typing.
+            if (isPoll && !force && listEl.querySelector('.rename-editor')) return;
             loading.style.display = 'none';
             if (!data.clients || data.clients.length === 0) {
                 listEl.innerHTML = '';
@@ -2209,9 +3327,33 @@
                 const assignedUser = client.assigned_user || '';
                 client._online = false; // reset each render; set by the handshake badge below
 
+                // Peer internal IP shown next to the name
+                const peerIp = userData.clientIp || (userData.allowedIps || '').match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || '';
+                const ipHtml = peerIp ? ` <span class="client-ip">${escapeHtml(peerIp)}</span>` : '';
+
                 let metaHtml = '';
                 if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;">👤 ${escapeHtml(assignedUser)}</span>`;
                 if (created) metaHtml += `<span>📅 ${formatDate(created)}</span>`;
+
+                // Connection flood warnings (P2P/torrent detection), newest last
+                let warningsHtml = '';
+                if (Array.isArray(userData.connWarnings) && userData.connWarnings.length) {
+                    warningsHtml = '<div class="conn-warnings">' + userData.connWarnings.map(ev => {
+                        const d = new Date(ev.ts * 1000);
+                        const dateStr = String(d.getDate()).padStart(2, '0') + '.' + String(d.getMonth() + 1).padStart(2, '0') + '.' + d.getFullYear();
+                        const timeStr = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+                        const text = _('conn_warning_text')
+                            .replace('{date}', dateStr)
+                            .replace('{time}', timeStr)
+                            .replace('{count}', ev.count);
+                        return `<div class="conn-warning">${escapeHtml(text)}</div>`;
+                    }).join('') +
+                    `<button class="btn btn-secondary btn-sm btn-icon conn-warning-clear" onclick="clearConnWarnings('${escapeJs(client.clientId)}')" title="${_('clear_warnings')}" style="margin-top:4px;">${ICON_TRASH}</button></div>`;
+                }
+
+                // Per-peer bandwidth limit badge (AWG): ⚡∞ by default, 🐢 X Mbps when a limit is set
+                const maxSpeed = parseFloat(userData.maxSpeed || 0) || 0;
+                if (proto.startsWith('awg') || protoBase(proto) === 'wireguard') metaHtml += `<span class="traffic-badge traffic-limit" title="${_('max_speed')}">${maxSpeed > 0 ? '🐢 ' + maxSpeed + ' Mbps' : '⚡<span style="font-size:1.25em; line-height:0;">∞</span>'}</span>`;
 
                 if (proto === 'telemt') {
                     if (userData.total_octets) metaHtml += `<span class="traffic-badge">📊 ${formatBytes(userData.total_octets)}</span>`;
@@ -2231,39 +3373,46 @@
                     }
                     if (userData.expiresAt) metaHtml += `<span class="badge" style="font-size:0.65rem;">⌛ ${formatDate(userData.expiresAt)}</span>`;
                 } else {
-                    if (handshake) metaHtml += `<span>🤝 ${handshake}</span>`;
+                    const hsSec = parseHandshakeAgo(handshake);
+                    const isOnline = hsSec !== null && hsSec < 180;
+                    if (handshake) metaHtml += `<span class="meta-handshake${isOnline ? ' meta-online' : ''}">🤝 ${formatHandshakeCompact(handshake)}</span>`;
                     // awg show reports transfer from the SERVER perspective:
                     // "received" = client upload, "sent" = client download.
                     if (sent) metaHtml += `<span class="traffic-badge traffic-down">↓ ${sent}</span>`;
                     if (received) metaHtml += `<span class="traffic-badge traffic-up">↑ ${received}</span>`;
+                    const rates = computeRates(client.clientId, userData);
+                    if (rates) metaHtml += `<span class="traffic-badge speed-badge${rates.active ? ' speed-active' : ''}">↓${formatBytes(Math.round(rates.rx))}/s ↑${formatBytes(Math.round(rates.tx))}/s</span>`;
+                    if (isOnline) client._online = true;
                 }
 
                 if (!enabled) metaHtml += `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`;
 
                 const disabledStyle = enabled ? '' : 'opacity:0.5;';
-                const toggleIcon = enabled ? '🔵' : '⚫';
-                const toggleTitle = enabled ? _('stop') : _('starting');
+                // 💡 is used for both states; the "off" look lives in CSS (.peer-toggle-off)
+                const toggleClass = enabled ? 'peer-toggle' : 'peer-toggle peer-toggle-off';
+                const toggleTitle = enabled ? _('stop_peer_title') : _('start_peer_title');
                 // Show config button for all WireGuard-based clients.
                 // If clientPrivateKey is missing (created via native app), we show a warning instead.
                 const canShowConfig = proto === 'xray' || true; // always show 📄 button
 
                 listEl.innerHTML += `
-                    <div class="client-item" style="${disabledStyle}">
+                    <div class="client-item" style="${disabledStyle}" data-maxspeed="${maxSpeed}" data-assigned-user="${client.assigned_user_id || ''}">
                         <div class="client-info">
                             <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
-                                <div class="client-name">${escapeHtml(name)}</div>
+                                <div class="client-name">${escapeHtml(name)}${ipHtml}</div>
                                 <div class="client-meta">${metaHtml || `<span class="text-muted">${_('no_data')}</span>`}</div>
+                                ${warningsHtml}
                             </div>
                         </div>
                         <div class="client-actions">
                             ${protoBase(proto) === 'aivpn' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="showProfile('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('profile')}">👁</button>` : ''}
-                            <button class="btn btn-secondary btn-sm btn-icon" onclick="startRenameConnection('${escapeJs(client.clientId)}', this)" title="${_('rename')}">✏️</button>
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="startRenameConnection('${escapeJs(client.clientId)}', this)" title="${_('rename')}">${ICON_PENCIL}</button>
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || protoBase(proto) === 'aivpn'})" title="${_('config')}">📄</button>
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="openTransferConnectionModal('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('transfer_connection')}">⇄</button>
-                            ${(proto === 'telemt' || protoBase(proto) === 'aivpn') ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">✏️</button>` : ''}
-                            <button class="btn btn-secondary btn-sm btn-icon" onclick="toggleConnection('${escapeJs(client.clientId)}', ${!enabled})" title="${toggleTitle}">${toggleIcon}</button>
-                            <button class="btn btn-danger btn-sm btn-icon" onclick="removeConnection('${escapeJs(client.clientId)}')" title="${_('delete')}">🗑</button>
+                            ${(proto === 'telemt' || protoBase(proto) === 'aivpn') ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">⚙️</button>` : ''}
+                            <button class="btn btn-secondary btn-sm btn-icon ${toggleClass}" onclick="toggleConnection('${escapeJs(client.clientId)}', ${!enabled}, this)" title="${toggleTitle}">💡</button>
+                            <button class="btn btn-danger btn-sm btn-icon" onclick="removeConnection('${escapeJs(client.clientId)}')" title="${_('delete')}">${ICON_TRASH}</button>
                         </div>
                     </div>
                 `;
@@ -2273,11 +3422,47 @@
             showToast(_('connections_load_error') + ': ' + err.message, 'error');
         } finally {
             window.connLoading = false;
+            highlightPeerFromQuery();
             // Auto-refresh every 5s while the connections section is visible (live speed/handshake)
             clearTimeout(window.connPollTimer);
             if (document.getElementById('connectionsSection').style.display !== 'none') {
                 window.connPollTimer = setTimeout(function() { loadConnections(true); }, 5000);
             }
+        }
+    }
+
+    // Deep link from the users page: /server/N?protocol=awg2&highlight=<client_id>
+    // switches to the right instance, frames the peer's card and scrolls it
+    // into the middle of the viewport. The id is kept in a var so the 5s poll
+    // re-applies the frame after every re-render; URL params are cleaned so a
+    // refresh doesn't scroll again.
+    let highlightedPeerId = null;
+
+    function applyPeerHighlight(scroll) {
+        if (!highlightedPeerId) return;
+        const btn = document.querySelector(`[onclick*="${CSS.escape(highlightedPeerId)}"]`);
+        const row = btn && btn.closest('.client-item');
+        if (!row) return;
+        row.classList.add('peer-highlight');
+        if (scroll) row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+
+    function highlightPeerFromQuery() {
+        const params = new URLSearchParams(location.search);
+        const proto = params.get('protocol');
+        const target = params.get('highlight');
+        if (!proto && !target) { applyPeerHighlight(false); return; }
+        const select = document.getElementById('connProtoSelect');
+        if (proto && select.value !== proto
+                && [...select.options].some(o => o.value === proto)) {
+            select.value = proto;
+            loadConnections();
+            return;
+        }
+        if (target) {
+            highlightedPeerId = target;
+            history.replaceState(null, '', location.pathname);
+            applyPeerHighlight(true);
         }
     }
 
@@ -2333,7 +3518,7 @@
                     document.querySelectorAll('.config-tab')[1].style.display = ((proto === 'telemt' || protoBase(proto) === 'aivpn') ? 'none' : '');
                     switchConfigTab('conf');
                     openModal('configModal');
-                    generateQR(result.config);
+                    generateQR(result.config, result.vpn_qr_chunks);
                 }
             }
             loadConnections();
@@ -2496,31 +3681,116 @@
         }
     }
 
+    // Clear connection-flood (torrent) warnings history for a peer
+    async function clearConnWarnings(clientId) {
+        const proto = document.getElementById('connProtoSelect').value;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/connections/clear_warnings`, 'POST', {
+                protocol: proto, client_id: clientId,
+            });
+            showToast(_('warnings_cleared'), 'success');
+            loadConnections();
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
     function startRenameConnection(clientId, btn) {
         const item = btn.closest('.client-item');
         const nameEl = item.querySelector('.client-name');
-        const oldName = nameEl.textContent;
+        const origHtml = nameEl.innerHTML;
+        // .client-name also contains the .client-ip span; edit the name only
+        const clone = nameEl.cloneNode(true);
+        clone.querySelectorAll('.client-ip').forEach(el => el.remove());
+        const oldName = clone.textContent.trim();
+        const proto = document.getElementById('connProtoSelect').value;
+        const isAwg = proto.startsWith('awg') || protoBase(proto) === 'wireguard';
+        const curSpeed = item.dataset.maxspeed || '0';
+        const currentAssigned = item.dataset.assignedUser || '';
         nameEl.innerHTML = `
-            <span class="rename-editor" style="display:inline-flex;gap:4px;align-items:center;">
-                <input type="text" class="form-input" style="padding:2px 8px;font-size:0.85rem;width:160px;height:auto;" value="${escapeHtml(oldName)}">
+            <span class="rename-editor" style="display:inline-flex;gap:12px;align-items:flex-end;flex-wrap:wrap;width:100%;">
+                <label style="display:flex;flex-direction:column;gap:2px;font-size:0.7rem;opacity:.7;flex:1;min-width:140px;">
+                    ${_('name')}
+                    <input type="text" class="form-input" style="padding:2px 8px;font-size:0.85rem;width:100%;height:auto;" value="${escapeHtml(oldName)}">
+                </label>
+                ${isAwg ? `<label style="display:flex;flex-direction:column;gap:2px;font-size:0.7rem;opacity:.7;flex:1;min-width:140px;">
+                    ${_('speed_limit_unlim')}
+                    <input type="number" class="form-input rename-speed" min="0" step="0.1" style="padding:2px 8px;font-size:0.85rem;width:100%;height:auto;" value="${curSpeed}" placeholder="∞">
+                </label>` : ''}
+                <label style="display:flex;flex-direction:column;gap:2px;font-size:0.7rem;opacity:.7;flex:1;min-width:140px;">
+                    ${_('assign_user')}
+                    <select class="form-select rename-user" style="padding:2px 8px;font-size:0.85rem;width:100%;height:auto;">
+                        <option value="">${_('loading')}</option>
+                    </select>
+                </label>
                 <button class="btn btn-secondary btn-sm btn-icon" title="${_('save')}">✔</button>
                 <button class="btn btn-secondary btn-sm btn-icon rename-cancel" title="${_('cancel')}">✖</button>
             </span>
         `;
         const input = nameEl.querySelector('input');
+        const speedInput = nameEl.querySelector('.rename-speed');
+        const userSelect = nameEl.querySelector('.rename-user');
         const saveBtn = nameEl.querySelector('button:not(.rename-cancel)');
         const cancelBtn = nameEl.querySelector('.rename-cancel');
-        saveBtn.addEventListener('click', () => saveRenameConnection(clientId, input.value));
-        cancelBtn.addEventListener('click', () => loadConnections());
+        // Fill the user list once; the 5s poll already skips open editors, so
+        // the selection survives until Save/Cancel.
+        (async () => {
+            try {
+                const ud = await apiCall('/api/users?size=1000');
+                if (!userSelect.isConnected) return;
+                const users = (ud.users || []).slice().sort((a, b) => {
+                    const an = a.role === 'none' ? 0 : 1, bn = b.role === 'none' ? 0 : 1;
+                    return an - bn || String(a.username).localeCompare(String(b.username));
+                });
+                // "No link" first and selected by default: opening the editor
+                // must never force a user assignment on save.
+                userSelect.innerHTML = `<option value="">${_('no_user_option')}</option>` + users.map(u =>
+                    `<option value="${u.id}" ${u.id === currentAssigned ? 'selected' : ''}>${escapeHtml(u.username)} (${u.role === 'none' ? _('role_none_badge') : u.role})</option>`
+                ).join('');
+                if (currentAssigned) userSelect.value = currentAssigned;
+            } catch (e) {
+                if (userSelect.isConnected) userSelect.innerHTML = `<option value="">${_('error')}</option>`;
+            }
+        })();
+        const doSave = async () => {
+            // Immediate busy feedback so a second click is impossible and the
+            // user sees the save is in flight (rename + tc apply takes 2-4s).
+            saveBtn.disabled = true;
+            cancelBtn.disabled = true;
+            input.disabled = true;
+            if (speedInput) speedInput.disabled = true;
+            if (userSelect) userSelect.disabled = true;
+            saveBtn.innerHTML = '<span class="spinner" style="display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,0.25);border-top-color:#1c1c30;border-radius:50%;animation:spin 0.6s linear infinite;"></span>';
+            await saveRenameConnection(clientId, input.value, speedInput ? (parseFloat(speedInput.value) || 0) : -1,
+                userSelect ? userSelect.value : undefined, currentAssigned);
+            // On success loadConnections() rerenders the list and wipes this
+            // editor; restore only when it is still in the DOM (error path).
+            if (saveBtn.isConnected) {
+                saveBtn.disabled = false;
+                cancelBtn.disabled = false;
+                input.disabled = false;
+                if (speedInput) speedInput.disabled = false;
+                if (userSelect) userSelect.disabled = false;
+                saveBtn.innerHTML = '✔';
+            }
+        };
+        // Cancel closes the editor locally, without reloading the whole panel.
+        const cancelEdit = () => { nameEl.innerHTML = origHtml; };
+        saveBtn.addEventListener('click', doSave);
+        cancelBtn.addEventListener('click', cancelEdit);
         input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') saveRenameConnection(clientId, input.value);
-            if (e.key === 'Escape') loadConnections();
+            if (e.key === 'Enter') doSave();
+            if (e.key === 'Escape') cancelEdit();
+        });
+        if (speedInput) speedInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') doSave();
+            if (e.key === 'Escape') cancelEdit();
         });
         input.focus();
         input.select();
     }
 
-    async function saveRenameConnection(clientId, rawName) {
+    async function saveRenameConnection(clientId, rawName, maxSpeed = -1, newUserId, currentAssigned) {
         const proto = document.getElementById('connProtoSelect').value;
         const newName = (rawName || '').trim();
         if (!newName) {
@@ -2529,16 +3799,40 @@
         }
         try {
             const result = await apiCall(`/api/servers/${SERVER_ID}/connections/rename`, 'POST', {
-                protocol: proto, client_id: clientId, new_name: newName,
+                protocol: proto, client_id: clientId, new_name: newName, max_speed: maxSpeed,
             });
-            showToast(_('connection_renamed'), 'success');
+            const toast = result.speed_warning
+                ? [ _('error') + ': ' + result.speed_warning, 'error' ]
+                : [ _('connection_renamed'), 'success' ];
+            // User (re)link: only when the selection actually changed.
+            if (newUserId !== undefined && newUserId !== (currentAssigned || '')) {
+                try {
+                    if (currentAssigned) {
+                        await apiCall(`/api/users/${currentAssigned}/connections/unlink`, 'POST', {
+                            server_id: SERVER_ID, protocol: proto, client_id: clientId,
+                        });
+                    }
+                    if (newUserId) {
+                        await apiCall(`/api/users/${newUserId}/connections/add`, 'POST', {
+                            server_id: SERVER_ID, protocol: proto, client_id: clientId, name: newName,
+                        });
+                        showToast(_('conn_linked'), 'success');
+                    } else {
+                        showToast(_('conn_unlinked'), 'success');
+                    }
+                } catch (linkErr) {
+                    showToast(_('error') + ': ' + linkErr.message, 'error');
+                }
+            }
+            // Refresh only after completing any user-link change.
             // If the config modal is open for this connection, retitle it too.
             if (currentConfigClientId === clientId &&
                 document.getElementById('configModal').classList.contains('active')) {
                 document.getElementById('configModalTitle').textContent = `${_('config')} — ${result.name}`;
                 currentConfigName = result.name.replace(/\s+/g, '_');
             }
-            loadConnections();
+            await loadConnections(true, true); // silent refresh, no overlay
+            showToast(toast[0], toast[1]);
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
         }
@@ -2558,7 +3852,7 @@
             currentConfig = text;
             currentVpnLink = result.vpn_link || '';
             document.getElementById('vpnLinkText').textContent = currentVpnLink;
-            generateQR(text);
+            generateQR(text, result.vpn_qr_chunks);
             showToast(_('config_saved'), 'success');
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
@@ -2610,7 +3904,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr_chunks);
             }
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
@@ -2732,18 +4026,56 @@
         }
     }
 
-    async function toggleConnection(clientId, enable) {
+    async function toggleConnection(clientId, enable, btn) {
         const proto = document.getElementById('connProtoSelect').value;
         const action = enable ? _('enable_connection_progress') : _('disable_connection_progress');
+        // Lock the whole client row and swap the bulb for a spinner until done
+        const row = btn ? btn.closest('.client-item') : null;
+        let originalContent = null;
+        if (row) {
+            row.classList.add('client-toggling');
+            row.querySelectorAll('button').forEach(b => b.disabled = true);
+        }
+        if (btn) {
+            originalContent = btn.innerHTML;
+            btn.innerHTML = '<span class="spinner"></span>';
+        }
+        const restore = () => {
+            if (row) {
+                row.classList.remove('client-toggling');
+                row.querySelectorAll('button').forEach(b => b.disabled = false);
+            }
+            if (btn && originalContent !== null) btn.innerHTML = originalContent;
+        };
         try {
             showToast(action, 'info');
             await apiCall(`/api/servers/${SERVER_ID}/connections/toggle`, 'POST', {
                 protocol: proto, client_id: clientId, enable: enable,
             });
             showToast(enable ? _('connection_enabled') : _('connection_disabled'), 'success');
-            loadConnections();
+            // Update just this row in place — no full list reload. The 5s
+            // poll reconciles speeds/badges anyway.
+            if (row && btn) {
+                row.style.opacity = enable ? '' : '0.5';
+                btn.classList.toggle('peer-toggle-off', !enable);
+                btn.title = enable ? _('stop') : _('starting');
+                btn.setAttribute('onclick', `toggleConnection('${escapeJs(clientId)}', ${!enable}, this)`);
+                const meta = row.querySelector('.client-meta');
+                if (meta) {
+                    const offBadge = meta.querySelector('.badge-danger');
+                    if (!enable && !offBadge) {
+                        meta.insertAdjacentHTML('afterbegin', `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`);
+                    } else if (enable && offBadge) {
+                        offBadge.remove();
+                    }
+                }
+            }
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            // Also on success: if loadConnections() fails the row it was
+            // supposed to rebuild would stay disabled with a spinning bulb.
+            restore();
         }
     }
 
@@ -2756,20 +4088,89 @@
         const tabIdx = { conf: 0, vpn: 1, qr: 2 };
         tabs[tabIdx[tab]].classList.add('active');
         document.getElementById(panels[tab]).classList.add('active');
+        // the frame series only animates while its panel is on screen
+        if (tab === 'qr') { renderQR(); } else { stopQrAnimation(); }
     }
 
-    function generateQR(text) {
+    // The QR shows one of two payloads: Amnezia's own config format, split into
+    // the frame series ImportController::parseQrCodeChunk reassembles, or the
+    // raw config, which is all AmneziaWG and wg-quick understand. The series
+    // exists because a whole config in one code lands at QR version 21-26,
+    // while the Android scanner reads 640x480 camera frames and cannot decode
+    // anything that dense. Every frame below stays under 55x55 modules.
+    const QR_FRAME_MS = 800;
+
+    let currentQrConfig = '';
+    let currentQrChunks = [];
+    let currentQrFormat = 'amnezia';
+    let qrFrame = 0;
+    let qrTimer = null;
+
+    function setQrFormat(format) {
+        currentQrFormat = format;
+        qrFrame = 0;
+        renderQR();
+    }
+
+    function generateQR(text, chunks) {
+        currentQrConfig = text || '';
+        currentQrChunks = chunks || [];
+        qrFrame = 0;
+        renderQR();
+    }
+
+    function stopQrAnimation() {
+        if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+    }
+
+    function drawQr(text, size) {
         const container = document.getElementById('qrCode');
+        if (!container) return;
         container.innerHTML = '';
         try {
             new QRCode(container, {
-                text: text, width: 280, height: 280,
+                text: text, width: size, height: size,
                 colorDark: '#000000', colorLight: '#ffffff',
                 correctLevel: QRCode.CorrectLevel.L
             });
         } catch (e) {
-            console.error('QR lib error:', e);
             container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
+        }
+    }
+
+    function renderQR() {
+        stopQrAnimation();
+        const named = currentQrFormat === 'amnezia' && currentQrChunks.length > 0;
+        const switcher = document.getElementById('qrFormat');
+        if (switcher) {
+            switcher.classList.toggle('hidden', currentQrChunks.length === 0);
+            switcher.querySelectorAll('.qr-format-btn').forEach(b =>
+                b.classList.toggle('active', b.dataset.fmt === (named ? 'amnezia' : 'wireguard')));
+        }
+        const hint = document.getElementById('qrFormatHint');
+        if (!named) {
+            if (hint) hint.textContent = _('qr_format_wireguard_hint');
+            drawQr(currentQrConfig, qrSize(document.getElementById('qrCode') || document.body, 280));
+            return;
+        }
+        const paint = () => {
+            drawQr(currentQrChunks[qrFrame], qrSize(document.getElementById('qrCode') || document.body, 300));
+            if (hint) {
+                hint.textContent = currentQrChunks.length > 1
+                    ? `${_('qr_format_amnezia_hint')} ${qrFrame + 1}/${currentQrChunks.length}`
+                    : _('qr_format_amnezia_hint');
+            }
+        };
+        paint();
+        if (currentQrChunks.length > 1) {
+            qrTimer = setInterval(() => {
+                // the modal was closed or another tab opened -- offsetParent is
+                // null once the panel is off screen, so stop burning a timer
+                const container = document.getElementById('qrCode');
+                if (!container || !container.offsetParent) { stopQrAnimation(); return; }
+                qrFrame = (qrFrame + 1) % currentQrChunks.length;
+                paint();
+            }, QR_FRAME_MS);
         }
     }
 

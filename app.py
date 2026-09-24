@@ -16,20 +16,24 @@ import subprocess
 import tarfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 import signal
 import calendar
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import struct
+import zlib
 import io
-from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse, FileResponse
+from fastapi.responses import (JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse,
+                               FileResponse, PlainTextResponse)
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi import FastAPI, Request, Query, UploadFile, File
+from fastapi import FastAPI, Request, Query, UploadFile, File, Form
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 import uvicorn
 import httpx
@@ -40,13 +44,24 @@ except ImportError:
     CaptchaGenerator = None
 
 from managers.ssh_manager import SSHManager
-from managers.awg_manager import AWGManager
+from managers.awg_manager import AWGManager, normalize_special_junk
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
 from managers.aivpn_manager import AIVPNManager
 from managers.backup_manager import BackupManager
 from storage import SQLiteStateStore, StorageError
 import telegram_bot as tg_bot
+
+from exit_link_service import ExitLinkError, ExitLinkService
+from pwa import build_manifest
+from connection_service import (
+    ConnectionService,
+    DEFAULT_SELF_SERVICE_SETTINGS,
+    RateLimitError,
+    SelfServiceError,
+    sanitize_allowed_protocols,
+    self_service_protocol_choices,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -60,7 +75,7 @@ OPENAPI_TAGS = [
     {"name": "System Templates", "description": "HTML pages served to browsers. These return Jinja-rendered templates rather than a JSON contract — they are not part of the public API and are listed here only for completeness."},
     {"name": "Authentication", "description": "Login, captcha, and session lifecycle."},
     {"name": "Servers", "description": "Server inventory, lifecycle and host-level operations (add, edit, delete, ping, reorder, reboot, clear, stats, status check)."},
-    {"name": "Protocols", "description": "Install, uninstall, container start/stop and raw config editing for the protocols/services on a server (AWG, Xray, WireGuard, Telemt, AmneziaDNS, AdGuard Home, SOCKS5)."},
+    {"name": "Protocols", "description": "Install, uninstall, container start/stop and raw config editing for the protocols/services on a server (AWG, Xray, WireGuard, Telemt, AIVPN, AmneziaDNS, AdGuard Home, SOCKS5, Exit node)."},
     {"name": "Connections", "description": "Per-protocol VPN client connections on a server: CRUD, enable/disable, config retrieval, and safe transfer between managed VPS running the same protocol."},
     {"name": "Users", "description": "Panel user accounts and the connections assigned to them."},
     {"name": "Self-service", "description": "Endpoints called by a regular user for their own data (the /my surface)."},
@@ -81,6 +96,22 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(Exception)
+async def api_json_error_handler(request: Request, exc: Exception):
+    """Answer /api/* with JSON even when a handler blew up.
+
+    Without this Starlette returns a plain-text "Internal Server Error", and
+    every caller that does `await res.json()` fails with a parse error that
+    says nothing about what went wrong ("JSON.parse: unexpected character at
+    line 1 column 1"). Pages keep the plain-text response - a browser showing
+    an error page is fine.
+    """
+    logger.exception(f"Unhandled error on {request.method} {request.url.path}")
+    if request.url.path.startswith('/api/'):
+        return JSONResponse({'error': 'Internal server error'}, status_code=500)
+    return PlainTextResponse('Internal Server Error', status_code=500)
+
+
 @app.get("/redoc", include_in_schema=False)
 async def custom_redoc():
     """Self-curated ReDoc page. Differs from FastAPI's default in two ways:
@@ -91,7 +122,7 @@ async def custom_redoc():
     response = get_redoc_html(
         openapi_url=(app.openapi_url or "/openapi.json") + "?v=storage-1",
         title=f"{app.title} — ReDoc",
-        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
+        redoc_js_url="/static/vendor/redoc/redoc.standalone.js",
         with_google_fonts=False,
     )
     response.headers['Cache-Control'] = 'no-store'
@@ -99,7 +130,25 @@ async def custom_redoc():
 app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
 
 # Mount static files & templates
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+class CachedStaticFiles(StaticFiles):
+    """Static assets that carry ?v=<static mtime> (see static_version()) change
+    their URL on every redeploy, so they can be cached for 180 days. Assets
+    referenced without that query - the favicon, the icons, qrcode.min.js,
+    searchable-select.js, the vendored CodeMirror and ReDoc bundles - keep the
+    same URL forever, so an immutable lifetime would freeze them in the
+    browser until it expires. Those get an hour and a revalidation instead."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            query = urllib.parse.parse_qsl(scope.get('query_string', b'').decode('latin-1'))
+            fingerprinted = any(key == 'v' for key, _value in query)
+            response.headers['Cache-Control'] = (
+                'public, max-age=15552000, immutable' if fingerprinted
+                else 'public, max-age=3600, must-revalidate')
+        return response
+
+app.mount("/static", CachedStaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
 if getattr(sys, 'frozen', False):
@@ -109,7 +158,10 @@ else:
 
 # DATA_FILE remains the legacy migration path. The live state lives in SQLite;
 # PANEL_DATA_FILE is retained so existing installations migrate automatically.
-DATA_FILE = os.environ.get('PANEL_DATA_FILE') or os.path.join(application_path, 'data.json')
+DATA_FILE = os.path.abspath(os.path.expanduser(
+    os.environ.get('PANEL_DATA_FILE') or os.environ.get('DATA_FILE')
+    or os.path.join(application_path, 'data.json')
+))
 DATABASE_FILE = os.environ.get('PANEL_DB_FILE') or os.path.join(application_path, 'data', 'panel.db')
 STATE_STORE = SQLiteStateStore(
     DATABASE_FILE,
@@ -117,7 +169,10 @@ STATE_STORE = SQLiteStateStore(
     master_key=os.environ.get('PANEL_MASTER_KEY', ''),
     require_encryption=os.environ.get('PANEL_REQUIRE_ENCRYPTION', '').lower() in {'1', 'true', 'yes'},
 )
-CURRENT_VERSION = "v1.6.0"
+CURRENT_VERSION = "v1.6.7"
+
+# Custom protocol instance names: the rename modal caps input at 64 chars.
+CUSTOM_PROTOCOL_NAME_MAX = 64
 BIN_DIR = os.environ.get('TUNNEL_BIN_DIR', os.path.join(application_path, 'bin'))
 TUNNEL_STATE_FILE = os.environ.get('TUNNEL_STATE_FILE', os.path.join(application_path, 'tunnels_state.json'))
 
@@ -193,6 +248,7 @@ def load_data():
         },
     })
     settings.setdefault('captcha', {'enabled': False})
+    settings.setdefault('exit_nodes', {'default_exit_uid': ''})
     settings.setdefault('telegram', {'token': '', 'enabled': False})
     settings.setdefault('ssl', {
         'enabled': False,
@@ -218,6 +274,11 @@ def load_data():
         'protocol_stopped_template': '⚠️ На сервере {{server_name}} остановлен протокол {{protocol}}.',
     })
     data.setdefault('alert_states', {})
+    self_service = data['settings'].setdefault('self_service', dict(DEFAULT_SELF_SERVICE_SETTINGS))
+    for key, value in DEFAULT_SELF_SERVICE_SETTINGS.items():
+        self_service.setdefault(key, value)
+    for server in data.get('servers', []):
+        server.setdefault('self_service_enabled', False)
     return data
 
 
@@ -231,14 +292,45 @@ async def save_data_async(data):
         await asyncio.to_thread(save_data, data)
 
 
+# Long-lived SSH connections, keyed by (host, port, username). Each command
+# becomes a cheap channel on an existing transport instead of a full TCP+SSH
+# handshake per API call — the main fix for UI timeouts on distant servers.
+_SSH_POOL = {}
+_SSH_POOL_LOCK = threading.Lock()
+
+
 def get_ssh(server):
-    return SSHManager(
-        host=server['host'],
-        port=server.get('ssh_port', 22),
-        username=server['username'],
-        password=server.get('password'),
-        private_key=server.get('private_key'),
-    )
+    key = (server['host'], int(server.get('ssh_port', 22)), server['username'])
+    cooldown_base = float(server.get('ssh_cooldown_base') or 30)
+    with _SSH_POOL_LOCK:
+        ssh = _SSH_POOL.get(key)
+        if ssh is None:
+            ssh = SSHManager(
+                host=server['host'],
+                port=server.get('ssh_port', 22),
+                username=server['username'],
+                password=server.get('password'),
+                private_key=server.get('private_key'),
+                connect_cooldown_base=cooldown_base,
+            )
+            _SSH_POOL[key] = ssh
+        # Apply edits without dropping the pooled connection.
+        ssh._connect_cooldown_base = cooldown_base
+        ssh.pooled = True
+    ssh.ensure_connected()
+    return ssh
+
+
+def drop_ssh(server):
+    """Remove a server's pooled connection (on edit/delete) and close it."""
+    key = (server['host'], int(server.get('ssh_port', 22)), server['username'])
+    with _SSH_POOL_LOCK:
+        ssh = _SSH_POOL.pop(key, None)
+    if ssh is not None:
+        try:
+            ssh.force_disconnect()
+        except Exception:
+            pass
 
 
 def get_panel_local_url(request: Optional[Request] = None):
@@ -893,8 +985,41 @@ async def wait_for_tunnel_url(provider: str, seconds: int = 20):
     return get_tunnel_status(provider)
 
 
-BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn']
+BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn', 'exit']
 MULTI_INSTANCE_PROTOCOLS = {'awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'}
+
+
+def backfill_server_uids(servers) -> bool:
+    """Give every server record without a stable `uid` one; return True when
+    something changed. Only write paths call this (startup migration,
+    add-server, backup restore): minting ids inside load_data() would let two
+    concurrent readers hand out different uids for the same record."""
+    changed = False
+    for server in servers or []:
+        if not server.get('uid'):
+            server['uid'] = uuid.uuid4().hex
+            changed = True
+    return changed
+
+
+def should_link_default_exit(default_uid, server_uid, is_awg, reinstall, previous_link):
+    """Whether a just-installed instance should join the default exit node:
+    only a newly added AWG instance on another server, and only when nothing
+    (a link of its own, or an earlier deliberate unlink) already speaks for it."""
+    return bool(default_uid) and is_awg and not reinstall and not previous_link \
+        and default_uid != server_uid
+
+
+def find_server_by_uid(data, uid):
+    """Return (index, server) for a stable server uid, or (None, None) when the
+    uid is empty or unknown. Index-based server_id values shift on reorder and
+    delete, so cross-server references must resolve through this instead."""
+    if not uid:
+        return None, None
+    for idx, server in enumerate(data.get('servers', []) or []):
+        if server.get('uid') == uid:
+            return idx, server
+    return None, None
 
 
 def protocol_base(protocol: str) -> str:
@@ -941,6 +1066,7 @@ def protocol_display_name(protocol: str) -> str:
         'adguard': 'AdGuard Home',
         'nginx': 'NGINX',
         'aivpn': 'AIVPN',
+        'exit': 'Exit Node',
     }
     name = names.get(base, base)
     return name if idx <= 1 else f'{name} #{idx}'
@@ -962,6 +1088,7 @@ def protocol_container_name(protocol: str) -> Optional[str]:
         'adguard': 'amnezia-adguard',
         'nginx': 'amnezia-nginx',
         'aivpn': 'amnezia-aivpn',
+        'exit': 'amnezia-exit',
     }
     name = base_names.get(base)
     if not name:
@@ -996,6 +1123,12 @@ def get_protocol_manager(ssh, protocol: str):
     elif base == 'nginx':
         from managers.nginx_manager import NginxManager
         return NginxManager(ssh, protocol)
+    elif base == 'aivpn':
+        from managers.aivpn_manager import AIVPNManager
+        return AIVPNManager(ssh, protocol)
+    elif base == 'exit':
+        from managers.exit_manager import ExitManager
+        return ExitManager(ssh, protocol)
     elif base == 'aivpn':
         from managers.aivpn_manager import AIVPNManager
         return AIVPNManager(ssh, protocol)
@@ -1085,9 +1218,419 @@ def normalize_rfc3339(value: Optional[str]) -> Optional[str]:
     return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
-def generate_vpn_link(config_text):
-    b64 = base64.b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
-    return f"vpn://{b64}"
+AWG_PROTOCOLS = ('awg', 'awg2', 'awg3', 'awg_legacy')
+
+
+def join_dns(dns1, dns2):
+    """Join the two DNS fields into the `a, b` form used in configs."""
+    parts = [str(value).strip() for value in (dns1, dns2) if value and str(value).strip()]
+    return ', '.join(parts) or None
+
+
+def split_dns(dns):
+    """Split a stored `a, b` DNS string back into two form fields."""
+    parts = [part.strip() for part in str(dns or '').split(',') if part.strip()]
+    parts += [''] * (2 - len(parts))
+    return parts[0], parts[1]
+
+
+def awg_special_junk_from(req):
+    """Collect I1-I5 from a request, or None when the form sent none of them."""
+    values = {key: getattr(req, f'awg_{key}', None) for key in ('i1', 'i2', 'i3', 'i4', 'i5')}
+    if all(value is None for value in values.values()):
+        return None
+    return values
+
+
+# Keys the desktop client treats as AmneziaWG-specific -- configKey::awgProtocolKeys()
+# in client/core/utils/constants/configKeys.h. One of them in a config is what makes
+# the client pick the awg container over the plain wireguard one.
+AWG_CONFIG_KEYS = (
+    'Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'S3', 'S4', 'H1', 'H2', 'H3', 'H4',
+    'I1', 'I2', 'I3', 'I4', 'I5',
+    'HeaderProtectionKey', 'ContentPaddingAddition', 'RekeyAfterTime', 'RekeyTimeout',
+    'RejectAfterTime', 'KeepaliveTimeout', 'MaxHandshakeAttempts', 'RandomTrailers',
+    'DisableCookies',
+)
+
+
+def protocol_short_name(protocol: str) -> str:
+    """Short protocol tag for the server name, e.g. `AWG3`."""
+    base = protocol_base(protocol)
+    idx = protocol_instance(protocol)
+    names = {
+        'awg': 'AWG',
+        'awg2': 'AWG2',
+        'awg3': 'AWG3',
+        'awg_legacy': 'AWG-Legacy',
+        'wireguard': 'WG',
+        'xray': 'Xray',
+        'telemt': 'Telemt',
+        'socks5': 'SOCKS5',
+        'dns': 'DNS',
+        'adguard': 'AdGuard',
+        'nginx': 'NGINX',
+        'exit': 'Exit',
+    }
+    name = names.get(base, base.upper())
+    return name if idx <= 1 else f'{name}#{idx}'
+
+
+def connection_display_name(server=None, protocol=None) -> str:
+    """`<node> <container>`, e.g. `nl-01 AWG3` -- the name the client will show."""
+    node = str((server or {}).get('name') or (server or {}).get('host') or '').strip()
+    tag = protocol_short_name(protocol) if protocol else ''
+    return ' '.join(part for part in (node, tag) if part)
+
+
+def parse_wg_config(config_text):
+    """Read a WireGuard/AmneziaWG config the way the client's importer does:
+    section headers ignored, every `key = value` line collected into one map."""
+    values = {}
+    for line in str(config_text or '').split('\n'):
+        line = line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            continue
+        sep = line.find('=')
+        if sep > 0:
+            values[line[:sep].strip()] = line[sep + 1:].strip()
+    return values
+
+
+# amnezia-awg only knows one link shape from this panel, and only that shape
+# can carry a name in its fragment.
+NAMED_LINK_SCHEMES = ('vless://',)
+
+# serialization::inbounds::GenerateInboundEntry(): the local SOCKS listener the
+# client patches with a free port and credentials when it connects.
+XRAY_INBOUND = {
+    'listen': '127.0.0.1',
+    'port': 10808,
+    'protocol': 'socks',
+    'settings': {'udp': True},
+}
+
+
+def apply_link_name(config_text, name):
+    """Put the connection's display name in a vless link's fragment.
+
+    AmneziaVPN reads that fragment as the server name (vless::Deserialize hands
+    it to extractXrayConfig as the description), so the panel's per-connection
+    label used to end up as the server's name in the client.
+    """
+    text = str(config_text or '').strip()
+    if not name or not text.startswith(NAMED_LINK_SCHEMES):
+        return config_text
+    return f"{text.split('#', 1)[0]}#{urllib.parse.quote(name)}"
+
+
+def build_xray_client_config(link):
+    """Turn a vless link into the xray client config the desktop client builds.
+
+    A port of serialization::vless::Deserialize -- the client only reaches that
+    code path for a bare `vless://` string, so anything wrapped (a `vpn://` key,
+    a QR code) has to arrive already deserialised.
+    """
+    if not str(link or '').strip().startswith('vless://'):
+        return None
+    parts = urllib.parse.urlsplit(link.strip())
+    host = (parts.hostname or '').strip('[]')
+    uuid_value = urllib.parse.unquote(parts.netloc.rpartition('@')[0])
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if not host or not port or not uuid_value:
+        return None
+
+    query = {}
+    for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        query.setdefault(key, value)
+
+    user = {'id': uuid_value, 'encryption': query.get('encryption', 'none')}
+    stream = {}
+
+    network = query.get('type', 'tcp')
+    if network != 'tcp':
+        stream['network'] = network
+    if network == 'kcp':
+        if query.get('seed'):
+            stream.setdefault('kcpSettings', {})['seed'] = query['seed']
+        if query.get('headerType', 'none') != 'none':
+            stream.setdefault('kcpSettings', {}).setdefault('header', {})['type'] = query['headerType']
+    elif network == 'http':
+        if query.get('path', '/') != '/':
+            stream.setdefault('httpSettings', {})['path'] = query['path']
+        if 'host' in query:
+            stream.setdefault('httpSettings', {})['host'] = query['host'].split(',')
+    elif network == 'ws':
+        if query.get('path', '/') != '/':
+            stream.setdefault('wsSettings', {})['path'] = query['path']
+        if 'host' in query:
+            stream.setdefault('wsSettings', {}).setdefault('headers', {})['Host'] = query['host']
+    elif network == 'quic':
+        if 'quicSecurity' in query:
+            quic = stream.setdefault('quicSettings', {})
+            quic['security'] = query['quicSecurity']
+            if query['quicSecurity'] != 'none':
+                quic['key'] = query.get('key', '')
+            if query.get('headerType', 'none') != 'none':
+                quic.setdefault('header', {})['type'] = query['headerType']
+    elif network == 'grpc':
+        if 'serviceName' in query:
+            stream.setdefault('grpcSettings', {})['serviceName'] = query['serviceName']
+        if 'mode' in query:
+            stream.setdefault('grpcSettings', {})['multiMode'] = query['mode'] == 'multi'
+
+    security = query.get('security', 'none')
+    tls_key = 'xtlsSettings' if security == 'xtls' else ('tlsSettings' if security == 'tls' else 'realitySettings')
+    if security != 'none':
+        stream['security'] = security
+    if 'sni' in query:
+        stream.setdefault(tls_key, {})['serverName'] = query['sni']
+    if 'alpn' in query:
+        # xray does not speak h2 here, and the client drops it
+        alpn = [item for item in query['alpn'].split(',') if item and item != 'h2']
+        if alpn:
+            stream.setdefault(tls_key, {})['alpn'] = alpn
+    if security in ('xtls', 'reality'):
+        user['flow'] = query.get('flow', '')
+    if security == 'reality':
+        reality = stream.setdefault('realitySettings', {})
+        for param, field in (('fp', 'fingerprint'), ('pbk', 'publicKey'), ('sid', 'shortId')):
+            if param in query:
+                reality[field] = query[param]
+        # the client only reads the long spelling, the panel emits the short one
+        spider = query.get('spiderX') or query.get('spx')
+        if spider:
+            reality['spiderX'] = spider
+
+    outbound = {
+        'protocol': 'vless',
+        'settings': {'vnext': [{'address': host, 'port': port, 'users': [user]}]},
+        'streamSettings': stream,
+    }
+    return {'inbounds': [dict(XRAY_INBOUND)], 'outbounds': [outbound]}
+
+
+def build_amnezia_xray_config(config_text, description):
+    """Wrap a vless link the way ImportController::extractXrayConfig would."""
+    client_config = build_xray_client_config(config_text)
+    if not client_config:
+        return None
+    serialized = json.dumps(client_config, indent=4, sort_keys=True) + '\n'
+    return {
+        'containers': [{
+            'container': 'amnezia-xray',
+            'xray': {'last_config': serialized, 'isThirdPartyConfig': True},
+        }],
+        'defaultContainer': 'amnezia-xray',
+        'description': description,
+        'hostName': client_config['outbounds'][0]['settings']['vnext'][0]['address'],
+    }
+
+
+def build_amnezia_config(config_text, description):
+    """Wrap a WireGuard/AmneziaWG config into Amnezia's own server config format.
+
+    A plain `.conf` cannot carry a name: extractWireGuardConfig() overwrites
+    description with nextAvailableServerName(), which is why every imported key
+    lands as "Server 1". This JSON goes down the ConfigTypes::Amnezia branch
+    instead, which keeps whatever description it is given. Field for field it is
+    what the client itself builds from the same config.
+    """
+    if str(config_text or '').strip().startswith(NAMED_LINK_SCHEMES):
+        return build_amnezia_xray_config(config_text, description)
+    values = parse_wg_config(config_text)
+    host, _, port = values.get('Endpoint', '').rpartition(':')
+    host = host.strip('[]')
+    if not host or not port.isdigit():
+        return None
+    if not (values.get('PrivateKey') and values.get('Address') and values.get('PublicKey')):
+        return None
+
+    last_config = {
+        'config': str(config_text),
+        'hostName': host,
+        'port': int(port),
+        'client_priv_key': values['PrivateKey'],
+        'client_ip': values['Address'],
+        'server_pub_key': values['PublicKey'],
+    }
+    psk = values.get('PresharedKey') or values.get('PreSharedKey')
+    if psk:
+        last_config['psk_key'] = psk
+    if values.get('PersistentKeepalive'):
+        last_config['persistent_keep_alive'] = values['PersistentKeepalive']
+    last_config['allowed_ips'] = [
+        part.strip() for part in values.get('AllowedIPs', '').split(',') if part.strip()
+    ]
+
+    protocol_name = 'wireguard'
+    for key in AWG_CONFIG_KEYS:
+        if values.get(key):
+            last_config[key] = values[key]
+            protocol_name = 'awg'
+    # processAmneziaConfig() replaces this with the client's own default on
+    # import, so a custom MTU only survives in the raw config below.
+    last_config['mtu'] = values.get('MTU') or ('1376' if protocol_name == 'awg' else '1420')
+
+    container = 'amnezia-awg' if protocol_name == 'awg' else 'amnezia-wireguard'
+    config = {
+        'containers': [{
+            'container': container,
+            protocol_name: {
+                'last_config': json.dumps(last_config, indent=4) + '\n',
+                'isThirdPartyConfig': True,
+                'port': str(port),
+                'transport_proto': 'udp',
+            },
+        }],
+        'defaultContainer': container,
+        'description': description,
+        'hostName': host,
+    }
+    dns = [part.strip() for part in values.get('DNS', '').split(',') if part.strip()]
+    if len(dns) >= 2:
+        config['dns1'], config['dns2'] = dns[0], dns[1]
+    return config
+
+
+def amnezia_config_bytes(config_text, description):
+    """qCompress(json) -- what an Amnezia `vpn://` key and QR series both carry.
+
+    qCompress prepends the uncompressed size as a big-endian uint32 and
+    qUncompress refuses anything without it. Empty when the config is not a
+    WireGuard/AmneziaWG one, so callers fall back to the plain key.
+    """
+    if not description:
+        return b''
+    config = build_amnezia_config(config_text, description)
+    if not config:
+        return b''
+    raw = json.dumps(config, indent=4).encode('utf-8')
+    return struct.pack('>I', len(raw)) + zlib.compress(raw, 8)
+
+
+def amnezia_vpn_key(config_text, description):
+    """The payload half of an Amnezia `vpn://` key."""
+    payload = amnezia_config_bytes(config_text, description)
+    if not payload:
+        return ''
+    return base64.urlsafe_b64encode(payload).decode('utf-8').rstrip('=')
+
+
+# ImportController::parseQrCodeChunk reassembles a scanned config from a series
+# of framed chunks: a QDataStream carrying qint16 magic, quint8 total, quint8
+# index and the payload slice as a QByteArray (quint32 length + bytes), the
+# whole frame base64url'd into one QR code.
+QR_MAGIC = 1984
+
+# The Android scanner (CameraActivity.kt) builds `ImageAnalysis.Builder().build()`
+# with no ResolutionSelector, so CameraX hands ML Kit 640x480 frames -- which is
+# why a whole config in one code never scanned: it lands at version 19 raw or 26
+# wrapped, around 2-3 px per module in such a frame. 144 bytes keeps every frame
+# at version 8-9, under 55x55 modules, which survived a simulated VGA capture
+# down to a QR filling only 40% of the frame height.
+QR_CHUNK_SIZE = 144
+
+# quint8 chunk counter on the reading side.
+QR_MAX_CHUNKS = 255
+
+
+def amnezia_qr_chunks(config_text, description):
+    """Split the config into QR frames the client can reassemble."""
+    payload = amnezia_config_bytes(config_text, description)
+    if not payload:
+        return []
+    total = (len(payload) + QR_CHUNK_SIZE - 1) // QR_CHUNK_SIZE
+    if total > QR_MAX_CHUNKS:
+        return []
+    # spread the bytes evenly rather than leaving a stub last frame
+    size = (len(payload) + total - 1) // total
+    chunks = []
+    for index in range(total):
+        part = payload[index * size:(index + 1) * size]
+        frame = struct.pack('>hBBI', QR_MAGIC, total, index, len(part)) + part
+        chunks.append(base64.urlsafe_b64encode(frame).decode('utf-8').rstrip('='))
+    return chunks
+
+
+def generate_vpn_link(config_text, server=None, protocol=None):
+    """Encode a config as a vpn:// key.
+
+    Amnezia decodes with QByteArray::Base64UrlEncoding|OmitTrailingEquals,
+    and Qt silently *skips* characters outside that alphabet instead of
+    failing. Standard base64 therefore corrupts the payload as soon as it
+    emits '+' or '/' -- which a config containing '>' or '?' does, the
+    default I1 packet among them.
+    """
+    key = amnezia_vpn_key(config_text, connection_display_name(server, protocol))
+    if key:
+        return f"vpn://{key}"
+    b64 = base64.urlsafe_b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
+    return f"vpn://{b64.rstrip('=')}"
+
+
+def config_payloads(config_text, server=None, protocol=None):
+    """What every config view needs: the config, the key, the QR frames, the name.
+
+    The frames carry no `vpn://` prefix -- extractConfigFromQr() hands the
+    scanned text straight to QByteArray::fromBase64, which drops ':' and '/'
+    but keeps 'v', 'p' and 'n', shifting the whole payload by three characters.
+    The list is empty when the config is not a WireGuard/AmneziaWG one; the QR
+    then stays on the raw config, which is all such clients understand anyway.
+    """
+    name = connection_display_name(server, protocol)
+    if not str(config_text or '').strip():
+        return {'config': config_text, 'vpn_link': '', 'vpn_qr_chunks': [], 'vpn_name': name}
+    config_text = apply_link_name(config_text, name)
+    key = amnezia_vpn_key(config_text, name)
+    return {
+        'config': config_text,
+        'vpn_link': f"vpn://{key}" if key else generate_vpn_link(config_text),
+        'vpn_qr_chunks': amnezia_qr_chunks(config_text, name),
+        'vpn_name': name,
+    }
+
+
+self_service_connections = ConnectionService(
+    load_data=load_data,
+    save_data=save_data,
+    data_lock=DATA_LOCK,
+    get_ssh=get_ssh,
+    get_protocol_manager=get_protocol_manager,
+    manager_call=_manager_call,
+    generate_vpn_link=generate_vpn_link,
+)
+
+
+def _exit_manager_factory(ssh):
+    from managers.exit_manager import ExitManager
+    return ExitManager(ssh)
+
+
+exit_link_svc = ExitLinkService(
+    load_data=load_data,
+    save_data=save_data,
+    data_lock=DATA_LOCK,
+    get_ssh=get_ssh,
+    awg_manager_factory=lambda ssh: AWGManager(ssh),
+    exit_manager_factory=_exit_manager_factory,
+    protocol_base=protocol_base,
+    awg_protocols=AWG_PROTOCOLS,
+    protocol_display_name=protocol_display_name,
+    find_server_by_uid=find_server_by_uid,
+)
+
+
+def _self_service_error_response(exc):
+    if isinstance(exc, RateLimitError):
+        return JSONResponse({'error': str(exc)}, status_code=429)
+    if isinstance(exc, SelfServiceError):
+        return JSONResponse({'error': str(exc)}, status_code=exc.status_code)
+    logger.exception("Unexpected self-service error")
+    return JSONResponse({'error': 'Internal server error'}, status_code=500)
 
 
 def _invite_hash(token: str) -> str:
@@ -1204,7 +1747,7 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-async def perform_delete_user(data: dict, user_id: str):
+def perform_delete_user(data: dict, user_id: str):
     user = next((u for u in data['users'] if u['id'] == user_id), None)
     if not user:
         return False
@@ -1242,7 +1785,7 @@ async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
             if sid >= len(data['servers']):
                 continue
             server = data['servers'][sid]
-            ssh = get_ssh(server)
+            ssh = await asyncio.to_thread(get_ssh, server)
             await asyncio.to_thread(ssh.connect)
             manager = get_protocol_manager(ssh, uc['protocol'])
             await asyncio.to_thread(
@@ -1289,7 +1832,7 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
         srv = current_data['servers'][srv_id]
         
         try:
-            ssh = get_ssh(srv)
+            ssh = await asyncio.to_thread(get_ssh, srv)
             await asyncio.to_thread(ssh.connect)
             
             # 1. Deletes
@@ -1505,11 +2048,29 @@ def get_current_user(request: Request):
     return None
 
 
+def static_version():
+    """Cache buster for /static: the newest mtime under it.
+
+    Browsers hold on to style.css across a redeploy -- it is served with an
+    ETag but no Cache-Control, so heuristic caching keeps a stale copy and the
+    page renders new markup against old rules.
+    """
+    newest = 0.0
+    for root, _dirs, files in os.walk(os.path.join(application_path, 'static')):
+        for name in files:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(root, name)))
+            except OSError:
+                continue
+    return str(int(newest))
+
+
 def tpl(request, template, **kwargs):
     data = load_data()
     lang = request.cookies.get('lang', 'en')
     ctx = {
         'request': request,
+        'static_v': static_version(),
         'current_user': get_current_user(request),
         'site_settings': data.get('settings', {}).get('appearance', {}),
         'captcha_settings': data.get('settings', {}).get('captcha', {}),
@@ -1522,6 +2083,32 @@ def tpl(request, template, **kwargs):
     }
     ctx.update(kwargs)
     return templates.TemplateResponse(template, ctx)
+
+
+@app.get('/manifest.webmanifest')
+def web_manifest(request: Request):
+    """Installable PWA manifest — public, no auth (browsers fetch without credentials)."""
+    data = load_data()
+    lang = request.cookies.get('lang', 'en')
+    appearance = data.get('settings', {}).get('appearance', {})
+    return JSONResponse(
+        build_manifest(appearance, lang),
+        media_type='application/manifest+json',
+    )
+
+
+@app.get('/sw.js')
+def service_worker():
+    """Root-scoped service worker. Must not live under /static/ or scope is confined."""
+    path = os.path.join(application_path, 'static', 'sw.js')
+    return FileResponse(
+        path,
+        media_type='text/javascript',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Service-Worker-Allowed': '/',
+        },
+    )
 
 
 # ======================== Pydantic Models ========================
@@ -1557,6 +2144,7 @@ class EditServerRequest(BaseModel):
     expires_at: Optional[str] = None
     payment_day: Optional[int] = None
     price: Optional[str] = None
+    self_service_enabled: Optional[bool] = None
 
 
 class ReorderServersRequest(BaseModel):
@@ -1586,6 +2174,56 @@ class InstallProtocolRequest(BaseModel):
     # NGINX
     nginx_domain: Optional[str] = None
     nginx_email: Optional[str] = None
+    # Exit node
+    exit_subnet: Optional[str] = None       # transit subnet, default 10.9.0.0/24
+    exit_obfuscation: Optional[bool] = None  # AmneziaWG obfuscation on the transit link
+    # AmneziaWG: values that end up in the generated client configs
+    awg_mtu: Optional[str] = None
+    awg_dns1: Optional[str] = None
+    awg_dns2: Optional[str] = None
+    awg_dns6: Optional[str] = None
+    awg_i1: Optional[str] = None
+    awg_i2: Optional[str] = None
+    awg_i3: Optional[str] = None
+    awg_i4: Optional[str] = None
+    awg_i5: Optional[str] = None
+
+
+class AwgSettingsRequest(BaseModel):
+    protocol: str = 'awg2'
+    mtu: Optional[str] = None
+    dns1: Optional[str] = None
+    dns2: Optional[str] = None
+    dns6: Optional[str] = None
+    i1: Optional[str] = None
+    i2: Optional[str] = None
+    i3: Optional[str] = None
+    i4: Optional[str] = None
+    i5: Optional[str] = None
+
+
+class ExitPeerAddRequest(BaseModel):
+    protocol: str = 'exit'
+    peer_id: str = ''
+    name: str = ''
+    public_key: str = ''
+
+
+class ExitPeerRemoveRequest(BaseModel):
+    protocol: str = 'exit'
+    public_key: str = ''
+    peer_id: str = ''
+
+
+class ExitLinkRequest(BaseModel):
+    protocol: str = 'awg'
+    exit_uid: str = ''
+    force: Optional[bool] = False
+
+
+class ExitDnsRequest(BaseModel):
+    protocol: str = 'awg'
+    enabled: bool = False
 
 
 class Socks5SettingsRequest(BaseModel):
@@ -1597,6 +2235,29 @@ class Socks5SettingsRequest(BaseModel):
 
 class ProtocolRequest(BaseModel):
     protocol: str = 'awg'
+
+
+class ContainerToggleRequest(ProtocolRequest):
+    # Stopping an exit node that entries route through needs an explicit yes
+    force: Optional[bool] = False
+
+
+class WgEasyPreviewRequest(BaseModel):
+    web_port: int = 51821
+    password: str = ''
+    username: Optional[str] = 'admin'
+
+
+class WgEasyImportRequest(BaseModel):
+    web_port: int = 51821
+    password: str = ''
+    username: Optional[str] = 'admin'
+    client_ids: Optional[list] = None  # None = import all
+    target: str = 'auto'  # auto | wireguard | awg2
+
+class RenameProtocolRequest(BaseModel):
+    protocol: str = ''
+    name: str = ''  # empty = reset to default
 
 
 class AddConnectionRequest(BaseModel):
@@ -1643,6 +2304,7 @@ class RenameConnectionRequest(BaseModel):
     protocol: str = 'awg'
     client_id: str = ''
     new_name: str = ''
+    max_speed: float = -1  # Mbit/s; -1 = don't touch, 0 = unlimited
 
 class SaveConnectionConfigRequest(BaseModel):
     protocol: str = 'awg'
@@ -1658,8 +2320,10 @@ class ToggleConnectionRequest(BaseModel):
 
 class AddUserRequest(BaseModel):
     username: str
-    password: str
-    role: str = 'user'
+    # Password is optional: role 'none' (the default) is a record-only user
+    # who cannot log in, so no password is needed. Any real role requires one.
+    password: Optional[str] = None
+    role: str = 'none'
     telegramId: Optional[str] = None
     email: Optional[str] = None
     description: Optional[str] = None
@@ -1773,9 +2437,26 @@ class AutoBackupSettings(BaseModel):
     interval_hours: int = 24
 
 
+class SelfServiceSettings(BaseModel):
+    enabled: bool = False
+    web_enabled: bool = True
+    telegram_enabled: bool = True
+    max_connections_per_user: int = Field(5, ge=1, le=100)
+    rate_limit_count: int = Field(3, ge=1, le=100)
+    rate_limit_window_seconds: int = Field(60, ge=1, le=86400)
+    allowed_protocols: List[str] = Field(default_factory=lambda: ['awg', 'awg2'])
+
+
+class SelfServiceConnectionRequest(BaseModel):
+    server_id: int
+    protocol: str = 'awg'
+    name: str = 'VPN Connection'
+
+
 
 
 class UpdateUserRequest(BaseModel):
+    username: Optional[str] = None
     telegramId: Optional[str] = None
     email: Optional[str] = None
     description: Optional[str] = None
@@ -1786,6 +2467,10 @@ class UpdateUserRequest(BaseModel):
 
 
 
+class ExitNodesSettings(BaseModel):
+    default_exit_uid: str = ''
+
+
 class SaveSettingsRequest(BaseModel):
     appearance: AppearanceSettings
     sync: SyncSettings
@@ -1793,10 +2478,23 @@ class SaveSettingsRequest(BaseModel):
     telegram: TelegramSettings
     ssl: SSLSettings
     auto_backup: AutoBackupSettings = AutoBackupSettings()
+    self_service: SelfServiceSettings = SelfServiceSettings()
+    exit_nodes: ExitNodesSettings = ExitNodesSettings()
 
 
 class ToggleUserRequest(BaseModel):
     enabled: bool
+
+
+def _normalize_telegram_id(value):
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if not normalized.isdigit():
+        raise ValueError('Telegram ID must be numeric')
+    return normalized
 
 
 class AddUserConnectionRequest(BaseModel):
@@ -1831,8 +2529,49 @@ class TunnelStartRequest(BaseModel):
 
 # ======================== Startup ========================
 
+# Interval (seconds) between background connection-flood collection rounds.
+# Each round is one cheap SSH roundtrip per AWG instance (a compact per-IP
+# conntrack summary), so detection works 24/7 without anyone watching the UI
+# and the 6s UI refresh only reads the small snapshot files.
+CONN_MONITOR_INTERVAL = 600
+
+
+def _conn_monitor_loop():
+    from managers.awg_manager import AWGManager
+    while True:
+        try:
+            data = load_data()
+            for server in data.get('servers', []):
+                protocols = server.get('protocols', {}) or {}
+                for proto in list(protocols):
+                    if protocol_base(proto) not in ('awg', 'awg2', 'awg3'):
+                        continue
+                    try:
+                        AWGManager(get_ssh(server)).collect_conn_stats(proto)
+                    except Exception as e:
+                        logger.warning(
+                            f"conn monitor: {server.get('host')} {proto}: {e}")
+        except Exception as e:
+            logger.warning(f"conn monitor loop: {e}")
+        time.sleep(CONN_MONITOR_INTERVAL)
+
+
+_conn_monitor_started = False
+
+
+def _start_conn_monitor():
+    global _conn_monitor_started
+    if _conn_monitor_started:
+        return
+    _conn_monitor_started = True
+    threading.Thread(target=_conn_monitor_loop, daemon=True,
+                     name='conn-monitor').start()
+    logger.info(f"Connection-flood monitor started (every {CONN_MONITOR_INTERVAL}s)")
+
+
 @app.on_event("startup")
 async def startup():
+    _start_conn_monitor()
     data = load_data()
     changed = False
     if not data.get('users'):
@@ -1911,6 +2650,10 @@ async def startup():
             'key_text': '',
             'panel_port': 5000
         }
+    # Stable server identity: list indices shift on reorder/delete, uids don't.
+    if backfill_server_uids(data.get('servers')):
+        changed = True
+        logger.info("Assigned uids to servers that had none")
 
     # Auto backup settings migration
     auto_backup = data.setdefault('settings', {}).setdefault('auto_backup', {})
@@ -1944,7 +2687,7 @@ async def startup():
     tg_cfg = data.get('settings', {}).get('telegram', {})
     if tg_cfg.get('enabled') and tg_cfg.get('token'):
         logger.info("Starting Telegram bot from saved settings...")
-        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data)
+        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
 
 
 def _parse_notification_time(value: str, tz_name: str) -> datetime:
@@ -2384,14 +3127,14 @@ async def periodic_background_tasks():
 # ======================== PAGE ROUTES ========================
 
 @app.get('/login', response_class=HTMLResponse, tags=["System Templates"])
-async def login_page(request: Request):
+def login_page(request: Request):
     if get_current_user(request):
         return RedirectResponse(url='/', status_code=302)
     return tpl(request, 'login.html')
 
 
 @app.get("/set_lang/{lang}", tags=["System Templates"])
-async def set_lang(lang: str, request: Request):
+def set_lang(lang: str, request: Request):
     ref = request.headers.get("referer", "/")
     response = RedirectResponse(url=ref)
     response.set_cookie(key="lang", value=lang, max_age=31536000)
@@ -2399,17 +3142,17 @@ async def set_lang(lang: str, request: Request):
 
 
 @app.get('/logout', tags=["System Templates"])
-async def logout(request: Request):
+def logout(request: Request):
     request.session.clear()
     return RedirectResponse(url='/login', status_code=302)
 
 
 @app.get('/', response_class=HTMLResponse, tags=["System Templates"])
-async def index(request: Request):
+def index(request: Request):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(url='/login', status_code=302)
-    if user['role'] == 'user':
+    if user['role'] not in ('admin', 'support'):
         return RedirectResponse(url='/my', status_code=302)
     data = load_data()
     for server in data['servers']:
@@ -2418,7 +3161,7 @@ async def index(request: Request):
 
 
 @app.get('/server/{server_id}', response_class=HTMLResponse, tags=["System Templates"])
-async def server_detail(request: Request, server_id: int):
+def server_detail(request: Request, server_id: int):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(url='/login', status_code=302)
@@ -2464,7 +3207,7 @@ async def server_detail(request: Request, server_id: int):
 
 
 @app.get('/users', response_class=HTMLResponse, tags=["System Templates"])
-async def users_page(request: Request):
+def users_page(request: Request):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(url='/login', status_code=302)
@@ -2481,7 +3224,7 @@ async def users_page(request: Request):
 
 
 @app.get('/my', response_class=HTMLResponse, tags=["System Templates"])
-async def my_connections_page(request: Request):
+def my_connections_page(request: Request):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(url='/login', status_code=302)
@@ -2500,7 +3243,7 @@ async def my_connections_page(request: Request):
 # ======================== AUTH API ========================
 
 @app.get('/api/auth/captcha', tags=["Authentication"])
-async def api_captcha(request: Request):
+def api_captcha(request: Request):
     if not CaptchaGenerator:
         return JSONResponse({"error": "multicolorcaptcha is not installed"}, status_code=500)
     
@@ -2517,7 +3260,7 @@ async def api_captcha(request: Request):
 
 
 @app.post('/api/auth/login', tags=["Authentication"])
-async def api_login(request: Request, req: LoginRequest):
+def api_login(request: Request, req: LoginRequest):
     data = load_data()
     captcha_settings = data.get('settings', {}).get('captcha', {})
     if captcha_settings.get('enabled') is True:
@@ -2529,8 +3272,13 @@ async def api_login(request: Request, req: LoginRequest):
         request.session.pop('captcha_answer', None)
 
     for u in data.get('users', []):
-        if u['username'] == req.username and verify_password(req.password, u['password_hash']):
+        # Users without a password (role 'none', record-only) can never log in.
+        if u['username'] == req.username and u.get('password_hash') and verify_password(req.password, u['password_hash']):
             lang = request.cookies.get('lang', 'ru')
+            if u.get('role') == 'none':
+                # Record-only account: even a password set later does not
+                # grant access until a real role is assigned.
+                return JSONResponse({'error': _t('invalid_login', lang)}, status_code=401)
             if not u.get('enabled', True):
                 return JSONResponse({'error': _t('account_disabled', lang)}, status_code=403)
             request.session['user_id'] = u['id']
@@ -2571,7 +3319,7 @@ def _check_admin(request):
 
 
 @app.post('/api/servers/add', tags=["Servers"])
-async def api_add_server(request: Request, req: AddServerRequest):
+def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -2592,6 +3340,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
             return JSONResponse({'error': f'Connection failed: {str(e)}'}, status_code=400)
 
         server = {
+            'uid': uuid.uuid4().hex,
             'name': name, 'host': host, 'ssh_port': req.ssh_port,
             'username': username, 'password': req.password,
             'private_key': req.private_key, 'server_info': server_info,
@@ -2610,7 +3359,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
 
 
 @app.post('/api/servers/{server_id}/edit', tags=["Servers"])
-async def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
+def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
     """Update connection details for an existing server entry. Verifies the new
     credentials by SSH-connecting before persisting, so a typo can't lock us out.
     """
@@ -2664,7 +3413,11 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
             server['payment_day'] = req.payment_day or None
         if req.price is not None:
             server['price'] = req.price.strip()
+        if req.self_service_enabled is not None:
+            server['self_service_enabled'] = bool(req.self_service_enabled)
         save_data(data)
+        # Drop the stale pooled connection: credentials/host may have changed.
+        drop_ssh(server)
         return {'status': 'success', 'server_info': server_info}
     except Exception as e:
         logger.exception("Error editing server")
@@ -2746,6 +3499,20 @@ async def api_delete_server(request: Request, server_id: int):
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        # Exit-node links: restore direct egress on entries routed through
+        # this server, and drop this server's own peers on the exits it used.
+        try:
+            if (server.get('protocols') or {}).get('exit'):
+                await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_server_deleted')
+            await exit_link_svc.forget_entry_peers(server)
+        except Exception as e:
+            logger.warning(f"exit-link cleanup before delete failed: {e}")
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        await asyncio.to_thread(drop_ssh, server)
         data['servers'].pop(server_id)
         # Clean up connections for this server
         data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
@@ -2760,7 +3527,7 @@ async def api_delete_server(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/reboot', tags=["Servers"])
-async def api_reboot_server(request: Request, server_id: int):
+def api_reboot_server(request: Request, server_id: int):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -2793,8 +3560,16 @@ async def api_clear_server(request: Request, server_id: int):
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
+        try:
+            if (server.get('protocols') or {}).get('exit'):
+                await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_cleared')
+            await exit_link_svc.forget_entry_peers(server)
+        except Exception as e:
+            logger.warning(f"exit-link cleanup before clear failed: {e}")
+        data = load_data()
+        server = data['servers'][server_id]
+        ssh = await asyncio.to_thread(get_ssh, server)
+        await asyncio.to_thread(ssh.connect)
         # Match every Amnezia container by name prefix (catches awg/awg2/awg-legacy,
         # wireguard, xray/ssxray, openvpn, dns, and any future amnezia-* protocol)
         # plus the telemt container which doesn't share that prefix.
@@ -2813,7 +3588,7 @@ done
 docker network rm amnezia-dns-net >/dev/null 2>&1 || true
 rm -rf /opt/amnezia
 """
-        ssh.run_sudo_script(cleanup_script, timeout=120)
+        await asyncio.to_thread(ssh.run_sudo_script, cleanup_script, timeout=120)
 
         server['protocols'] = {}
         save_data(data)
@@ -2825,7 +3600,7 @@ rm -rf /opt/amnezia
 
 
 @app.post('/api/servers/{server_id}/stats', tags=["Servers"])
-async def api_server_stats(request: Request, server_id: int):
+def api_server_stats(request: Request, server_id: int):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -2878,7 +3653,7 @@ async def api_server_stats(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/check', tags=["Servers"])
-async def api_check_server(request: Request, server_id: int):
+def api_check_server(request: Request, server_id: int):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -2928,6 +3703,12 @@ async def api_check_server(request: Request, server_id: int):
                 for key in ('domain', 'email', 'site_url'):
                     if db_proto.get(key) not in (None, ''):
                         merged[key] = db_proto[key]
+            if protocol_base(proto) == 'exit':
+                for key in ('subnet', 'public_key', 'obfuscation'):
+                    if db_proto.get(key) not in (None, ''):
+                        merged.setdefault(key, db_proto[key])
+            if protocol_base(proto) in AWG_PROTOCOLS and db_proto.get('exit_link'):
+                merged['exit_link'] = db_proto['exit_link']
             return merged
 
         def should_preserve_saved_protocol(proto, result=None, err=None):
@@ -2935,6 +3716,10 @@ async def api_check_server(request: Request, server_id: int):
             db_proto = server.get('protocols', {}).get(proto)
             if not db_proto:
                 return False
+            # An instance routed through an exit node keeps its record: the
+            # exit still holds its peer and the admin needs Unlink/Repair.
+            if db_proto.get('exit_link'):
+                return True
             # Additional AWG-family instances are only known by their saved
             # dynamic keys (awg__2/awg2__2/awg_legacy__2). Keep them unless
             # the user explicitly uninstalls them.
@@ -2950,6 +3735,12 @@ async def api_check_server(request: Request, server_id: int):
             try:
                 p_manager = get_protocol_manager(ssh, proto)
                 result = _manager_call(p_manager, 'get_server_status', proto)
+                db_proto = server.get('protocols', {}).get(proto, {}) or {}
+                if db_proto.get('exit_link') and result.get('container_running'):
+                    try:
+                        result['exit_link_status'] = AWGManager(ssh).exit_link_status(proto)
+                    except Exception as e:
+                        result['exit_link_status'] = {'up': False, 'error': str(e)}
                 return proto, merge_saved_protocol_status(proto, result), None
             except Exception as e:
                 return proto, merge_saved_protocol_status(proto, {}, str(e)), str(e)
@@ -2987,6 +3778,12 @@ async def api_check_server(request: Request, server_id: int):
                             'email': result.get('email'),
                             'site_url': result.get('site_url'),
                         })
+                    if protocol_base(proto) == 'exit':
+                        server['protocols'][proto].update({
+                            'subnet': result.get('subnet'),
+                            'public_key': result.get('public_key'),
+                            'obfuscation': result.get('obfuscation'),
+                        })
                     changed = True
             else:
                 if proto in server['protocols']:
@@ -2995,6 +3792,11 @@ async def api_check_server(request: Request, server_id: int):
                         status['protocols'][proto]['container_exists'] = True
                         status['protocols'][proto].setdefault('container_running', False)
                         status['protocols'][proto]['status_preserved'] = True
+                        link = (server['protocols'][proto] or {}).get('exit_link')
+                        if link and not err and not link.get('stale') and result and not result.get('container_exists'):
+                            # Container gone but the exit still has our peer
+                            link['stale'] = 'entry_container_missing'
+                            changed = True
                     else:
                         del server['protocols'][proto]
                         changed = True
@@ -3007,6 +3809,60 @@ async def api_check_server(request: Request, server_id: int):
     except Exception as e:
         logger.exception("Error checking server")
         return JSONResponse({'error': str(e), 'connection': 'failed'}, status_code=500)
+
+
+def get_used_ports(ssh):
+    """Return {'udp': {port: proc}, 'tcp': {port: proc}} for listening sockets.
+
+    Used to suggest a free port before protocol installation and to validate
+    the chosen port, instead of letting 'docker run' fail with a half-created
+    container on 'port is already allocated'.
+    """
+    out, _, code = ssh.run_sudo_command("ss -H -l -n -p -u; echo ---TCP---; ss -H -l -n -p -t")
+    used = {'udp': {}, 'tcp': {}}
+    if code != 0 or not out:
+        return used
+    section = 'udp'
+    for line in out.split('\n'):
+        line = line.strip()
+        if line == '---TCP---':
+            section = 'tcp'
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[3]
+        port = local.rsplit(':', 1)[-1]
+        if not port.isdigit():
+            continue
+        m = re.search(r'users:\(\("([^"]+)"', line)
+        used[section][port] = m.group(1) if m else '?'
+    return used
+
+
+# Protocols whose install port must be validated against used ports,
+# mapped to their transport. dns/adguard are skipped (internal bindings).
+INSTALL_PORT_TRANSPORT = {
+    'awg': 'udp', 'awg2': 'udp', 'awg3': 'udp', 'awg_legacy': 'udp',
+    'wireguard': 'udp', 'exit': 'udp',
+    'xray': 'tcp', 'telemt': 'tcp', 'socks5': 'tcp', 'nginx': 'tcp',
+}
+
+
+@app.get('/api/servers/{server_id}/used-ports', tags=["Servers"])
+def api_used_ports(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        ssh = get_ssh(data['servers'][server_id])
+        ssh.connect()
+        return get_used_ports(ssh)
+    except Exception as e:
+        logger.exception("Error getting used ports")
+        return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.post('/api/servers/{server_id}/install', tags=["Protocols"])
@@ -3031,15 +3887,45 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         else:
             install_protocol = req.protocol
         install_base = protocol_base(install_protocol)
+        # A reinstalled entry keeps its exit link and is re-linked below
+        previous_link = None
+        # Reinstalling an instance is not the same as adding one: an instance a
+        # user deliberately left unlinked must not be linked behind their back.
+        reinstall = install_protocol in (server.get('protocols') or {})
+        if install_base in AWG_PROTOCOLS:
+            previous_link = ((server.get('protocols') or {}).get(install_protocol) or {}).get('exit_link')
 
-        ssh = get_ssh(server)
-        ssh.connect()
-        docker_install_log = ensure_docker_installed(ssh)
+        awg_special_junk = awg_special_junk_from(req) if install_base in AWG_PROTOCOLS else None
+        if awg_special_junk is not None:
+            # Reject a malformed packet before touching the server.
+            try:
+                normalize_special_junk(awg_special_junk)
+            except ValueError as e:
+                return JSONResponse({'error': str(e)}, status_code=400)
+
+        ssh = await asyncio.to_thread(get_ssh, server)
+        await asyncio.to_thread(ssh.connect)
+
+        # Validate the requested port before touching Docker: a busy port
+        # otherwise fails mid-install with a half-created broken container.
+        transport = INSTALL_PORT_TRANSPORT.get(install_base)
+        if transport and req.port and str(req.port).isdigit():
+            used = await asyncio.to_thread(get_used_ports, ssh)
+            owner = used.get(transport, {}).get(str(req.port))
+            if owner:
+                return JSONResponse(
+                    {'error': f'Port {req.port}/{transport} is already used by {owner}. '
+                              f'Choose another port.'},
+                    status_code=400)
+
+        docker_install_log = await asyncio.to_thread(ensure_docker_installed, ssh)
         manager = get_protocol_manager(ssh, install_protocol)
 
         # Pass parameters to installer
+        install_kwargs = None
         if install_base == 'telemt':
-            result = manager.install_protocol(
+            install_args = ()
+            install_kwargs = dict(
                 protocol_type=install_protocol,
                 port=req.port,
                 tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
@@ -3047,18 +3933,22 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 max_connections=req.max_connections if req.max_connections is not None else 0
             )
         elif install_base == 'xray':
-            result = manager.install_protocol(port=req.port)
+            install_args = ()
+            install_kwargs = dict(port=req.port)
         elif install_base == 'wireguard':
-            result = manager.install_protocol(port=req.port)
+            install_args = ()
+            install_kwargs = dict(port=req.port)
         elif install_base == 'socks5':
-            result = manager.install_protocol(
+            install_args = ()
+            install_kwargs = dict(
                 protocol_type=install_protocol,
                 port=req.port,
                 username=req.socks5_username,
                 password=req.socks5_password,
             )
         elif install_base == 'adguard':
-            result = manager.install_protocol(
+            install_args = ()
+            install_kwargs = dict(
                 protocol_type='adguard',
                 mode=req.adguard_mode or 'sidebyside',
                 web_port=req.adguard_web_port,
@@ -3071,14 +3961,34 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 expose_doh=bool(req.adguard_expose_doh),
             )
         elif install_base == 'nginx':
-            result = manager.install_protocol(
+            install_args = ()
+            install_kwargs = dict(
                 protocol_type='nginx',
                 port=req.port,
                 domain=req.nginx_domain,
                 email=req.nginx_email,
             )
+        elif install_base == 'exit':
+            install_args = ()
+            install_kwargs = dict(
+                protocol_type='exit',
+                port=req.port,
+                subnet=req.exit_subnet,
+                obfuscation=bool(req.exit_obfuscation),
+            )
+        elif install_base in AWG_PROTOCOLS:
+            install_args = (install_protocol,)
+            install_kwargs = dict(
+                port=req.port,
+                mtu=req.awg_mtu,
+                dns=join_dns(req.awg_dns1, req.awg_dns2),
+                special_junk=awg_special_junk,
+                dns6=req.awg_dns6,
+            )
         else:
-            result = manager.install_protocol(install_protocol, port=req.port)
+            install_args = (install_protocol,)
+            install_kwargs = dict(port=req.port)
+        result = await asyncio.to_thread(manager.install_protocol, *install_args, **install_kwargs)
 
         if not isinstance(result, dict):
             result = {'status': 'success', 'message': str(result)}
@@ -3094,6 +4004,10 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             'port': req.port,
             'awg_params': result.get('awg_params', {}),
         }
+        if result.get('mtu'):
+            proto_record['mtu'] = result['mtu']
+        if result.get('dns'):
+            proto_record['dns'] = result['dns']
         if install_base == 'adguard':
             proto_record['mode'] = result.get('mode')
             proto_record['internal_ip'] = result.get('internal_ip')
@@ -3103,10 +4017,18 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             proto_record['domain'] = result.get('domain')
             proto_record['email'] = result.get('email')
             proto_record['site_url'] = result.get('site_url')
+        if install_base == 'exit':
+            # req.port may be empty: the manager applied the default
+            proto_record['port'] = result.get('port') or req.port
+            proto_record['subnet'] = result.get('subnet')
+            proto_record['public_key'] = result.get('public_key')
+            proto_record['obfuscation'] = result.get('obfuscation')
         proto_record['base_protocol'] = install_base
         proto_record['instance'] = protocol_instance(install_protocol)
         proto_record['display_name'] = protocol_display_name(install_protocol)
         proto_record['container_name'] = protocol_container_name(install_protocol)
+        if previous_link:
+            proto_record['exit_link'] = previous_link
         server['protocols'][install_protocol] = proto_record
         result['protocol'] = install_protocol
         result['base_protocol'] = install_base
@@ -3114,6 +4036,39 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         result['container_name'] = proto_record['container_name']
         save_data(data)
         ssh.disconnect()
+
+        # A new AWG instance joins the default exit node, when one is set.
+        default_uid = ((data.get('settings', {}).get('exit_nodes') or {}).get('default_exit_uid') or '').strip()
+        if should_link_default_exit(default_uid, server.get('uid'), install_base in AWG_PROTOCOLS,
+                                    reinstall, previous_link):
+            try:
+                linked = await exit_link_svc.link(server_id, install_protocol, default_uid)
+                result.setdefault('log', []).append(
+                    f"Linked to the default exit node {linked['exit_link']['exit_name']}")
+            except Exception as e:
+                # the instance is installed either way; the link is an extra
+                logger.warning(f"default exit link after install failed: {e}")
+                result.setdefault('log', []).append(f"! Could not link to the default exit node: {e}")
+
+        # Exit-node links survive reinstalls: bring them back now.
+        if install_base == 'exit':
+            for item in await exit_link_svc.relink_entries_for_exit(server.get('uid')):
+                result.setdefault('log', []).append(
+                    f"Re-linked {item['name']}/{item['protocol']}" if item['status'] == 'success'
+                    else f"! Failed to re-link {item['name']}/{item['protocol']}: {item['error']}")
+        elif previous_link:
+            try:
+                await exit_link_svc.relink_entry(server_id, install_protocol)
+                result.setdefault('log', []).append(f"Re-linked to exit node {previous_link.get('exit_name')}")
+            except Exception as e:
+                logger.warning(f"re-link after reinstall failed: {e}")
+                fresh = load_data()
+                rec = (fresh['servers'][server_id].get('protocols') or {}).get(install_protocol) if server_id < len(fresh['servers']) else None
+                if rec and rec.get('exit_link'):
+                    rec['exit_link']['stale'] = 'relink_failed'
+                    save_data(fresh)
+                result.setdefault('log', []).append(
+                    f"! Could not re-link to exit node {previous_link.get('exit_name')}: {e}")
         return result
     except Exception as e:
         logger.exception("Error installing protocol")
@@ -3121,7 +4076,7 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
 
 
 @app.get('/api/servers/{server_id}/socks5/credentials', tags=["Protocols"])
-async def api_socks5_get_credentials(request: Request, server_id: int, protocol: str = 'socks5'):
+def api_socks5_get_credentials(request: Request, server_id: int, protocol: str = 'socks5'):
     """Return the current SOCKS5 port/username/password for the panel UI."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3143,7 +4098,7 @@ async def api_socks5_get_credentials(request: Request, server_id: int, protocol:
 
 
 @app.post('/api/servers/{server_id}/socks5/credentials', tags=["Protocols"])
-async def api_socks5_update_credentials(request: Request, server_id: int, req: Socks5SettingsRequest):
+def api_socks5_update_credentials(request: Request, server_id: int, req: Socks5SettingsRequest):
     """Apply new SOCKS5 connection settings — regenerates the 3proxy config and
     reconciles the container (recreating it if the listening port changed)."""
     if not _check_admin(request):
@@ -3178,6 +4133,266 @@ async def api_socks5_update_credentials(request: Request, server_id: int, req: S
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+def _exit_manager_for(ssh):
+    from managers.exit_manager import ExitManager
+    return ExitManager(ssh)
+
+
+@app.post('/api/servers/{server_id}/exit/peers', tags=["Protocols"])
+def api_exit_peers(request: Request, server_id: int, req: ProtocolRequest):
+    """Exit node endpoint data (public key, port, transit subnet, obfuscation)
+    and its peers - the entry nodes linked to it - with live handshake and
+    transfer counters."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        ssh = get_ssh(data['servers'][server_id])
+        ssh.connect()
+        try:
+            manager = _exit_manager_for(ssh)
+            info = manager.get_info()
+            peers = manager.list_peers()
+        finally:
+            ssh.disconnect()
+        return {'status': 'success', 'info': info, 'peers': peers}
+    except Exception as e:
+        logger.exception("Error listing exit peers")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit/peers/add', tags=["Protocols"])
+def api_exit_peer_add(request: Request, server_id: int, req: ExitPeerAddRequest):
+    """Register a peer on the exit node by hand (a node not managed by this
+    panel). Upserts by `peer_id`; returns the transit address, a fresh PSK and
+    the exit's endpoint data for the peer's own WireGuard config."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not req.peer_id.strip() or not req.public_key.strip():
+        return JSONResponse({'error': 'peer_id and public_key are required'}, status_code=400)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        ssh = get_ssh(data['servers'][server_id])
+        ssh.connect()
+        try:
+            manager = _exit_manager_for(ssh)
+            peer = manager.add_peer(req.peer_id.strip(), req.name.strip() or req.peer_id.strip(),
+                                    req.public_key.strip())
+        finally:
+            ssh.disconnect()
+        return {'status': 'success', 'peer': peer}
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Error adding exit peer")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit/peers/remove', tags=["Protocols"])
+def api_exit_peer_remove(request: Request, server_id: int, req: ExitPeerRemoveRequest):
+    """Drop a peer from the exit node by public key or by peer id."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not req.public_key.strip() and not req.peer_id.strip():
+        return JSONResponse({'error': 'public_key or peer_id is required'}, status_code=400)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        ssh = get_ssh(data['servers'][server_id])
+        ssh.connect()
+        try:
+            manager = _exit_manager_for(ssh)
+            removed = manager.remove_peer(public_key=req.public_key.strip() or None,
+                                          peer_id=req.peer_id.strip() or None)
+        finally:
+            ssh.disconnect()
+        return {'status': 'success', 'removed': removed}
+    except Exception as e:
+        logger.exception("Error removing exit peer")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+def _exit_link_error(e: ExitLinkError):
+    return JSONResponse({'error': e.code, 'message': str(e)}, status_code=e.status_code)
+
+
+@app.get('/api/exit-nodes', tags=["Servers"])
+def api_exit_nodes(request: Request):
+    """Servers with an installed exit node, from data.json (no SSH)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    return {'status': 'success', 'exit_nodes': exit_link_svc.list_exit_nodes(load_data())}
+
+
+@app.post('/api/servers/{server_id}/exit-link', tags=["Protocols"])
+async def api_exit_link(request: Request, server_id: int, req: ExitLinkRequest):
+    """Route all clients of an AWG instance through an exit node (by its
+    server uid). Rolled back unless the exit answers within 15 s; `force`
+    keeps the link anyway."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.link(server_id, req.protocol, req.exit_uid.strip(), force=bool(req.force))
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error linking to exit node")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/remove', tags=["Protocols"])
+async def api_exit_unlink(request: Request, server_id: int, req: ProtocolRequest):
+    """Restore direct egress for an AWG instance and drop its peer on the exit."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.unlink(server_id, req.protocol)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error unlinking from exit node")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/relink', tags=["Protocols"])
+async def api_exit_relink(request: Request, server_id: int, req: ProtocolRequest):
+    """Re-establish an existing link (after a reinstall or a stale state)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.relink_entry(server_id, req.protocol)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error re-linking to exit node")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/dns', tags=["Protocols"])
+async def api_exit_link_dns(request: Request, server_id: int, req: ExitDnsRequest):
+    """Resolve client DNS at the exit node instead of this one (requires
+    AmneziaDNS on the exit)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.set_dns_via_exit(server_id, req.protocol, req.enabled)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error switching the DNS route of an exit link")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/status', tags=["Protocols"])
+async def api_exit_link_status(request: Request, server_id: int, req: ProtocolRequest):
+    """Saved link plus live handshake/transfer, client MTU and IPv6 flags."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.status(server_id, req.protocol)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error reading exit link status")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/exit-link/check-egress', tags=["Protocols"])
+async def api_exit_link_check_egress(request: Request, server_id: int, req: ProtocolRequest):
+    """Public IP the clients of this instance leave from, compared with the
+    exit node address (two HTTP probes from inside the container)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.check_egress(server_id, req.protocol)
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error checking exit egress")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/awg/settings', tags=["Protocols"])
+def api_awg_settings_get(request: Request, server_id: int, req: ProtocolRequest):
+    """Return MTU, DNS and the special junk packets I1-I5 of an AWG server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(req.protocol) not in AWG_PROTOCOLS:
+        return JSONResponse({'error': 'Not an AmneziaWG protocol'}, status_code=400)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        ssh = get_ssh(data['servers'][server_id])
+        ssh.connect()
+        try:
+            settings = AWGManager(ssh).get_awg_settings(req.protocol)
+        finally:
+            ssh.disconnect()
+        settings['dns1'], settings['dns2'] = split_dns(settings.get('dns'))
+        return settings
+    except Exception as e:
+        logger.exception("Error getting AWG settings")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/awg/settings/save', tags=["Protocols"])
+def api_awg_settings_save(request: Request, server_id: int, req: AwgSettingsRequest):
+    """Update MTU, DNS and I1-I5 and apply them to the running interface."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(req.protocol) not in AWG_PROTOCOLS:
+        return JSONResponse({'error': 'Not an AmneziaWG protocol'}, status_code=400)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        special_junk = {key: getattr(req, key) for key in ('i1', 'i2', 'i3', 'i4', 'i5')}
+        if all(value is None for value in special_junk.values()):
+            special_junk = None
+        else:
+            # Reject a malformed packet before opening an SSH connection.
+            normalize_special_junk(special_junk)
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            # An empty string means "clear it", None means "leave it alone";
+            # join_dns() collapses two blank fields to None, so restore the
+            # distinction here or the DNS could never be reset from the UI.
+            dns = None
+            if req.dns1 is not None or req.dns2 is not None:
+                dns = join_dns(req.dns1, req.dns2) or ''
+            settings = AWGManager(ssh).update_awg_settings(
+                req.protocol,
+                mtu=req.mtu,
+                dns=dns,
+                special_junk=special_junk,
+                dns6=req.dns6,
+            )
+        finally:
+            ssh.disconnect()
+        proto_record = server.setdefault('protocols', {}).get(req.protocol)
+        if proto_record is not None:
+            proto_record['mtu'] = settings.get('mtu')
+            proto_record['dns'] = settings.get('dns')
+            proto_record['dns6'] = settings.get('dns6')
+            save_data(data)
+        settings['dns1'], settings['dns2'] = split_dns(settings.get('dns'))
+        settings['status'] = 'success'
+        return settings
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Error saving AWG settings")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/uninstall', tags=["Protocols"])
 async def api_uninstall_protocol(request: Request, server_id: int, req: ProtocolRequest):
     if not _check_admin(request):
@@ -3187,18 +4402,34 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
         base = protocol_base(req.protocol)
+        if base in AWG_PROTOCOLS and ((server.get('protocols') or {}).get(req.protocol) or {}).get('exit_link'):
+            # Drop our peer on the exit while the container still exists
+            try:
+                await exit_link_svc.unlink(server_id, req.protocol)
+            except Exception as e:
+                logger.warning(f"unlink before uninstall failed: {e}")
+            data = load_data()
+            server = data['servers'][server_id]
+        ssh = await asyncio.to_thread(get_ssh, server)
+        await asyncio.to_thread(ssh.connect)
+        manager = get_protocol_manager(ssh, req.protocol)
         if base in ('xray', 'wireguard'):
-            manager.remove_container()
+            await asyncio.to_thread(manager.remove_container)
         else:
-            manager.remove_container(req.protocol)
+            await asyncio.to_thread(manager.remove_container, req.protocol)
         if req.protocol in server.get('protocols', {}):
             del server['protocols'][req.protocol]
             save_data(data)
         ssh.disconnect()
+        if base == 'exit':
+            detached = await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_uninstalled')
+            return {'status': 'success', 'detached': detached}
+        if base == 'dns':
+            # queries sent here through a link would go nowhere now
+            restored = await exit_link_svc.disable_dns_via_exit_for_exit(server.get('uid'))
+            if restored:
+                return {'status': 'success', 'dns_restored': restored}
         return {'status': 'success'}
     except Exception as e:
         logger.exception("Error uninstalling protocol")
@@ -3223,7 +4454,7 @@ CONTAINER_NAMES = {
 
 
 @app.post('/api/servers/{server_id}/backups', tags=["Protocols"])
-async def api_protocol_backups_list(request: Request, server_id: int, req: ProtocolRequest):
+def api_protocol_backups_list(request: Request, server_id: int, req: ProtocolRequest):
     """List backups created on the remote server for one protocol."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3250,7 +4481,7 @@ async def api_protocol_backups_list(request: Request, server_id: int, req: Proto
 
 
 @app.post('/api/servers/{server_id}/backups/create', tags=["Protocols"])
-async def api_protocol_backup_create(request: Request, server_id: int, req: ProtocolRequest):
+def api_protocol_backup_create(request: Request, server_id: int, req: ProtocolRequest):
     """Create a protocol backup archive on the remote server."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3280,7 +4511,7 @@ async def api_protocol_backup_create(request: Request, server_id: int, req: Prot
 
 
 @app.post('/api/servers/{server_id}/backups/download', tags=["Protocols"])
-async def api_protocol_backup_download(request: Request, server_id: int, req: BackupDownloadRequest):
+def api_protocol_backup_download(request: Request, server_id: int, req: BackupDownloadRequest):
     """Download one remote protocol backup archive through the panel."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3304,8 +4535,9 @@ async def api_protocol_backup_download(request: Request, server_id: int, req: Ba
         ssh.connect()
         quoted_remote = shlex.quote(remote_path)
         quoted_tmp = shlex.quote(tmp_remote)
+        # `sudo <a> && <b>` elevates only `<a>`; the whole chain needs one shell
         _, err, code = ssh.run_sudo_command(
-            f"test -f {quoted_remote} && cp {quoted_remote} {quoted_tmp} && chmod 0644 {quoted_tmp}"
+            f"sh -c {shlex.quote(f'test -f {quoted_remote} && cp {quoted_remote} {quoted_tmp} && chmod 0644 {quoted_tmp}')}"
         )
         if code != 0:
             return JSONResponse({'error': err or 'Backup not found'}, status_code=404)
@@ -3338,9 +4570,129 @@ async def api_protocol_backup_download(request: Request, server_id: int, req: Ba
             ssh.disconnect()
 
 
+@app.post('/api/servers/{server_id}/backups/upload', tags=["Protocols"])
+async def api_protocol_backup_upload(
+    request: Request,
+    server_id: int,
+    protocol: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """Upload a protocol backup archive onto the remote server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not is_valid_protocol(protocol):
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    ssh = None
+    tmp_path = None
+    try:
+        data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        content = await file.read(BackupManager.MAX_UPLOAD_BYTES + 1)
+        if not content:
+            return JSONResponse({'error': 'Empty file'}, status_code=400)
+        if len(content) > BackupManager.MAX_UPLOAD_BYTES:
+            return JSONResponse({'error': 'Backup file is too large'}, status_code=413)
+        fd, tmp_path = tempfile.mkstemp(prefix='amnezia-backup-upload-', suffix='.tar.gz')
+        os.write(fd, content)
+        os.close(fd)
+        fd = None
+        server = data['servers'][server_id]
+        ssh = await asyncio.to_thread(get_ssh, server)
+        await asyncio.to_thread(ssh.connect)
+        result = await asyncio.to_thread(BackupManager(ssh).upload_backup, protocol, file.filename, tmp_path)
+        if result.get('status') == 'error':
+            return JSONResponse({'error': result.get('message', 'Failed to upload backup')}, status_code=400)
+        return result
+    except Exception as e:
+        logger.exception("Error uploading protocol backup")
+        return JSONResponse({'error': 'Internal server error'}, status_code=500)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        if ssh:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/backups/restore', tags=["Protocols"])
+async def api_protocol_backup_restore(request: Request, server_id: int, req: BackupDownloadRequest):
+    """Restore a protocol from a backup archive on the remote server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not is_valid_protocol(req.protocol):
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    filename = BackupManager.safe_filename(req.filename)
+    if not filename:
+        return JSONResponse({'error': 'Invalid backup filename'}, status_code=400)
+    ssh = None
+    try:
+        data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        container = protocol_container_name(req.protocol)
+        if not container:
+            return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+        ssh = await asyncio.to_thread(get_ssh, server)
+        await asyncio.to_thread(ssh.connect)
+        result = await asyncio.to_thread(BackupManager(ssh).restore_backup, req.protocol, container, filename)
+        if result.get('status') == 'error':
+            return JSONResponse({'error': result.get('message', 'Failed to restore backup')}, status_code=500)
+        ssh.disconnect()
+        ssh = None
+        # The archive owns the files an exit link lives in, so the restored
+        # container and data.json can now disagree. Never fails the restore.
+        try:
+            result.update(await exit_link_svc.reconcile_after_restore(server_id, req.protocol))
+        except Exception as e:
+            logger.warning(f"exit-link reconcile after restore failed: {e}")
+        return result
+    except Exception as e:
+        logger.exception("Error restoring protocol backup")
+        return JSONResponse({'error': 'Internal server error'}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/backups/delete', tags=["Protocols"])
+def api_protocol_backup_delete(request: Request, server_id: int, req: BackupDownloadRequest):
+    """Delete one protocol backup archive on the remote server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not is_valid_protocol(req.protocol):
+        return JSONResponse({'error': 'Unknown protocol'}, status_code=400)
+    filename = BackupManager.safe_filename(req.filename)
+    if not filename:
+        return JSONResponse({'error': 'Invalid backup filename'}, status_code=400)
+    ssh = None
+    try:
+        data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        result = BackupManager(ssh).delete_backup(req.protocol, filename)
+        if result.get('status') == 'error':
+            return JSONResponse({'error': result.get('message', 'Failed to delete backup')}, status_code=404)
+        return result
+    except Exception as e:
+        logger.exception("Error deleting protocol backup")
+        return JSONResponse({'error': 'Internal server error'}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
+
+
 @app.post('/api/servers/{server_id}/container/toggle', tags=["Protocols"])
-async def api_container_toggle(request: Request, server_id: int, req: ProtocolRequest):
-    """Start or stop a protocol Docker container."""
+def api_container_toggle(request: Request, server_id: int, req: ContainerToggleRequest):
+    """Start or stop a protocol Docker container. Stopping an exit node that
+    entries route through is refused (409 `exit_in_use`) unless `force` is
+    set - their clients would silently land on the kill-switch."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -3358,6 +4710,11 @@ async def api_container_toggle(request: Request, server_id: int, req: ProtocolRe
             f"docker inspect -f '{{{{.State.Running}}}}' {container} 2>/dev/null"
         )
         is_running = out.strip().lower() == 'true'
+        if is_running and protocol_base(req.protocol) == 'exit' and not req.force:
+            entries = exit_link_svc.linked_entries(data, server.get('uid'))
+            if entries:
+                ssh.disconnect()
+                return JSONResponse({'error': 'exit_in_use', 'entries': entries}, status_code=409)
         if is_running:
             ssh.run_sudo_command(f"docker stop {container}")
             action = 'stopped'
@@ -3372,7 +4729,7 @@ async def api_container_toggle(request: Request, server_id: int, req: ProtocolRe
 
 
 @app.post('/api/servers/{server_id}/server_config', tags=["Protocols"])
-async def api_server_config(request: Request, server_id: int, req: ProtocolRequest):
+def api_server_config(request: Request, server_id: int, req: ProtocolRequest):
     """Get the raw server-side WireGuard/Xray configuration."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3415,8 +4772,179 @@ async def api_server_config(request: Request, server_id: int, req: ProtocolReque
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/ssh_cooldown', tags=["Servers"])
+async def api_ssh_cooldown(request: Request, server_id: int):
+    """Set the per-server SSH circuit-breaker base cooldown (seconds)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        body = await request.json()
+        seconds = float(body.get('seconds', 30))
+    except Exception:
+        return JSONResponse({'error': 'Invalid value'}, status_code=400)
+    if not (5 <= seconds <= 300):
+        return JSONResponse({'error': 'Value must be between 5 and 300 seconds'}, status_code=400)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    data['servers'][server_id]['ssh_cooldown_base'] = seconds
+    save_data(data)
+    return {'ok': True, 'ssh_cooldown_base': seconds}
+
+
+@app.post('/api/servers/{server_id}/host_tuning', tags=["Protocols"])
+def api_host_tuning(request: Request, server_id: int):
+    """Server-level network tuning summary (host sysctls + AWG containers)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        mgr = AWGManager(ssh)
+        info = mgr.get_host_tuning()
+        ssh.disconnect()
+        info['panel'] = {'ssh_cooldown_base': float(server.get('ssh_cooldown_base') or 30)}
+        return info
+    except Exception as e:
+        logger.exception("Error getting host tuning info")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/wgeasy/preview', tags=["Protocols"])
+def api_wgeasy_preview(request: Request, server_id: int, req: WgEasyPreviewRequest):
+    """Fetch the client list from a wg-easy / amnezia-wg-easy panel running on
+    this server (via its local web API over SSH). No secrets are returned."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    from managers.wgeasy_import import WgEasyError
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            from managers.wgeasy_import import WgEasyImporter, normalize_clients
+            importer = WgEasyImporter(ssh, web_port=req.web_port)
+            backup = importer.fetch_backup(req.password, req.username or 'admin')
+            clients = normalize_clients(backup)
+            _, listen_port, _, obfuscation = importer.detect_source()
+        finally:
+            ssh.disconnect()
+        return {
+            'status': 'success',
+            'release': backup.get('_release'),
+            'server_address': (backup.get('server') or {}).get('address', ''),
+            'listen_port': int(listen_port),
+            'obfuscation': bool(obfuscation),
+            'recommended_target': 'awg2' if obfuscation else 'wireguard',
+            'clients': [{
+                'id': c['id'],
+                'name': c['name'],
+                'address': c['address'],
+                'enabled': c['enabled'],
+            } for c in clients],
+            'has_server_private_key': bool((backup.get('server') or {}).get('privateKey')),
+        }
+    except WgEasyError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Error previewing wg-easy import")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/protocol/rename', tags=["Protocols"])
+def api_rename_protocol(request: Request, server_id: int, req: RenameProtocolRequest):
+    """Set or clear a custom display name for an installed protocol instance."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        proto = req.protocol.strip()
+        if proto not in server.get('protocols', {}):
+            return JSONResponse({'error': 'Protocol not found'}, status_code=404)
+        # The modal caps input at 64 chars; the API has to cap it too, or a
+        # direct call parks an unbounded string in data.json forever.
+        name = req.name.strip()[:CUSTOM_PROTOCOL_NAME_MAX]
+        if name:
+            server['protocols'][proto]['custom_name'] = name
+        else:
+            server['protocols'][proto].pop('custom_name', None)
+        save_data(data)
+        return {'status': 'success', 'protocol': proto, 'name': name}
+    except Exception as e:
+        logger.exception("Error renaming protocol")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/wgeasy/import', tags=["Protocols"])
+def api_wgeasy_import(request: Request, server_id: int, req: WgEasyImportRequest):
+    """Migrate clients from a wg-easy panel on this server into a panel-managed
+    WireGuard instance, preserving keys/IPs/port so client configs keep working."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    from managers.wgeasy_import import WgEasyError  # noqa: needed in except below
+    log = []
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        if 'protocols' not in server:
+            server['protocols'] = {}
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            from managers.wgeasy_import import WgEasyImporter, WgEasyError, run_import
+            importer = WgEasyImporter(ssh, web_port=req.web_port)
+            backup = importer.fetch_backup(req.password, req.username or 'admin')
+            _, _, _, obfuscation = importer.detect_source()
+            target = req.target if req.target in ('wireguard', 'awg2') else (
+                'awg2' if obfuscation else 'wireguard')
+            # Additional instances are supported for AWG 2.0: when the first
+            # slot is taken, import as the next free instance key (awg2__2,
+            # awg2__3, ...). WireGuard is single-instance for now.
+            if target in server['protocols'] and target != 'awg2':
+                return JSONResponse(
+                    {'error': f'Protocol {target} is already installed on this server. '
+                              'Remove it first if you want to re-import.'}, status_code=400)
+            if target == 'awg2' and any(k.split('__', 1)[0] == 'awg2'
+                                        for k in server['protocols']):
+                target = next_protocol_key(server['protocols'], 'awg2')
+            result = run_import(ssh, backup, client_ids=req.client_ids,
+                                target=target, log=log)
+            result['log'] = log
+        finally:
+            ssh.disconnect()
+
+        server['protocols'][target] = {
+            'installed': True,
+            'port': result['port'],
+            'awg_params': {},
+            'base_protocol': protocol_base(target),
+            'instance': protocol_instance(target),
+            'display_name': protocol_display_name(target),
+            'container_name': protocol_container_name(target),
+        }
+        save_data(data)
+        return result
+    except WgEasyError as e:
+        return JSONResponse({'error': str(e), 'log': log}, status_code=400)
+    except Exception as e:
+        logger.exception("Error importing from wg-easy")
+        return JSONResponse({'error': str(e), 'log': log}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/server_config/save', tags=["Protocols"])
-async def api_server_config_save(request: Request, server_id: int, req: ServerConfigSaveRequest):
+def api_server_config_save(request: Request, server_id: int, req: ServerConfigSaveRequest):
     """Save the raw server-side WireGuard/Xray configuration and apply changes."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3467,7 +4995,7 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
 
 
 @app.post('/api/servers/{server_id}/nginx/site', tags=["Protocols"])
-async def api_nginx_site_get(request: Request, server_id: int, req: ProtocolRequest):
+def api_nginx_site_get(request: Request, server_id: int, req: ProtocolRequest):
     """Return editable NGINX site index.html."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3491,7 +5019,7 @@ async def api_nginx_site_get(request: Request, server_id: int, req: ProtocolRequ
 
 
 @app.post('/api/servers/{server_id}/nginx/site/save', tags=["Protocols"])
-async def api_nginx_site_save(request: Request, server_id: int, req: NginxSiteSaveRequest):
+def api_nginx_site_save(request: Request, server_id: int, req: NginxSiteSaveRequest):
     """Save editable NGINX site index.html."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3514,7 +5042,7 @@ async def api_nginx_site_save(request: Request, server_id: int, req: NginxSiteSa
         return JSONResponse({'error': str(e)}, status_code=500)
 
 @app.get('/api/servers/{server_id}/connections', tags=["Connections"])
-async def api_get_connections(request: Request, server_id: int, protocol: str = Query(default='awg')):
+def api_get_connections(request: Request, server_id: int, protocol: str = Query(default='awg')):
     if not protocol:
         protocol = 'awg'
     if not _check_admin(request):
@@ -3551,7 +5079,7 @@ async def api_get_connections(request: Request, server_id: int, protocol: str = 
 
 
 @app.post('/api/servers/{server_id}/connections/add', tags=["Connections"])
-async def api_add_connection(request: Request, server_id: int, req: AddConnectionRequest):
+def api_add_connection(request: Request, server_id: int, req: AddConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -3588,7 +5116,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
         ssh.disconnect()
 
         if result.get('config'):
-            result['vpn_link'] = generate_vpn_link(result['config'])
+            result.update(config_payloads(result['config'], server, req.protocol))
 
         # Link connection to user if specified
         if req.user_id and result.get('client_id'):
@@ -3611,7 +5139,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
 
 
 @app.post('/api/servers/{server_id}/connections/remove', tags=["Connections"])
-async def api_remove_connection(request: Request, server_id: int, req: ConnectionActionRequest):
+def api_remove_connection(request: Request, server_id: int, req: ConnectionActionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -3806,7 +5334,7 @@ async def api_transfer_connection(request: Request, server_id: int, req: Transfe
 
 
 @app.post('/api/servers/{server_id}/connections/edit', tags=["Connections"])
-async def api_edit_connection(request: Request, server_id: int, req: EditConnectionRequest):
+def api_edit_connection(request: Request, server_id: int, req: EditConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -3845,8 +5373,29 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/connections/clear_warnings', tags=["Connections"])
+def api_clear_conn_warnings(request: Request, server_id: int, req: ConnectionActionRequest):
+    """Clear recorded connection-flood (torrent) warnings for one peer."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, req.protocol)
+        result = _manager_call(manager, 'clear_conn_warnings', req.protocol, req.client_id) or {}
+        ssh.disconnect()
+        return result
+    except Exception as e:
+        logger.exception("Error clearing connection warnings")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/connections/rename', tags=["Connections"])
-async def api_rename_connection(request: Request, server_id: int, req: RenameConnectionRequest):
+def api_rename_connection(request: Request, server_id: int, req: RenameConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -3863,6 +5412,14 @@ async def api_rename_connection(request: Request, server_id: int, req: RenameCon
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
         result = _manager_call(manager, 'rename_client', req.protocol, req.client_id, new_name) or {}
+        # Optional per-peer bandwidth limit (managers exposing set_speed_limit)
+        speed_warning = None
+        if req.max_speed >= 0 and hasattr(manager, 'set_speed_limit'):
+            try:
+                _manager_call(manager, 'set_speed_limit', req.protocol, req.client_id, req.max_speed)
+            except Exception as se:
+                logger.warning(f"set_speed_limit failed: {se}")
+                speed_warning = str(se)
         ssh.disconnect()
         # Telemt rename may also change client_id (username is the identity there)
         new_client_id = result.get('client_id', req.client_id)
@@ -3875,14 +5432,17 @@ async def api_rename_connection(request: Request, server_id: int, req: RenameCon
                 changed = True
         if changed:
             save_data(data)
-        return {'status': 'success', 'name': stored_name, 'client_id': new_client_id}
+        resp = {'status': 'success', 'name': stored_name, 'client_id': new_client_id}
+        if speed_warning:
+            resp['speed_warning'] = speed_warning
+        return resp
     except Exception as e:
         logger.exception("Error renaming connection")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.post('/api/servers/{server_id}/connections/config/save', tags=["Connections"])
-async def api_save_connection_config(request: Request, server_id: int, req: SaveConnectionConfigRequest):
+def api_save_connection_config(request: Request, server_id: int, req: SaveConnectionConfigRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -3900,14 +5460,14 @@ async def api_save_connection_config(request: Request, server_id: int, req: Save
         manager = get_protocol_manager(ssh, req.protocol)
         _manager_call(manager, 'save_client_config', req.protocol, req.client_id, config_text)
         ssh.disconnect()
-        return {'status': 'success', 'vpn_link': generate_vpn_link(config_text)}
+        return {'status': 'success', **config_payloads(config_text, server, req.protocol)}
     except Exception as e:
         logger.exception("Error saving connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.post('/api/servers/{server_id}/connections/config', tags=["Connections"])
-async def api_get_connection_config(request: Request, server_id: int, req: ConnectionActionRequest):
+def api_get_connection_config(request: Request, server_id: int, req: ConnectionActionRequest):
     user = get_current_user(request)
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3916,7 +5476,7 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         # Users can only view their own connections
-        if user['role'] == 'user':
+        if user['role'] in ('user', 'none'):
             owned = any(
                 c for c in data.get('user_connections', [])
                 if c.get('client_id') == req.client_id and c.get('server_id') == server_id and c.get('user_id') == user['id']
@@ -3933,8 +5493,7 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         manager = get_protocol_manager(ssh, req.protocol)
         config = _manager_call(manager, 'get_client_config', req.protocol, req.client_id, server['host'], port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        return {'config': config, **config_payloads(config, server, req.protocol)}
     except Exception as e:
         logger.exception("Error getting connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -4010,7 +5569,7 @@ async def api_reset_connection_device(request: Request, server_id: int, req: Con
 
 
 @app.post('/api/servers/{server_id}/connections/toggle', tags=["Connections"])
-async def api_toggle_connection(request: Request, server_id: int, req: ToggleConnectionRequest):
+def api_toggle_connection(request: Request, server_id: int, req: ToggleConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -4035,7 +5594,7 @@ async def api_toggle_connection(request: Request, server_id: int, req: ToggleCon
 # ======================== USER API (admin only) ========================
 
 @app.get('/api/users', tags=["Users"])
-async def api_list_users(request: Request, search: str = '', page: int = 1, size: int = 10):
+def api_list_users(request: Request, search: str = '', page: int = 1, size: int = 10):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
@@ -4090,24 +5649,30 @@ async def api_list_users(request: Request, search: str = '', page: int = 1, size
 
 
 @app.post('/api/users/add', tags=["Users"])
-async def api_add_user(request: Request, req: AddUserRequest):
+def api_add_user(request: Request, req: AddUserRequest):
     cur = get_current_user(request)
     if not cur or cur['role'] != 'admin':
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
         lang = request.cookies.get('lang', 'ru')
+        try:
+            telegram_id = _normalize_telegram_id(req.telegramId)
+        except ValueError as exc:
+            return JSONResponse({'error': str(exc)}, status_code=400)
         # Check duplicate
         if any(u['username'] == req.username for u in data.get('users', [])):
             return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
-        if req.role not in ('admin', 'support', 'user'):
-            return JSONResponse({'error': 'Invalid role'}, status_code=400)
+        if req.role not in ('admin', 'support', 'user', 'none'):
+            return JSONResponse({'error': _t('invalid_role', lang)}, status_code=400)
+        if req.role != 'none' and not req.password:
+            return JSONResponse({'error': _t('password_required_for_role', lang)}, status_code=400)
         new_user = {
             'id': str(uuid.uuid4()),
             'username': req.username,
-            'password_hash': hash_password(req.password),
+            'password_hash': hash_password(req.password) if req.password else None,
             'role': req.role,
-            'telegramId': req.telegramId,
+            'telegramId': telegram_id,
             'email': req.email,
             'description': req.description,
             'traffic_limit': int(req.traffic_limit * 1024**3) if req.traffic_limit else 0,
@@ -4168,7 +5733,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
                     result['connection_created'] = True
                     if conn_result.get('config'):
                         result['config'] = conn_result['config']
-                        result['vpn_link'] = generate_vpn_link(conn_result['config'])
+                        result.update(config_payloads(conn_result['config'], server, req.protocol))
         return result
     except Exception as e:
         logger.exception("Error adding user")
@@ -4185,7 +5750,19 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if not user:
             return JSONResponse({'error': 'User not found'}, status_code=404)
             
-        if req.telegramId is not None: user['telegramId'] = req.telegramId
+        if req.username is not None:
+            new_name = req.username.strip()
+            lang = request.cookies.get('lang', 'ru')
+            if not new_name:
+                return JSONResponse({'error': _t('username_empty', lang)}, status_code=400)
+            if any(u['username'] == new_name and u['id'] != user_id for u in data.get('users', [])):
+                return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
+            user['username'] = new_name
+        if req.telegramId is not None:
+            try:
+                user['telegramId'] = _normalize_telegram_id(req.telegramId)
+            except ValueError as exc:
+                return JSONResponse({'error': str(exc)}, status_code=400)
         if req.email is not None: user['email'] = req.email
         if req.description is not None: user['description'] = req.description
         if req.traffic_limit is not None: 
@@ -4227,7 +5804,7 @@ async def api_delete_user(request: Request, user_id: str):
         return JSONResponse({'error': _t('cannot_delete_self', lang)}, status_code=400)
     try:
         data = load_data()
-        success = await perform_delete_user(data, user_id)
+        success = await asyncio.to_thread(perform_delete_user, data, user_id)
         if not success:
             return JSONResponse({'error': 'User not found'}, status_code=404)
         save_data(data)
@@ -4255,7 +5832,7 @@ async def api_toggle_user(request: Request, user_id: str, req: ToggleUserRequest
 
 
 @app.post('/api/users/{user_id}/traffic/reset', tags=["Users"])
-async def api_reset_user_traffic(request: Request, user_id: str):
+def api_reset_user_traffic(request: Request, user_id: str):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -4289,9 +5866,28 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
         if req.server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][req.server_id]
+
+        if req.client_id:
+            # A peer is a single on/off entity on the server: linking it to a
+            # second panel user would make both cards control the same peer.
+            # Reject any double-link, even to the same user.
+            clash = next(
+                (c for c in data.get('user_connections', [])
+                 if c.get('client_id') == req.client_id
+                 and c.get('server_id') == req.server_id
+                 and c.get('protocol') == req.protocol),
+                None,
+            )
+            if clash:
+                lang = request.cookies.get('lang', 'ru')
+                if clash.get('user_id') == user_id:
+                    return JSONResponse({'error': _t('peer_already_linked_self', lang)}, status_code=400)
+                owner = next((u for u in data['users'] if u['id'] == clash.get('user_id')), None)
+                owner_name = owner['username'] if owner else '?'
+                return JSONResponse({'error': _t('peer_already_linked', lang).replace('{}', owner_name)}, status_code=400)
         proto_info = server.get('protocols', {}).get(req.protocol, {})
         port = proto_info.get('port', '55424')
-        ssh = get_ssh(server)
+        ssh = await asyncio.to_thread(get_ssh, server)
         await asyncio.to_thread(ssh.connect)
         manager = get_protocol_manager(ssh, req.protocol)
         
@@ -4299,7 +5895,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             # Use existing client
             target_client_id = req.client_id
             # Retrieve config for existing client
-            config = await asyncio.to_thread(manager.get_client_config, req.protocol, req.client_id, server['host'], port)
+            config = await asyncio.to_thread(_manager_call, manager, 'get_client_config', req.protocol, req.client_id, server['host'], port)
             result = {'client_id': target_client_id, 'config': config}
         else:
             # Create new client
@@ -4335,20 +5931,48 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
         resp = {'status': 'success'}
         if result.get('config'):
             resp['config'] = result['config']
-            resp['vpn_link'] = generate_vpn_link(result['config'])
+            resp.update(config_payloads(result['config'], server, req.protocol))
         return resp
     except Exception as e:
         logger.exception("Error adding user connection")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+class UnlinkConnectionRequest(BaseModel):
+    server_id: int
+    protocol: str = 'awg'
+    client_id: str = ''
+
+
+@app.post('/api/users/{user_id}/connections/unlink', tags=["Users"])
+async def api_unlink_user_connection(request: Request, user_id: str, req: UnlinkConnectionRequest):
+    """Detach a connection from the user WITHOUT touching the peer on the
+    server: the key keeps working and the peer goes back to the pool of
+    linkable existing clients."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    before = len(data.get('user_connections', []))
+    data['user_connections'] = [
+        c for c in data.get('user_connections', [])
+        if not (c.get('user_id') == user_id
+                and c.get('server_id') == req.server_id
+                and c.get('protocol') == req.protocol
+                and c.get('client_id') == req.client_id)
+    ]
+    if len(data['user_connections']) == before:
+        return JSONResponse({'error': 'Connection link not found'}, status_code=404)
+    save_data(data)
+    return {'status': 'success'}
+
+
 @app.get('/api/users/{user_id}/connections', tags=["Users"])
-async def api_get_user_connections(request: Request, user_id: str):
+def api_get_user_connections(request: Request, user_id: str):
     user = get_current_user(request)
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     # Users can only see their own, admin/support can see all
-    if user['role'] == 'user' and user['id'] != user_id:
+    if user['role'] in ('user', 'none') and user['id'] != user_id:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
@@ -4356,13 +5980,55 @@ async def api_get_user_connections(request: Request, user_id: str):
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
             c['server_name'] = data['servers'][sid].get('name', '')
+
+    # Enrich with live peer data (IP, enabled, handshake, transfer, speed
+    # limit) from each server the user has connections on. One SSH session
+    # per (server, protocol) group; unreachable servers degrade gracefully —
+    # the DB fields above are still returned.
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for c in conns:
+        groups[(c.get('server_id', 0), c.get('protocol', 'awg'))].append(c)
+    for (sid, proto), items in groups.items():
+        try:
+            if sid >= len(data['servers']):
+                continue
+            server = data['servers'][sid]
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                manager = get_protocol_manager(ssh, proto)
+                clients = _manager_call(manager, 'get_clients', proto)
+            finally:
+                ssh.disconnect()
+        except Exception as e:
+            logger.warning(f"Could not enrich connections from server {sid}/{proto}: {e}")
+            continue
+        by_id = {cl.get('clientId'): cl for cl in clients}
+        for c in items:
+            cl = by_id.get(c.get('client_id'))
+            if not cl:
+                continue
+            ud = cl.get('userData', {}) or {}
+            # Peer names live in userData.clientName (same place the server
+            # page reads them); fall back to a top-level key just in case.
+            c['peer_name'] = ud.get('clientName') or cl.get('name', '')
+            # Managers store the flag in userData.enabled; fall back to the
+            # top-level key just in case another manager sets it there.
+            enabled = cl.get('enabled', ud.get('enabled', True))
+            c['enabled'] = enabled if enabled is not None else True
+            c['allowed_ips'] = ud.get('allowedIps', '')
+            c['latest_handshake'] = ud.get('latestHandshake', '')
+            c['data_received'] = ud.get('dataReceived', '')
+            c['data_sent'] = ud.get('dataSent', '')
+            c['max_speed'] = ud.get('maxSpeed', 0) or 0
     return {'connections': conns}
 
 
 # ======================== MY CONNECTIONS API (for user role) ========================
 
 @app.get('/api/my/connections', tags=["Self-service"])
-async def api_my_connections(request: Request):
+def api_my_connections(request: Request):
     user = get_current_user(request)
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -4376,11 +6042,47 @@ async def api_my_connections(request: Request):
             c['server_name'] = data['servers'][sid].get('name', '')
         else:
             c['server_name'] = 'Unknown'
+        c['protocol_name'] = protocol_display_name(c.get('protocol', ''))
     return {'connections': conns}
 
 
+@app.get('/api/my/connections/options', tags=["Self-service"])
+async def api_my_connection_options(request: Request):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.get_self_service_options(user['id'], 'web')
+    except Exception as exc:
+        return _self_service_error_response(exc)
+
+
+@app.post('/api/my/connections/add', tags=["Self-service"])
+async def api_my_connection_add(request: Request, payload: SelfServiceConnectionRequest):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.create_user_connection(
+            user['id'], payload.server_id, payload.protocol, payload.name, 'web'
+        )
+    except Exception as exc:
+        return _self_service_error_response(exc)
+
+
+@app.post('/api/my/connections/{connection_id}/delete', tags=["Self-service"])
+async def api_my_connection_delete(request: Request, connection_id: str):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.delete_user_connection(user['id'], connection_id, 'web')
+    except Exception as exc:
+        return _self_service_error_response(exc)
+
+
 @app.post('/api/users/{user_id}/share/setup', tags=["Users"])
-async def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Request):
+def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Request):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
@@ -4401,7 +6103,7 @@ async def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Re
 
 
 @app.get('/share/{token}', response_class=HTMLResponse, tags=["System Templates"])
-async def share_page(token: str, request: Request):
+def share_page(token: str, request: Request):
     data = load_data()
     user = next((u for u in data['users'] if u.get('share_token') == token), None)
     if not user or not user.get('share_enabled'):
@@ -4418,7 +6120,7 @@ async def share_page(token: str, request: Request):
 
 
 @app.post('/api/share/{token}/auth', tags=["Sharing"])
-async def api_share_auth(token: str, req: ShareAuthRequest, request: Request):
+def api_share_auth(token: str, req: ShareAuthRequest, request: Request):
     data = load_data()
     user = next((u for u in data['users'] if u.get('share_token') == token), None)
     if not user or not user.get('share_enabled'):
@@ -4433,7 +6135,7 @@ async def api_share_auth(token: str, req: ShareAuthRequest, request: Request):
 
 
 @app.get('/api/share/{token}/connections', tags=["Sharing"])
-async def api_share_connections(token: str, request: Request):
+def api_share_connections(token: str, request: Request):
     data = load_data()
     user = next((u for u in data['users'] if u.get('share_token') == token), None)
     if not user or not user.get('share_enabled'):
@@ -4455,7 +6157,7 @@ async def api_share_connections(token: str, request: Request):
 
 
 @app.post('/api/share/{token}/config/{connection_id}', tags=["Sharing"])
-async def api_share_config(token: str, connection_id: str, request: Request):
+def api_share_config(token: str, connection_id: str, request: Request):
     data = load_data()
     user = next((u for u in data['users'] if u.get('share_token') == token), None)
     if not user or not user.get('share_enabled'):
@@ -4480,15 +6182,14 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         manager = get_protocol_manager(ssh, conn['protocol'])
         config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], server['host'], port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        return {'config': config, **config_payloads(config, server, conn['protocol'])}
     except Exception as e:
         logger.exception("Error getting shared config")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.post('/api/my/connections/{connection_id}/config', tags=["Self-service"])
-async def api_my_connection_config(request: Request, connection_id: str):
+def api_my_connection_config(request: Request, connection_id: str):
     user = get_current_user(request)
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -4512,20 +6213,26 @@ async def api_my_connection_config(request: Request, connection_id: str):
         manager = get_protocol_manager(ssh, conn['protocol'])
         config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], server['host'], port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        return {'config': config, **config_payloads(config, server, conn['protocol'])}
     except Exception as e:
         logger.exception("Error getting my connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.get('/settings', tags=["System Templates"])
-async def settings_page(request: Request):
+def settings_page(request: Request):
     user = _check_admin(request)
     if not user:
         return RedirectResponse('/login')
     data = load_data()
-    return tpl(request, 'settings.html', settings=data.get('settings', {}), servers=data.get('servers', []), current_version=CURRENT_VERSION)
+    return tpl(
+        request,
+        'settings.html',
+        settings=data.get('settings', {}),
+        servers=data.get('servers', []),
+        current_version=CURRENT_VERSION,
+        self_service_protocol_choices=self_service_protocol_choices(),
+    )
 
 
 @app.get('/notifications', response_class=HTMLResponse, tags=["System Templates"])
@@ -4808,7 +6515,7 @@ async def api_delete_notification(notification_id: str, request: Request):
 
 
 @app.get('/api/settings', tags=["Settings"])
-async def api_get_settings(request: Request):
+def api_get_settings(request: Request):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
@@ -4816,7 +6523,7 @@ async def api_get_settings(request: Request):
 
 
 @app.get('/api/settings/tunnels/status', tags=["Settings"])
-async def api_tunnels_status(request: Request):
+def api_tunnels_status(request: Request):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     return {
@@ -4924,7 +6631,7 @@ async def api_warp_disconnect(request: Request):
 #     return {'status': 'success'}
 
 @app.post('/api/settings/save', tags=["Settings"])
-async def save_settings(request: Request, payload: SaveSettingsRequest):
+def save_settings(request: Request, payload: SaveSettingsRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
@@ -4945,6 +6652,18 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
         'last_created_count': old_auto_backup.get('last_created_count', 0),
         'last_error': old_auto_backup.get('last_error')
     }
+    self_service = payload.self_service.dict()
+    self_service['allowed_protocols'] = sanitize_allowed_protocols(self_service.get('allowed_protocols'))
+    settings['self_service'] = self_service
+
+    warnings = []
+    default_exit_uid = (payload.exit_nodes.default_exit_uid or '').strip()
+    if default_exit_uid and not any(n['uid'] == default_exit_uid
+                                    for n in exit_link_svc.list_exit_nodes(data)):
+        # the node was uninstalled or deleted between opening and saving
+        default_exit_uid = ''
+        warnings.append('exit_default_cleared')
+    settings['exit_nodes'] = {'default_exit_uid': default_exit_uid}
     save_data(data)
     logger.info("Settings saved (including captcha, telegram and auto backup)")
 
@@ -4953,13 +6672,13 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     if tg_cfg.enabled and tg_cfg.token:
         if not tg_bot.is_running():
             logger.info("Starting Telegram bot (settings save)...")
-            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data)
+            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
     else:
         if tg_bot.is_running():
             logger.info("Stopping Telegram bot (settings save)...")
             asyncio.create_task(tg_bot.stop_bot())
 
-    return {"status": "success", "bot_running": tg_bot.is_running()}
+    return {"status": "success", "bot_running": tg_bot.is_running(), "warnings": warnings}
 
 
 @app.post('/api/settings/telegram/toggle', tags=["Settings"])
@@ -4987,7 +6706,7 @@ async def api_telegram_toggle(
         save_data(data)
         return {'status': 'stopped', 'bot_running': False}
     else:
-        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data)
+        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
         tg_cfg['enabled'] = True
         data['settings']['telegram'] = tg_cfg
         save_data(data)
@@ -5014,7 +6733,7 @@ async def api_sync_delete(request: Request):
 
 
 @app.get('/api/servers/{server_id}/{protocol}/clients', tags=["Connections"])
-async def api_get_server_clients(request: Request, server_id: int, protocol: str):
+def api_get_server_clients(request: Request, server_id: int, protocol: str):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -5025,7 +6744,7 @@ async def api_get_server_clients(request: Request, server_id: int, protocol: str
         ssh = get_ssh(server)
         ssh.connect()
         manager = get_protocol_manager(ssh, protocol)
-        clients = manager.get_clients(protocol)
+        clients = _manager_call(manager, 'get_clients', protocol)
         ssh.disconnect()
         
         # Filter: only show clients that are not assigned to anyone in the panel
@@ -5046,7 +6765,7 @@ async def api_get_server_clients(request: Request, server_id: int, protocol: str
 
 
 @app.get('/api/settings/tokens', tags=["API Tokens"])
-async def api_list_tokens(request: Request):
+def api_list_tokens(request: Request):
     """List metadata for every API token. The raw token value is never
     returned by this endpoint — only its prefix and timestamps are visible
     after creation, by design."""

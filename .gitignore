@@ -38,3 +38,5 @@ data/
 # IDEs
 .vscode/
 .idea/
+.worktrees/
+docs/
