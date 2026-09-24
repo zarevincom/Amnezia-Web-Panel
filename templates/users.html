@@ -264,6 +264,33 @@
     </div>
 </div>
 
+<!-- ===== Telegram Invite Modal ===== -->
+<div class="modal-backdrop" id="telegramInviteModal">
+    <div class="modal" style="max-width: 520px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="telegramInviteTitle">{{ _('telegram_invite_title') }}</h2>
+            <button class="modal-close" onclick="closeModal('telegramInviteModal')">×</button>
+        </div>
+        <p class="form-hint" style="margin-bottom: var(--space-lg);">{{ _('telegram_invite_hint') }}</p>
+        <div class="form-group">
+            <label class="form-label" for="telegramInviteExpiresAt">{{ _('telegram_invite_expiry') }}</label>
+            <input class="form-input" type="datetime-local" id="telegramInviteExpiresAt">
+        </div>
+        <div class="form-group">
+            <label class="form-label" for="telegramInviteLink">{{ _('telegram_invite_link') }}</label>
+            <input class="form-input" type="text" id="telegramInviteLink" readonly autocomplete="off">
+            <div class="form-hint" id="telegramInviteStatus"></div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" onclick="copyTelegramInviteLink()" id="copyTelegramInviteBtn" disabled>{{ _('copy') }}</button>
+            <button type="button" class="btn btn-primary" onclick="createTelegramInvite()" id="createTelegramInviteBtn">
+                <span id="createTelegramInviteText">{{ _('telegram_invite_generate') }}</span>
+                <div class="spinner hidden" id="createTelegramInviteSpinner"></div>
+            </button>
+        </div>
+    </div>
+</div>
+
 <!-- ===== Add Connection for User Modal ===== -->
 <div class="modal-backdrop" id="addUserConnModal">
     <div class="modal">
@@ -414,6 +441,7 @@
     let currentConfig = '';
     let currentVpnLink = '';
     let currentConfigName = 'connection';
+    let telegramInviteUserId = '';
 
     let currentPage = 1;
     let pageSize = 10;
@@ -535,6 +563,7 @@
                                 <span style="cursor:pointer; color:var(--primary); text-decoration: underline;" onclick="viewUserConnections('${u.id}', '${u.username.replace(/'/g, "\\'")}')">🔗 ${u.connections_count} ${_('connections')}</span>
                                 ${u.created_at ? `<span>📅 ${u.created_at.substring(0, 10)}</span>` : ''}
                                 ${u.telegramId ? `<span>💬 ${u.telegramId}</span>` : ''}
+                                ${u.telegram_invite_pending ? `<span title="${_('telegram_invite_pending')}">⌛ ${new Date(u.telegram_invite_expires_at).toLocaleString()}</span>` : ''}
                                 ${u.email ? `<span>📧 ${u.email}</span>` : ''}
                                 ${u.expiration_date ? `<span style="color: ${new Date(u.expiration_date) < new Date() ? 'var(--danger)' : 'var(--text-muted)'}">⌛ ${_('expiration_date_label')}: ${new Date(u.expiration_date).toLocaleString()}</span>` : ''}
                             </div>
@@ -582,6 +611,7 @@
                         <button class="btn btn-secondary btn-sm btn-icon" 
                                 onclick='openEditUser({"id": "${u.id}", "username": "${u.username}", "tg": "${u.telegramId || ""}", "email": "${u.email || ""}", "desc": "${u.description || ""}", "limit": "${u.traffic_limit ? (u.traffic_limit / Math.pow(1024, 3)).toFixed(2) : 0}", "strategy": "${u.traffic_reset_strategy || 'never'}", "expiration": "${u.expiration_date || ''}"})'
                                 title="${_('edit')}">${ICON_PENCIL}</button>
+                        ${u.telegramId ? '' : `<button class="btn btn-secondary btn-sm btn-icon" onclick="openTelegramInviteModal('${u.id}', '${escapeJs(u.username)}')" title="${_('telegram_invite_generate')}">✈</button>`}
                         <button class="btn btn-secondary btn-sm btn-icon" onclick="openShareModal(this.dataset)"
                                 data-id="${u.id}" data-username="${u.username}" data-token="${u.share_token || ''}"
                                 data-enabled="${u.share_enabled ? 'true' : 'false'}"
@@ -764,6 +794,57 @@
             text.textContent = _('create');
             spinner.classList.add('hidden');
         }
+    }
+
+    function defaultTelegramInviteExpiry() {
+        const value = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        value.setMinutes(value.getMinutes() - value.getTimezoneOffset());
+        return value.toISOString().slice(0, 16);
+    }
+
+    function openTelegramInviteModal(userId, username) {
+        telegramInviteUserId = userId;
+        document.getElementById('telegramInviteTitle').textContent =
+            `${_('telegram_invite_title').replace('{}', username)}`;
+        document.getElementById('telegramInviteExpiresAt').value = defaultTelegramInviteExpiry();
+        document.getElementById('telegramInviteLink').value = '';
+        document.getElementById('telegramInviteStatus').textContent = '';
+        document.getElementById('copyTelegramInviteBtn').disabled = true;
+        document.getElementById('createTelegramInviteText').textContent = _('telegram_invite_generate');
+        openModal('telegramInviteModal');
+    }
+
+    async function createTelegramInvite() {
+        if (!telegramInviteUserId) return;
+        const expiresAt = document.getElementById('telegramInviteExpiresAt').value;
+        const btn = document.getElementById('createTelegramInviteBtn');
+        const text = document.getElementById('createTelegramInviteText');
+        const spinner = document.getElementById('createTelegramInviteSpinner');
+        btn.disabled = true;
+        spinner.classList.remove('hidden');
+        try {
+            const result = await apiCall(`/api/users/${telegramInviteUserId}/telegram-invites`, 'POST', {
+                expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
+            });
+            document.getElementById('telegramInviteLink').value = result.url;
+            document.getElementById('telegramInviteStatus').textContent =
+                `${_('telegram_invite_expiry')}: ${new Date(result.expires_at).toLocaleString()}`;
+            document.getElementById('copyTelegramInviteBtn').disabled = false;
+            text.textContent = _('telegram_invite_replace');
+            refreshUsersList();
+        } catch (err) {
+            showToast(`${_('error')}: ${err.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+            spinner.classList.add('hidden');
+        }
+    }
+
+    async function copyTelegramInviteLink() {
+        const link = document.getElementById('telegramInviteLink').value;
+        if (!link) return;
+        await copyToClipboard(link);
+        showToast(_('telegram_invite_copied'), 'success');
     }
 
     async function deleteUser(userId) {

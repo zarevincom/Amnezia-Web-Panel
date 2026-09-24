@@ -97,6 +97,8 @@ Configuration panel for system parameters and preferences:
     *   Notify users about new connections or limits.
     *   Integrated management via Telegram commands.
     *   Admin-role workflows for managing servers, protocols, users, and connections directly from Telegram.
+    *   **One-time user invitations**: issue a short-lived `t.me/<bot>?start=tg_...` link from a user's card. Opening it in a private bot chat binds the sender's immutable Telegram ID to that panel user and immediately shows only that user's existing VPN profiles.
+      Invitation payloads are stored only as SHA-256 hashes, are invalidated after use, and a replacement link revokes the prior pending link.
 *   **🔄 Built-in Update Checker**:
     *   View your current panel version directly in Settings.
     *   One-click check for fresh GitHub releases to stay up to date.
@@ -269,6 +271,7 @@ Routes are grouped in the docs as:
 | **Self-service** | Endpoints called by a regular user for their own data (`/api/my/*`). |
 | **Sharing** | Public, token-protected configuration sharing — no panel session required. |
 | **Settings** | Panel-wide settings, Telegram bot, Remnawave sync, encrypted SQLite backup/restore and legacy JSON migration. |
+| **Invites** | Admin-managed public VPN profile invitations and one-time Telegram account binding links. |
 | **API Tokens** | Create and revoke bearer tokens for external integrations. |
 
 **Authentication for external integrations** — both session cookies and `Authorization: Bearer <token>` are accepted on every admin endpoint. Example:

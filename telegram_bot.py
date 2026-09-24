@@ -4,9 +4,13 @@ Uses raw Telegram Bot API via httpx — no library version conflicts.
 Runs as a background asyncio task alongside the FastAPI app.
 """
 import asyncio
+from datetime import datetime, timezone
+import hashlib
+import hmac
 import html
 import logging
 import os
+import re
 import shlex
 import sys
 import time
@@ -43,6 +47,8 @@ _EXTRA_PROTOCOL_DISPLAY_NAMES = {
     "aivpn": "AIVPN",
 }
 SERVICE_PROTOCOLS = {"dns", "adguard", "socks5", "nginx", "exit"}
+TELEGRAM_INVITE_PREFIX = "tg_"
+TELEGRAM_INVITE_PAYLOAD_RE = re.compile(r"tg_[A-Za-z0-9_-]{24,60}$")
 
 TG_TRANSLATIONS = {
     "en": {
@@ -50,6 +56,9 @@ TG_TRANSLATIONS = {
         "account_not_linked": "Your Telegram account is not linked to any panel user.",
         "contact_admin_to_link": "Please contact your administrator — they need to add your Telegram ID to your profile.",
         "your_telegram_id": "Your Telegram ID",
+        "telegram_invite_invalid": "This Telegram invitation is unavailable or has expired.",
+        "telegram_invite_linked": "Your Telegram account is now linked to <b>{username}</b>.",
+        "telegram_invite_private_only": "Open this invitation in a private chat with the bot.",
         "registered_admin": "You are registered as <b>{username}</b> with <b>Admin</b> role.",
         "choose_action": "Choose an action:",
         "registered_as": "You are registered as <b>{username}</b>.",
@@ -160,6 +169,9 @@ TG_TRANSLATIONS = {
         "account_not_linked": "Ваш аккаунт Telegram не привязан ни к одному пользователю панели.",
         "contact_admin_to_link": "Обратитесь к администратору — он должен добавить ваш Telegram ID в профиль.",
         "your_telegram_id": "Ваш Telegram ID",
+        "telegram_invite_invalid": "Это Telegram-приглашение недоступно или срок его действия истёк.",
+        "telegram_invite_linked": "Ваш аккаунт Telegram привязан к пользователю <b>{username}</b>.",
+        "telegram_invite_private_only": "Откройте это приглашение в личном чате с ботом.",
         "registered_admin": "Вы зарегистрированы как <b>{username}</b> с ролью <b>Admin</b>.",
         "choose_action": "Выберите действие:",
         "registered_as": "Вы зарегистрированы как <b>{username}</b>.",
@@ -410,6 +422,95 @@ def _find_user(load_data_fn: Callable, tg_id: str, username: Optional[str] = Non
         if stored and stored == tg_id_clean:
             return u
     return None
+
+
+def _telegram_invite_hash(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _start_payload(text: str) -> Optional[str]:
+    """Return a Telegram deep-link payload from a /start command, if present."""
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts or parts[0].split("@", 1)[0].lower() != "/start" or len(parts) != 2:
+        return None
+    payload = parts[1].strip()
+    return payload if TELEGRAM_INVITE_PAYLOAD_RE.fullmatch(payload) else None
+
+
+def _telegram_invite_is_active(invite: dict) -> bool:
+    if not invite.get("enabled", True) or invite.get("accepted_at"):
+        return False
+    try:
+        expires_at = datetime.fromisoformat(str(invite["expires_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at > datetime.now(timezone.utc)
+
+
+async def _claim_telegram_invite(
+    api: TelegramAPI,
+    msg: dict,
+    payload: str,
+    load_data_fn: Callable,
+    save_data_fn: Optional[Callable],
+    lang: str,
+) -> Optional[dict]:
+    """Bind one unclaimed deep-link to the sender's immutable numeric ID."""
+    chat_id = msg["chat"]["id"]
+    if not _is_private_chat(msg.get("chat")):
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'telegram_invite_private_only')}")
+        return None
+    if not save_data_fn:
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'telegram_invite_invalid')}")
+        return None
+
+    data = load_data_fn()
+    token_hash = _telegram_invite_hash(payload)
+    invite = next(
+        (
+            item for item in data.get("telegram_invites", [])
+            if hmac.compare_digest(str(item.get("token_hash", "")), token_hash)
+        ),
+        None,
+    )
+    if not invite or not _telegram_invite_is_active(invite):
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'telegram_invite_invalid')}")
+        return None
+
+    user = next((item for item in data.get("users", []) if item.get("id") == invite.get("user_id")), None)
+    tg_id = str(msg["from"]["id"])
+    already_linked = any(
+        str(item.get("telegramId", "") or "").lstrip("@") == tg_id
+        for item in data.get("users", [])
+    )
+    if not user or not user.get("enabled", True) or user.get("telegramId") or already_linked:
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'telegram_invite_invalid')}")
+        return None
+
+    accepted_at = datetime.now(timezone.utc).isoformat()
+    user["telegramId"] = tg_id
+    invite.update({
+        "enabled": False,
+        "accepted_at": accepted_at,
+        "telegram_id": tg_id,
+        "telegram_username": msg["from"].get("username") or None,
+    })
+    data.setdefault("audit_log", []).append({
+        "id": str(uuid.uuid4()),
+        "event": "telegram_invite_accepted",
+        "created_at": accepted_at,
+        "invite_id": invite.get("id"),
+        "user_id": user.get("id"),
+        "telegram_id": tg_id,
+    })
+    save_data_fn(data)
+    await api.send_message(
+        chat_id,
+        f"✅ {_tt(lang, 'telegram_invite_linked', username=_e(user.get('username')))}",
+    )
+    return user
 
 
 def _pending_key(chat_id, from_id) -> str:
@@ -750,12 +851,29 @@ async def _refresh_server_protocol_statuses_async(server: dict) -> dict:
 # ----------------------------------------------------------------------- #
 #  /start and user connection handlers
 # ----------------------------------------------------------------------- #
-async def _handle_start(api: TelegramAPI, msg: dict, load_data_fn: Callable):
+async def _handle_start(
+    api: TelegramAPI,
+    msg: dict,
+    load_data_fn: Callable,
+    save_data_fn: Optional[Callable] = None,
+):
     chat_id = msg["chat"]["id"]
     tg_id = str(msg["from"]["id"])
     tg_username = msg["from"].get("username")
     first_name = msg["from"].get("first_name", "")
     lang = _tg_lang(msg["from"])
+
+    payload = _start_payload(msg.get("text", ""))
+    if payload:
+        panel_user = await _claim_telegram_invite(
+            api, msg, payload, load_data_fn, save_data_fn, lang
+        )
+        if not panel_user:
+            return
+        await _send_user_connections(
+            api, chat_id, panel_user, load_data_fn, first_name=first_name, lang=lang
+        )
+        return
 
     panel_user = _find_user(load_data_fn, tg_id, tg_username)
 
@@ -1675,13 +1793,13 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         tg_username = msg["from"].get("username")
         lang = _tg_lang(msg["from"])
         chat_id = msg["chat"]["id"]
-        if text.startswith(("/connections", "/connect", "/disconnect")) and not _is_private_chat(msg.get("chat")):
+        if text.startswith(("/start", "/connections", "/connect", "/disconnect")) and not _is_private_chat(msg.get("chat")):
             await _reject_non_private(api, chat_id, lang)
             return
         if await _handle_pending_input(api, msg, load_data_fn, save_data_fn, generate_vpn_link_fn, self_service_svc):
             return
         if text.startswith("/start") or text.startswith("/admin"):
-            await _handle_start(api, msg, load_data_fn)
+            await _handle_start(api, msg, load_data_fn, save_data_fn)
         elif text.startswith("/connections"):
             panel_user = _find_user(load_data_fn, str(msg["from"]["id"]), tg_username)
             if not panel_user:

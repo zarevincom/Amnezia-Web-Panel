@@ -594,5 +594,13 @@
   "stop_peer_title": "Arrêter",
   "start_peer_title": "Activer",
   "ssh_cooldown_title": "SSH cooldown (s)",
-  "ssh_cooldown_hint": "Délai initial avant reconnexion à un serveur injoignable. Ne modifiez pas si le serveur fonctionne correctement."
+  "ssh_cooldown_hint": "Délai initial avant reconnexion à un serveur injoignable. Ne modifiez pas si le serveur fonctionne correctement.",
+  "telegram_invite_title": "Invitation Telegram : {}",
+  "telegram_invite_hint": "Ce lien ouvre le bot et associe le compte Telegram de l’utilisateur à ce profil. Il est à usage unique et affiché seulement maintenant.",
+  "telegram_invite_expiry": "Valable jusqu’au",
+  "telegram_invite_link": "Lien Telegram",
+  "telegram_invite_generate": "Créer le lien",
+  "telegram_invite_replace": "Créer un nouveau lien",
+  "telegram_invite_pending": "En attente de l’association Telegram",
+  "telegram_invite_copied": "Lien d’invitation copié"
 }
