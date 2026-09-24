@@ -684,7 +684,6 @@ def _admin_main_keyboard(lang: str = "en") -> dict:
         "inline_keyboard": [
             [{"text": f"🖥 {_tt(lang, 'btn_servers')}", "callback_data": "adm:servers"}],
             [{"text": f"👤 {_tt(lang, 'btn_users')}", "callback_data": "adm:users"}],
-            [{"text": f"➕ {_tt(lang, 'btn_create_telegram_user')}", "callback_data": "adm:create_telegram_user"}],
             [{"text": f"🔐 {_tt(lang, 'btn_my_connections')}", "callback_data": "adm:myconns"}],
             [{"text": f"➕ {_tt(lang, 'btn_how_add_server')}", "callback_data": "adm:addserver_help"}],
         ]

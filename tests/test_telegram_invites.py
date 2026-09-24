@@ -159,6 +159,21 @@ class TestTelegramBotInviteIssuing:
             bot_username="panel_bot",
         )
 
+    def test_create_user_button_is_only_in_users_section(self):
+        main_actions = [
+            button["callback_data"]
+            for row in tg_bot._admin_main_keyboard("ru")["inline_keyboard"]
+            for button in row
+        ]
+        users_actions = [
+            button["callback_data"]
+            for row in tg_bot._users_keyboard(self.data, lang="ru")["inline_keyboard"]
+            for button in row
+        ]
+
+        assert "adm:create_telegram_user" not in main_actions
+        assert users_actions[0] == "adm:create_telegram_user"
+
     def test_admin_creates_named_user_and_non_expiring_invitation_in_bot(self):
         asyncio.run(self._dispatch(_callback_update(222, "adm:create_telegram_user")))
         asyncio.run(self._dispatch({
