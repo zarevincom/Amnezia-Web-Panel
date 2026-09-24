@@ -77,6 +77,7 @@
                 <select class="form-select" id="newRole" onchange="toggleNewUserPasswordReq()">
                     <option value="none" selected>{{ _('role_none_desc') }}</option>
                     <option value="user">{{ _('role_user_desc') }}</option>
+                    <option value="tg_user">{{ _('role_tg_user_desc') }}</option>
                     <option value="support">{{ _('role_support_desc') }}</option>
                     <option value="admin">{{ _('role_admin_desc') }}</option>
                 </select>
@@ -524,7 +525,7 @@
                                 ${u.username}
                                 <span class="badge badge-${u.role === 'admin' ? 'success' : (u.role === 'support' ? 'info' : (u.role === 'none' ? 'secondary' : 'warn'))}"
                                       style="font-size:0.65rem; margin-left: var(--space-xs);">
-                                    ${u.role === 'none' ? _('role_none_badge') : u.role.toUpperCase()}
+                                    ${u.role === 'none' ? _('role_none_badge') : (u.role === 'tg_user' ? _('role_tg_user_badge') : u.role.toUpperCase())}
                                 </span>
                                 <span class="badge badge-secondary" style="font-size:0.65rem; opacity: 0.7;">
                                     ${u.source}
@@ -691,13 +692,16 @@
     });
 
     function toggleNewUserPasswordReq() {
-        const needsPass = document.getElementById('newRole').value !== 'none';
+        const role = document.getElementById('newRole').value;
+        const needsPass = !['none', 'tg_user'].includes(role);
         const input = document.getElementById('newPassword');
         input.required = needsPass;
         document.getElementById('newPasswordLabel').textContent =
             needsPass ? _('password_label') : _('password_label') + ' (' + _('optional') + ')';
-        // The hint only holds for "none"; leaving it up next to a required
-        // field makes the form contradict itself.
+        document.getElementById('newPasswordHint').textContent =
+            role === 'tg_user' ? _('password_optional_tg_user') : _('password_optional_no_role');
+        // The hint only holds for password-optional roles; leaving it up next
+        // to a required field makes the form contradict itself.
         document.getElementById('newPasswordHint').style.display = needsPass ? 'none' : '';
     }
 
@@ -705,7 +709,7 @@
         e.preventDefault();
         const role = document.getElementById('newRole').value;
         const password = document.getElementById('newPassword').value;
-        if (role !== 'none' && !password) {
+        if (!['none', 'tg_user'].includes(role) && !password) {
             showToast(_('password_required_for_role'), 'error');
             return;
         }

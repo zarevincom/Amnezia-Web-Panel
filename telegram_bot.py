@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 _bot_task: Optional[asyncio.Task] = None
 _callback_refs = {}
 _pending_inputs = {}
+_vpn_help_last_reported = {}
+
+VPN_HELP_COOLDOWN_SECONDS = 60
 
 CLIENT_PROTOCOLS = {"awg", "awg2", "awg3", "awg_legacy", "xray", "telemt", "wireguard", "aivpn"}
 _EXTRA_PROTOCOL_DISPLAY_NAMES = {
@@ -94,6 +97,15 @@ TG_TRANSLATIONS = {
         "action_expired": "Action expired. Use /start again.",
         "btn_create_connection": "Create connection",
         "btn_refresh_list": "Refresh list",
+        "btn_vpn_not_working": "VPN is not working",
+        "vpn_problem_reporting": "Sending your report…",
+        "vpn_problem_received": "Your report was sent to the administrator.",
+        "vpn_problem_cooldown": "A report was already sent. Please wait a minute.",
+        "vpn_problem_admin_unavailable": "Could not contact the administrator. Please try again later.",
+        "vpn_problem_no_profiles": "• No VPN profiles are assigned",
+        "vpn_problem_profile": "• <b>{name}</b> · {protocol} · {server}\n  Observed peer IP: <code>{ip}</code>",
+        "vpn_problem_profile_no_ip": "• <b>{name}</b> · {protocol} · {server}\n  Observed peer IP: unavailable",
+        "vpn_problem_report": "⚠️ <b>VPN issue report</b>\n\nUser: <b>{username}</b>\nTelegram ID: <code>{telegram_id}</code>\n\nProfiles:\n{profiles}",
         "btn_back": "Back",
         "btn_do_not_assign": "Do not assign",
         "btn_cancel": "Cancel",
@@ -217,6 +229,15 @@ TG_TRANSLATIONS = {
         "action_expired": "Действие устарело. Используйте /start снова.",
         "btn_create_connection": "Создать подключение",
         "btn_refresh_list": "Обновить список",
+        "btn_vpn_not_working": "VPN не работает",
+        "vpn_problem_reporting": "Отправляю обращение…",
+        "vpn_problem_received": "Обращение отправлено администратору.",
+        "vpn_problem_cooldown": "Обращение уже отправлено. Подождите минуту перед повтором.",
+        "vpn_problem_admin_unavailable": "Не удалось связаться с администратором. Попробуйте позже.",
+        "vpn_problem_no_profiles": "• VPN-профили не назначены",
+        "vpn_problem_profile": "• <b>{name}</b> · {protocol} · {server}\n  Наблюдаемый IP пира: <code>{ip}</code>",
+        "vpn_problem_profile_no_ip": "• <b>{name}</b> · {protocol} · {server}\n  Наблюдаемый IP пира: недоступен",
+        "vpn_problem_report": "⚠️ <b>Обращение: VPN не работает</b>\n\nПользователь: <b>{username}</b>\nTelegram ID: <code>{telegram_id}</code>\n\nПрофили:\n{profiles}",
         "btn_back": "Назад",
         "btn_do_not_assign": "Не назначать",
         "btn_cancel": "Отмена",
@@ -624,8 +645,174 @@ def _build_connections_keyboard(conns: list, data: dict, lang: str = "en") -> di
         rows.append(row)
     if ss_enabled:
         rows.append([{"text": f"➕ {_tt(lang, 'btn_create_connection')}", "callback_data": "user_create"}])
+    rows.append([{"text": f"🆘 {_tt(lang, 'btn_vpn_not_working')}", "callback_data": "user_vpn_not_working"}])
     rows.append([{"text": f"🔄 {_tt(lang, 'btn_refresh_list')}", "callback_data": "refresh"}])
     return {"inline_keyboard": rows}
+
+
+def _support_admin_chat_ids(data: dict) -> list[str]:
+    """Return every enabled administrator bound to the bot, with alert fallback."""
+    chat_ids = []
+    for user in data.get("users", []):
+        if user.get("role") != "admin" or not user.get("enabled", True):
+            continue
+        chat_id = str(user.get("telegramId") or "").strip()
+        if chat_id and chat_id not in chat_ids:
+            chat_ids.append(chat_id)
+    if chat_ids:
+        return chat_ids
+
+    fallback = str(
+        (data.get("settings") or {}).get("alerts", {}).get("chat_id") or ""
+    ).strip()
+    return [fallback] if fallback else []
+
+
+def _endpoint_ip(endpoint) -> str:
+    """Return the host portion of a WireGuard endpoint without its UDP port."""
+    endpoint = str(endpoint or "").strip()
+    if not endpoint:
+        return ""
+    if endpoint.startswith("["):
+        host, _, _ = endpoint[1:].partition("]")
+        return host
+    host, separator, _ = endpoint.rpartition(":")
+    return host if separator and host else endpoint
+
+
+def _collect_vpn_problem_profiles(data: dict, panel_user: dict) -> list[dict]:
+    """Read observed WireGuard peer endpoints for a user's assigned profiles."""
+    connections = [
+        conn for conn in data.get("user_connections", [])
+        if conn.get("user_id") == panel_user.get("id")
+    ]
+    profiles = []
+    grouped = {}
+    servers = data.get("servers", [])
+
+    for conn in connections[:20]:
+        server_id = conn.get("server_id")
+        protocol = str(conn.get("protocol") or "")
+        server = (
+            servers[server_id]
+            if isinstance(server_id, int) and 0 <= server_id < len(servers)
+            else {}
+        )
+        profiles.append({
+            "name": conn.get("name") or "Connection",
+            "protocol": _protocol_display_name(protocol),
+            "server": server.get("name") or server.get("host") or "Unknown server",
+            "ip": "",
+        })
+        if server and protocol_base(protocol) in {"awg", "wireguard"}:
+            grouped.setdefault((server_id, protocol), []).append((len(profiles) - 1, conn))
+
+    for (server_id, protocol), items in grouped.items():
+        ssh = None
+        try:
+            ssh, manager = _get_ssh_and_manager(servers[server_id], protocol)
+            ssh.connect()
+            clients = _manager_call(manager, "get_clients", protocol) or []
+            clients_by_id = {
+                str(client.get("clientId") or client.get("client_id") or client.get("id") or ""): client
+                for client in clients
+            }
+            for profile_index, conn in items:
+                client = clients_by_id.get(str(conn.get("client_id") or ""))
+                client_data = (client or {}).get("userData") or {}
+                profiles[profile_index]["ip"] = _endpoint_ip(
+                    (client or {}).get("endpoint") or client_data.get("endpoint")
+                )
+        except Exception as exc:
+            logger.info(
+                "Telegram bot: could not collect a peer endpoint for %s/%s: %s",
+                servers[server_id].get("name") or servers[server_id].get("host"),
+                protocol,
+                exc,
+            )
+        finally:
+            if ssh:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+    return profiles
+
+
+def _vpn_problem_report_text(
+    lang: str,
+    panel_user: dict,
+    telegram_id: str,
+    profiles: list[dict],
+) -> str:
+    lines = []
+    for profile in profiles:
+        template = "vpn_problem_profile" if profile.get("ip") else "vpn_problem_profile_no_ip"
+        lines.append(_tt(
+            lang,
+            template,
+            name=_e(profile.get("name")),
+            protocol=_e(profile.get("protocol")),
+            server=_e(profile.get("server")),
+            ip=_e(profile.get("ip")),
+        ))
+    return _tt(
+        lang,
+        "vpn_problem_report",
+        username=_e(panel_user.get("username")),
+        telegram_id=_e(telegram_id),
+        profiles="\n".join(lines) if lines else _tt(lang, "vpn_problem_no_profiles"),
+    )
+
+
+async def _user_vpn_not_working(
+    api: TelegramAPI,
+    chat_id: int,
+    callback_id: str,
+    tg_id: str,
+    tg_username: Optional[str],
+    load_data_fn: Callable,
+    save_data_fn: Optional[Callable],
+    lang: str = "en",
+):
+    panel_user = _find_user(load_data_fn, tg_id, tg_username)
+    if not panel_user:
+        await api.answer_callback(callback_id, _tt(lang, "access_denied"))
+        return
+
+    user_id = str(panel_user.get("id") or tg_id)
+    now = time.monotonic()
+    if now - _vpn_help_last_reported.get(user_id, 0) < VPN_HELP_COOLDOWN_SECONDS:
+        await api.answer_callback(callback_id, _tt(lang, "vpn_problem_cooldown"))
+        return
+
+    await api.answer_callback(callback_id, _tt(lang, "vpn_problem_reporting"))
+    data = load_data_fn()
+    profiles = await asyncio.to_thread(_collect_vpn_problem_profiles, data, panel_user)
+    report = _vpn_problem_report_text(lang, panel_user, tg_id, profiles)
+    sent = 0
+    for admin_chat_id in _support_admin_chat_ids(data):
+        try:
+            await api.send_message(admin_chat_id, report)
+            sent += 1
+        except Exception as exc:
+            logger.warning("Telegram bot: could not send VPN support report: %s", exc)
+
+    if not sent:
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'vpn_problem_admin_unavailable')}")
+        return
+
+    _vpn_help_last_reported[user_id] = now
+    if save_data_fn:
+        data.setdefault("audit_log", []).append({
+            "id": str(uuid.uuid4()),
+            "event": "telegram_vpn_problem_reported",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "user_id": panel_user.get("id"),
+            "telegram_id": tg_id,
+        })
+        save_data_fn(data)
+    await api.send_message(chat_id, f"✅ {_tt(lang, 'vpn_problem_received')}")
 
 
 def _connection_lookup(data: dict, server_id: int, proto: str) -> dict:
@@ -2029,6 +2216,21 @@ async def _dispatch(
             return
         if data_str == "user_create_cancel":
             await _user_create_cancel(api, chat_id, message_id, callback_id, tg_id, tg_username, load_data_fn, lang)
+            return
+        if data_str == "user_vpn_not_working":
+            if not _is_private_chat(chat):
+                await _reject_non_private(api, chat_id, lang, callback_id)
+                return
+            await _user_vpn_not_working(
+                api,
+                chat_id,
+                callback_id,
+                tg_id,
+                tg_username,
+                load_data_fn,
+                save_data_fn,
+                lang,
+            )
             return
 
         ref = _resolve_ref(data_str)

@@ -191,7 +191,8 @@ class TestTelegramBotInviteIssuing:
         payload = messages[-1].split("?start=", 1)[1].split("</code>", 1)[0]
         copy_button = self.api.send_message.call_args.kwargs["reply_markup"]["inline_keyboard"][0][0]
 
-        assert user["role"] == "none"
+        assert user["role"] == "tg_user"
+        assert user["auth_source"] == "telegram"
         assert not user["telegramId"]
         assert invite["user_id"] == user["id"]
         assert invite["expires_at"] is None
@@ -205,6 +206,23 @@ class TestTelegramBotInviteIssuing:
             "telegram_invite_created",
         ]
         assert self.saved
+
+    def test_migrates_only_passwordless_users_referenced_by_telegram_invites(self):
+        data = {
+            "users": [
+                {"id": "telegram-user", "role": "none", "password_hash": None},
+                {"id": "manual-user", "role": "none", "password_hash": None},
+                {"id": "password-user", "role": "none", "password_hash": "hash"},
+            ],
+            "telegram_invites": [{"user_id": "telegram-user"}, {"user_id": "password-user"}],
+        }
+
+        assert panel.migrate_telegram_user_roles(data)
+        assert data["users"][0]["role"] == "tg_user"
+        assert data["users"][0]["auth_source"] == "telegram"
+        assert data["users"][1]["role"] == "none"
+        assert data["users"][2]["role"] == "none"
+        assert not panel.migrate_telegram_user_roles(data)
 
     def test_reissuing_from_an_existing_user_revokes_previous_link(self):
         first_ref = tg_bot._ref("telegram_invite_create", {"uid": "user-1"})
@@ -240,6 +258,23 @@ class TestTelegramInviteApi:
         }
         self.request = Mock()
         self.admin = {"id": "admin-1", "role": "admin"}
+
+    def test_api_allows_a_passwordless_tg_user(self):
+        request = Mock()
+        request.cookies = {"lang": "en"}
+        data = {"users": [], "servers": [], "user_connections": []}
+        with patch.object(panel, "get_current_user", return_value=self.admin), \
+             patch.object(panel, "load_data", return_value=data), \
+             patch.object(panel, "save_data") as save_data:
+            result = panel.api_add_user(
+                request,
+                panel.AddUserRequest(username="Telegram Alice", role="tg_user"),
+            )
+
+        assert result["status"] == "success"
+        assert data["users"][0]["role"] == "tg_user"
+        assert data["users"][0]["password_hash"] is None
+        save_data.assert_called_once_with(data)
 
     def test_admin_can_issue_hashed_one_time_deep_link(self):
         with patch.object(panel, "get_current_user", return_value=self.admin), \

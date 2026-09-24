@@ -599,6 +599,59 @@ class TestTelegramLocalization(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Users', keyboard_text)
 
 
+class TestVpnProblemReports(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        tg_bot._vpn_help_last_reported.clear()
+        self.data = base_data()
+        self.data['user_connections'] = [{
+            'id': 'conn-1',
+            'user_id': 'user-1',
+            'server_id': 0,
+            'protocol': 'awg',
+            'client_id': 'peer-1',
+            'name': 'Alice iPhone',
+        }]
+        self.saved = []
+        self.api = AsyncMock()
+        self.api.send_message = AsyncMock()
+        self.api.answer_callback = AsyncMock()
+
+    async def test_user_can_report_vpn_problem_with_observed_peer_ip(self):
+        update = _callback_update(111, 111, 'user_vpn_not_working')
+        profiles = [{
+            'name': 'Alice iPhone',
+            'protocol': 'AmneziaWG',
+            'server': 'Server 1',
+            'ip': '198.51.100.25',
+        }]
+        with patch.object(tg_bot, '_collect_vpn_problem_profiles', return_value=profiles):
+            await tg_bot._dispatch(
+                self.api,
+                update,
+                lambda: self.data,
+                lambda config: f'vpn://{config}',
+                lambda data: self.saved.append(copy.deepcopy(data)),
+            )
+
+        messages = [(call.args[0], call.args[1]) for call in self.api.send_message.call_args_list]
+        admin_messages = [text for chat_id, text in messages if chat_id == '222']
+        user_messages = [text for chat_id, text in messages if chat_id == 111]
+        self.assertEqual(len(admin_messages), 1)
+        self.assertIn('alice', admin_messages[0])
+        self.assertIn('198.51.100.25', admin_messages[0])
+        self.assertTrue(any('sent to the administrator' in text for text in user_messages))
+        self.assertEqual(self.data['audit_log'][-1]['event'], 'telegram_vpn_problem_reported')
+        self.assertTrue(self.saved)
+
+    async def test_problem_button_is_rejected_outside_a_private_chat(self):
+        update = _callback_update(-100, 111, 'user_vpn_not_working', chat_type='group')
+
+        await _dispatch_callback(self.api, update, lambda: self.data)
+
+        self.api.send_message.assert_awaited()
+        self.assertIn('private', self.api.send_message.call_args.args[1].lower())
+
+
 def _callback_update(chat_id, from_id, data_str, username=None, language_code=None, chat_type='private'):
     from_user = {'id': from_id}
     if username:
