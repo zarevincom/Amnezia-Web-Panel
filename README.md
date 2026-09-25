@@ -97,8 +97,9 @@ Configuration panel for system parameters and preferences:
     *   Notify users about new connections or limits.
     *   Integrated management via Telegram commands.
     *   Admin-role workflows for managing servers, protocols, users, and connections directly from Telegram.
-    *   **One-time user invitations**: create a record-only user by name or select an existing user in the Telegram bot, then forward its `t.me/<bot>?start=tg_...` link. Opening it in a private bot chat binds the sender's immutable Telegram ID to that panel user and immediately shows only that user's existing VPN profiles.
+    *   **One-time user invitations**: create a passwordless `tg_user` by name or select an existing user in the Telegram bot, then forward its `t.me/<bot>?start=tg_...` link. Opening it in a private bot chat binds the sender's immutable Telegram ID to that panel user and immediately shows only that user's existing VPN profiles.
       Invitation payloads are stored only as SHA-256 hashes, never expire automatically, are invalidated after use, and a replacement link revokes the prior pending link.
+    *   **VPN issue reports**: a user can report that VPN is not working from the bot. The panel notifies all linked administrators and, for AmneziaWG/WireGuard, includes the public peer endpoint last observed by the VPS.
       See [Telegram User Invitations](docs/telegram-user-invitations.md) for the administrator flow, API contract, and security model.
 *   **🔄 Built-in Update Checker**:
     *   View your current panel version directly in Settings.

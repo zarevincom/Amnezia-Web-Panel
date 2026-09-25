@@ -39,7 +39,7 @@ def telegram_invite_is_active(invite: dict[str, Any], now: datetime | None = Non
 
 
 def create_telegram_user(data: dict[str, Any], username: str, created_by: str) -> dict[str, Any]:
-    """Create a record-only panel user to be bound through a Telegram invite."""
+    """Create a Telegram-owned user with the same data access as ``user``."""
     clean_name = str(username or "").strip()
     if not clean_name or len(clean_name) > 80:
         raise TelegramInviteError("invalid_username")
@@ -51,7 +51,10 @@ def create_telegram_user(data: dict[str, Any], username: str, created_by: str) -
         "id": str(uuid.uuid4()),
         "username": clean_name,
         "password_hash": None,
-        "role": "none",
+        # Telegram authenticates the recipient through the one-time deep link,
+        # so this user type deliberately does not need a panel password.
+        "role": "tg_user",
+        "auth_source": "telegram",
         "telegramId": None,
         "email": None,
         "description": None,

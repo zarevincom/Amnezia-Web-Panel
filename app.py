@@ -176,6 +176,9 @@ STATE_STORE = SQLiteStateStore(
     require_encryption=os.environ.get('PANEL_REQUIRE_ENCRYPTION', '').lower() in {'1', 'true', 'yes'},
 )
 CURRENT_VERSION = "v1.6.7"
+USER_EQUIVALENT_ROLES = ('user', 'tg_user')
+PASSWORD_OPTIONAL_ROLES = ('none', 'tg_user')
+VALID_USER_ROLES = ('admin', 'support', *USER_EQUIVALENT_ROLES, 'none')
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -297,6 +300,31 @@ async def save_data_async(data):
     """Persists state under the async lock used by multi-step operations."""
     async with DATA_LOCK:
         await asyncio.to_thread(save_data, data)
+
+
+def migrate_telegram_user_roles(data: dict) -> bool:
+    """Promote passwordless users created by Telegram invitations to ``tg_user``.
+
+    A generic ``none`` account can also be linked to Telegram manually, so the
+    migration deliberately touches only passwordless users referenced by a
+    Telegram invitation. This makes the migration narrow and repeatable.
+    """
+    telegram_user_ids = {
+        invite.get('user_id')
+        for invite in data.get('telegram_invites', [])
+        if invite.get('user_id')
+    }
+    changed = False
+    for user in data.get('users', []):
+        if user.get('id') not in telegram_user_ids:
+            continue
+        if user.get('role') == 'none' and not user.get('password_hash'):
+            user['role'] = 'tg_user'
+            changed = True
+        if user.get('role') == 'tg_user' and user.get('auth_source') != 'telegram':
+            user['auth_source'] = 'telegram'
+            changed = True
+    return changed
 
 
 # Long-lived SSH connections, keyed by (host, port, username). Each command
@@ -2343,8 +2371,8 @@ class ToggleConnectionRequest(BaseModel):
 
 class AddUserRequest(BaseModel):
     username: str
-    # Password is optional: role 'none' (the default) is a record-only user
-    # who cannot log in, so no password is needed. Any real role requires one.
+    # Password is optional for a record-only user or a Telegram-authenticated
+    # user. All other roles require a password for panel login.
     password: Optional[str] = None
     role: str = 'none'
     telegramId: Optional[str] = None
@@ -2612,6 +2640,10 @@ async def startup():
         }]
         changed = True
         logger.info("Default admin created (admin / admin)")
+
+    if migrate_telegram_user_roles(data):
+        changed = True
+        logger.info("Migrated Telegram invitation users to the tg_user role")
     
     # Migration for sharing fields and traffic reset strategy
     for u in data['users']:
@@ -5503,7 +5535,7 @@ def api_get_connection_config(request: Request, server_id: int, req: ConnectionA
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         # Users can only view their own connections
-        if user['role'] in ('user', 'none'):
+        if user['role'] in (*USER_EQUIVALENT_ROLES, 'none'):
             owned = any(
                 c for c in data.get('user_connections', [])
                 if c.get('client_id') == req.client_id and c.get('server_id') == server_id and c.get('user_id') == user['id']
@@ -5745,9 +5777,9 @@ def api_add_user(request: Request, req: AddUserRequest):
         # Check duplicate
         if any(u['username'] == req.username for u in data.get('users', [])):
             return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
-        if req.role not in ('admin', 'support', 'user', 'none'):
+        if req.role not in VALID_USER_ROLES:
             return JSONResponse({'error': _t('invalid_role', lang)}, status_code=400)
-        if req.role != 'none' and not req.password:
+        if req.role not in PASSWORD_OPTIONAL_ROLES and not req.password:
             return JSONResponse({'error': _t('password_required_for_role', lang)}, status_code=400)
         new_user = {
             'id': str(uuid.uuid4()),
@@ -6054,7 +6086,7 @@ def api_get_user_connections(request: Request, user_id: str):
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     # Users can only see their own, admin/support can see all
-    if user['role'] in ('user', 'none') and user['id'] != user_id:
+    if user['role'] in (*USER_EQUIVALENT_ROLES, 'none') and user['id'] != user_id:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]

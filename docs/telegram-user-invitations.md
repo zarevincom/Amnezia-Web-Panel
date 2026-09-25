@@ -2,9 +2,11 @@
 
 Telegram invitations bind a panel user to a Telegram account without asking an
 administrator to obtain a numeric Telegram ID. The administrator creates a
-new record-only panel user by name, or selects an existing user, directly in
-the panel's Telegram bot. The bot then returns a one-time `t.me` link that the
-administrator forwards to the recipient.
+new `tg_user` by name, or selects an existing user, directly in the panel's
+Telegram bot. A `tg_user` has the same profile-level permissions as `user`,
+but has no password by default because Telegram authenticates the recipient.
+The bot then returns a one-time `t.me` link that the administrator forwards to
+the recipient.
 
 Once the recipient opens the link in a private chat, the bot binds the
 recipient's immutable Telegram ID to that panel user and displays only that
@@ -28,7 +30,7 @@ the existing long-polling connection.
 1. Open a private chat with the bot and send `/start`.
 2. Select **Create user**.
 3. Send the display name for the new panel user.
-4. The bot creates a record-only user (`role: none`) and sends the one-time
+4. The bot creates a passwordless Telegram user (`role: tg_user`) and sends the one-time
    `t.me/<bot>?start=tg_...` URL.
 5. Use **Copy invitation link** to copy it, then forward the URL to the
    recipient without opening it yourself.
@@ -58,6 +60,18 @@ not create or display invitation URLs.
 The initial response does not broadcast configurations. A recipient can only
 retrieve a configuration assigned to their own panel user.
 
+### Report a VPN issue
+
+The recipient can press **VPN is not working** in their private connection
+menu. The bot sends the report to every enabled `admin` account linked to the
+bot. If none are linked, it falls back to the configured server-alert chat.
+
+For AmneziaWG and WireGuard profiles, the report includes the public endpoint
+observed by the VPS for the most recent peer handshake. Telegram does not expose
+the sender's network IP to bots, and other protocols report the IP as
+unavailable. The observed IP is sent only to administrators and is not retained
+in the audit log.
+
 ## Security Model
 
 - Each deep-link payload is generated with `secrets.token_urlsafe(24)` and
@@ -75,9 +89,9 @@ retrieve a configuration assigned to their own panel user.
 - Invalid, used, revoked, disabled-user, and conflicting invitations receive
   the same generic bot error. The response does not reveal usernames, server
   details, profile names, or invitation state.
-- The panel writes `telegram_user_created`, `telegram_invite_created`, and
-  `telegram_invite_accepted` audit events. They contain IDs and timestamps,
-  never the raw invitation payload.
+- The panel writes `telegram_user_created`, `telegram_invite_created`,
+  `telegram_invite_accepted`, and `telegram_vpn_problem_reported` audit events.
+  They contain IDs and timestamps, never raw invitation payloads or observed IPs.
 
 ## API
 

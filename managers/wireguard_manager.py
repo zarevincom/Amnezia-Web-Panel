@@ -723,6 +723,8 @@ tail -f /dev/null
                         result[current_peer]['dataSentBytes'] = self._parse_bytes(sent)
                 elif key == 'allowed ips':
                     result[current_peer]['allowedIps'] = value
+                elif key == 'endpoint':
+                    result[current_peer]['endpoint'] = value
         return result
 
     def get_clients(self):
@@ -747,6 +749,7 @@ tail -f /dev/null
                 user_data['dataReceivedBytes'] = show_data.get('dataReceivedBytes', 0)
                 user_data['dataSentBytes'] = show_data.get('dataSentBytes', 0)
                 user_data['allowedIps'] = show_data.get('allowedIps', '')
+                user_data['endpoint'] = show_data.get('endpoint', '')
                 client['userData'] = user_data
 
         # Pick up peers from conf not in clientsTable (native app clients)
@@ -776,6 +779,7 @@ tail -f /dev/null
                         'dataReceivedBytes': show_data.get('dataReceivedBytes', 0),
                         'dataSentBytes': show_data.get('dataSentBytes', 0),
                         'allowedIps': allowed_ip,
+                        'endpoint': show_data.get('endpoint', ''),
                     }
                 })
         except Exception as e:
