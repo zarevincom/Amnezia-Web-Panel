@@ -578,6 +578,12 @@
             <div class="empty-title">{{ _('no_connections') }}</div>
             <div class="empty-desc">{{ _('no_connections_desc') }}</div>
         </div>
+        <div class="bulk-bar hidden" id="bulkBar">
+            <span class="bulk-bar__count" id="bulkBarCount"></span>
+            <button class="btn btn-secondary btn-sm" onclick="selectAllClients()">{{ _('bulk_select_all') }}</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearClientSelection()">{{ _('bulk_clear') }}</button>
+            <button class="btn btn-primary btn-sm" onclick="openBulkTransferModal()">⇄ {{ _('bulk_transfer') }}</button>
+        </div>
         <div class="clients-list" id="connectionsListInner"></div>
     </div>
 </div>
@@ -1090,6 +1096,9 @@
                 <option value="{{ u.id }}">{{ u.username }} ({{ u.role }})</option>
                 {% endfor %}
             </select>
+            <label class="check-row form-hint" id="connectionNotifyRow">
+                <input type="checkbox" id="connectionNotifyUser" checked> {{ _('notify_user_telegram') }}
+            </label>
         </div>
 
         <div id="telemtConnOptions"
@@ -1160,12 +1169,50 @@
             <select class="form-select" id="transferTargetServer"></select>
             <div class="form-hint">{{ _('transfer_protocol_hint') }}</div>
         </div>
+        <div class="form-group">
+            <label class="check-row"><input type="checkbox" id="transferNotifyUser" checked> {{ _('notify_user_telegram') }}</label>
+        </div>
         <div class="form-hint" style="margin-bottom: var(--space-md);">{{ _('transfer_warning') }}</div>
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="closeModal('transferConnectionModal')">{{ _('cancel') }}</button>
             <button class="btn btn-primary" onclick="transferConnection()" id="transferConnectionBtn">
                 <span id="transferConnectionBtnText">{{ _('transfer_connection') }}</span>
                 <div class="spinner hidden" id="transferConnectionSpinner"></div>
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Bulk Transfer Modal ===== -->
+<div class="modal-backdrop" id="bulkTransferModal">
+    <div class="modal" style="max-width: 560px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _('bulk_transfer_title') }}</h2>
+            <button class="modal-close" onclick="closeModal('bulkTransferModal')">×</button>
+        </div>
+        <div id="bulkTransferForm">
+            <p class="form-hint" id="bulkTransferSummary"></p>
+            <div class="bulk-chips" id="bulkTransferChips"></div>
+            <div class="form-group">
+                <label class="form-label" for="bulkTargetServer">{{ _('transfer_target_server') }}</label>
+                <select class="form-select" id="bulkTargetServer"></select>
+                <div class="form-hint">{{ _('transfer_protocol_hint') }}</div>
+            </div>
+            <div class="form-group">
+                <label class="check-row"><input type="checkbox" id="bulkNotifyUsers" checked> {{ _('notify_users_telegram') }}</label>
+            </div>
+            <div class="form-hint" style="margin-bottom: var(--space-md);">{{ _('bulk_transfer_hint') }}</div>
+        </div>
+        <div id="bulkTransferResults" class="hidden">
+            <p class="form-hint" id="bulkTransferResultSummary"></p>
+            <div class="bulk-results" id="bulkTransferResultList"></div>
+            <div class="form-hint" style="margin-bottom: var(--space-md);">{{ _('bulk_transfer_configs_hint') }}</div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('bulkTransferModal')" id="bulkTransferCloseBtn">{{ _('cancel') }}</button>
+            <button class="btn btn-primary" onclick="transferSelectedConnections()" id="bulkTransferBtn">
+                <span id="bulkTransferBtnText">{{ _('bulk_transfer') }}</span>
+                <div class="spinner hidden" id="bulkTransferSpinner"></div>
             </button>
         </div>
     </div>
@@ -1332,6 +1379,11 @@
     document.body.dataset.serverUid = {{ (server.uid or '') | tojson }};
     const SERVER_HOST = "{{ server.host }}";
     const TRANSFER_TARGETS = {{ transfer_targets | tojson }};
+    // Bulk-transfer selection state (declared early: loadConnections may run on load).
+    let selectedClientIds = new Set();
+    let selectionProtocol = null;
+    let clientNames = {};
+    let bulkTransferData = null;
     // These values come from the panel database, not a new SSH request. They
     // keep the screen useful while the live health check is still running.
     const SAVED_PROTOCOLS = {{ saved_protocols | tojson }};
@@ -3306,6 +3358,7 @@
             // re-rendering now would destroy it mid-typing.
             if (isPoll && !force && listEl.querySelector('.rename-editor')) return;
             loading.style.display = 'none';
+            syncClientSelection(proto, data.clients || []);
             if (!data.clients || data.clients.length === 0) {
                 listEl.innerHTML = '';
                 emptyEl.classList.remove('hidden');
@@ -3388,6 +3441,7 @@
                 if (!enabled) metaHtml += `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`;
 
                 const disabledStyle = enabled ? '' : 'opacity:0.5;';
+                const isSelected = selectedClientIds.has(client.clientId);
                 // 💡 is used for both states; the "off" look lives in CSS (.peer-toggle-off)
                 const toggleClass = enabled ? 'peer-toggle' : 'peer-toggle peer-toggle-off';
                 const toggleTitle = enabled ? _('stop_peer_title') : _('start_peer_title');
@@ -3396,8 +3450,9 @@
                 const canShowConfig = proto === 'xray' || true; // always show 📄 button
 
                 listEl.innerHTML += `
-                    <div class="client-item" style="${disabledStyle}" data-maxspeed="${maxSpeed}" data-assigned-user="${client.assigned_user_id || ''}">
+                    <div class="client-item${isSelected ? ' client-selected' : ''}" style="${disabledStyle}" data-maxspeed="${maxSpeed}" data-assigned-user="${client.assigned_user_id || ''}">
                         <div class="client-info">
+                            <input type="checkbox" class="client-select" data-client-id="${escapeHtml(client.clientId)}" ${isSelected ? 'checked' : ''} onchange="toggleClientSelection(this)" title="${_('bulk_select_connection')}" aria-label="${_('bulk_select_connection')}">
                             <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
                                 <div class="client-name">${escapeHtml(name)}${ipHtml}</div>
@@ -3479,6 +3534,7 @@
         try {
             const params = {
                 protocol: proto, name: connName, user_id: userId,
+                notify_user: document.getElementById('connectionNotifyUser').checked,
             };
             if (proto === 'telemt') {
                 params.telemt_quota = document.getElementById('telemtQuota').value || null;
@@ -3504,6 +3560,7 @@
                 closeModal('addConnectionModal');
             } else {
                 showToast(_('connection_created').replace('{}', connName), 'success');
+                showUserNotificationStatus(result.user_notification);
                 closeModal('addConnectionModal');
                 document.getElementById('connectionName').value = '';
                 if (result.config) {
@@ -3652,9 +3709,11 @@
                 protocol: transferConnectionData.protocol,
                 client_id: transferConnectionData.clientId,
                 target_server_id: targetServerId,
+                notify_user: document.getElementById('transferNotifyUser').checked,
             });
             closeModal('transferConnectionModal');
             showToast(_('connection_transferred'), 'success');
+            showUserNotificationStatus(result.user_notification);
             loadConnections();
 
             if (result.config) {
@@ -3678,6 +3737,128 @@
             button.disabled = false;
             document.getElementById('transferConnectionBtnText').textContent = _('transfer_connection');
             document.getElementById('transferConnectionSpinner').classList.add('hidden');
+        }
+    }
+
+    // ---- Multi-select + bulk transfer ----
+    // The selection lives outside the DOM so the 5s re-render keeps it; it is
+    // reset when the protocol changes and pruned of peers that disappeared.
+
+    function syncClientSelection(proto, clients) {
+        if (selectionProtocol !== proto) {
+            selectedClientIds.clear();
+            selectionProtocol = proto;
+        }
+        clientNames = {};
+        clients.forEach((client, idx) => {
+            clientNames[client.clientId] = (client.userData || {}).clientName || `Connection ${idx}`;
+        });
+        selectedClientIds.forEach((id) => { if (!(id in clientNames)) selectedClientIds.delete(id); });
+        updateBulkBar();
+    }
+
+    function updateBulkBar() {
+        const count = selectedClientIds.size;
+        document.getElementById('bulkBar').classList.toggle('hidden', count === 0);
+        document.getElementById('bulkBarCount').textContent = _('bulk_selected').replace('{}', count);
+    }
+
+    function setClientChecked(input, checked) {
+        input.checked = checked;
+        input.closest('.client-item').classList.toggle('client-selected', checked);
+        if (checked) selectedClientIds.add(input.dataset.clientId);
+        else selectedClientIds.delete(input.dataset.clientId);
+    }
+
+    function toggleClientSelection(input) {
+        setClientChecked(input, input.checked);
+        updateBulkBar();
+    }
+
+    function selectAllClients() {
+        document.querySelectorAll('#connectionsListInner .client-select').forEach((input) => setClientChecked(input, true));
+        updateBulkBar();
+    }
+
+    function clearClientSelection() {
+        document.querySelectorAll('#connectionsListInner .client-select').forEach((input) => setClientChecked(input, false));
+        selectedClientIds.clear();
+        updateBulkBar();
+    }
+
+    function openBulkTransferModal() {
+        const protocol = document.getElementById('connProtoSelect').value;
+        const targets = TRANSFER_TARGETS.filter((server) => server.protocols.includes(protocol));
+        if (!targets.length) {
+            showToast(_('transfer_no_targets'), 'info');
+            return;
+        }
+        const clientIds = [...selectedClientIds];
+        if (!clientIds.length) return;
+        bulkTransferData = {protocol, clientIds};
+        document.getElementById('bulkTransferSummary').textContent =
+            `${protocol.toUpperCase()} · ${_('bulk_selected').replace('{}', clientIds.length)}`;
+        document.getElementById('bulkTransferChips').innerHTML = clientIds.map((id) =>
+            `<span class="badge badge-info">${escapeHtml(clientNames[id] || id)}</span>`
+        ).join('');
+        document.getElementById('bulkTargetServer').innerHTML = targets.map((server) =>
+            `<option value="${server.id}">${escapeHtml(server.name)}</option>`
+        ).join('');
+        document.getElementById('bulkTransferForm').classList.remove('hidden');
+        document.getElementById('bulkTransferResults').classList.add('hidden');
+        document.getElementById('bulkTransferBtn').classList.remove('hidden');
+        document.getElementById('bulkTransferCloseBtn').textContent = _('cancel');
+        openModal('bulkTransferModal');
+    }
+
+    function renderBulkTransferResults(result) {
+        const notifyBadge = (status) => status === 'queued' ? ` · ${_('notify_badge_sent')}`
+            : status === 'no_telegram' ? ` · ${_('notify_badge_no_telegram')}`
+            : status === 'no_bot' ? ` · ${_('notify_badge_no_bot')}` : '';
+        document.getElementById('bulkTransferResultSummary').textContent = _('bulk_transfer_done')
+            .replace('{ok}', result.transferred || 0).replace('{failed}', result.failed || 0);
+        document.getElementById('bulkTransferResultList').innerHTML = (result.results || []).map((item) => `
+            <div class="bulk-result">
+                <span>${item.status === 'success' ? '✅' : '❌'} ${escapeHtml(item.name || item.client_id)}</span>
+                <span class="${item.status === 'success' ? 'text-muted' : ''}" style="${item.status === 'success' ? '' : 'color:var(--danger);'}text-align:right;">
+                    ${item.status === 'success' ? escapeHtml(notifyBadge(item.user_notification).replace(/^ · /, '')) : escapeHtml(item.error || '')}
+                </span>
+            </div>`).join('');
+        document.getElementById('bulkTransferForm').classList.add('hidden');
+        document.getElementById('bulkTransferResults').classList.remove('hidden');
+        document.getElementById('bulkTransferBtn').classList.add('hidden');
+        document.getElementById('bulkTransferCloseBtn').textContent = _('close');
+    }
+
+    async function transferSelectedConnections() {
+        if (!bulkTransferData) return;
+        const count = bulkTransferData.clientIds.length;
+        if (!confirm(_('bulk_transfer_confirm').replace('{}', count))) return;
+        const button = document.getElementById('bulkTransferBtn');
+        button.disabled = true;
+        document.getElementById('bulkTransferBtnText').textContent = _('bulk_transfer_running');
+        document.getElementById('bulkTransferSpinner').classList.remove('hidden');
+        try {
+            const result = await apiCall(`/api/servers/${SERVER_ID}/connections/transfer-bulk`, 'POST', {
+                protocol: bulkTransferData.protocol,
+                client_ids: bulkTransferData.clientIds,
+                target_server_id: Number(document.getElementById('bulkTargetServer').value),
+                notify_users: document.getElementById('bulkNotifyUsers').checked,
+            });
+            renderBulkTransferResults(result);
+            // Keep only the failures selected so a retry is one click away.
+            (result.results || []).forEach((item) => {
+                if (item.status === 'success') selectedClientIds.delete(item.client_id);
+            });
+            showToast(document.getElementById('bulkTransferResultSummary').textContent,
+                result.failed ? 'info' : 'success');
+            loadConnections(true, true);
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            button.disabled = false;
+            document.getElementById('bulkTransferBtnText').textContent = _('bulk_transfer');
+            document.getElementById('bulkTransferSpinner').classList.add('hidden');
         }
     }
 

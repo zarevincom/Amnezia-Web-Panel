@@ -232,8 +232,49 @@ class SQLiteStateStore:
             finally:
                 connection.close()
 
-    def export_database(self) -> bytes:
-        """Return a consistent SQLite snapshot, including WAL changes."""
+    def _plaintext_secret_paths(self, value: Any, path: str = "", key: str = "") -> list[str]:
+        if isinstance(value, dict):
+            return [
+                found
+                for item_key, item_value in value.items()
+                for found in self._plaintext_secret_paths(item_value, f"{path}.{item_key}" if path else item_key, item_key)
+            ]
+        if isinstance(value, list):
+            return [found for index, item in enumerate(value) for found in self._plaintext_secret_paths(item, f"{path}[{index}]", key)]
+        if isinstance(value, str) and key in _SECRET_KEYS and value and not value.startswith(_SECRET_PREFIX):
+            return [path]
+        return []
+
+    def plaintext_secret_paths(self) -> list[str]:
+        """Paths of secret fields stored unencrypted in the persisted payload.
+
+        A database created before PANEL_MASTER_KEY was configured keeps its old
+        plaintext values until they are rewritten, and export_database() copies
+        the payload verbatim.
+        """
+        self._initialise()
+        with self._lock:
+            connection = self._connect()
+            try:
+                row = connection.execute("SELECT payload FROM panel_state WHERE id = 1").fetchone()
+            finally:
+                connection.close()
+        return self._plaintext_secret_paths(json.loads(row[0])) if row else []
+
+    def reseal(self) -> None:
+        """Rewrite the stored state so every secret field is encrypted."""
+        if not self._key:
+            raise StorageError("PANEL_MASTER_KEY is required to encrypt stored secrets")
+        with self._lock:
+            self.save(self.load())
+
+    def export_database(self, compact: bool = False) -> bytes:
+        """Return a consistent SQLite snapshot, including WAL changes.
+
+        compact=True rebuilds the copy with VACUUM so free pages that still
+        hold earlier payload versions (e.g. pre-encryption plaintext) are not
+        shipped along with the current state.
+        """
         self._initialise()
         with self._lock:
             fd, snapshot_path = tempfile.mkstemp(prefix="amnezia-panel-backup-", suffix=".db")
@@ -243,6 +284,8 @@ class SQLiteStateStore:
                 destination = sqlite3.connect(snapshot_path)
                 try:
                     source.backup(destination)
+                    if compact:
+                        destination.execute("VACUUM")
                 finally:
                     destination.close()
                     source.close()

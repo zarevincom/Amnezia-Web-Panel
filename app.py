@@ -51,6 +51,8 @@ from managers.aivpn_manager import AIVPNManager
 from managers.backup_manager import BackupManager
 from storage import SQLiteStateStore, StorageError
 import telegram_bot as tg_bot
+import user_notifications
+import activity_stats
 from telegram_invite_service import (
     TelegramInviteError,
     create_telegram_invite,
@@ -1689,6 +1691,41 @@ def _audit(data: dict, event: str, **details):
     data.setdefault('audit_log', []).append({'id': str(uuid.uuid4()), 'event': event, 'created_at': datetime.now(timezone.utc).isoformat(), **details})
 
 
+def notify_user_profile(data: dict, user_id, kind: str, server: dict, protocol: str,
+                        conn_name: str, config: Optional[str], requested: bool = True) -> str:
+    """Queue delivery of an issued or moved profile to its owner's Telegram chat.
+
+    Returns the user_notifications status code for the API response; the
+    Telegram call itself runs in the background.
+    """
+    status, user = user_notifications.resolve_recipient(data, user_id, kind, requested)
+    if status != user_notifications.QUEUED:
+        return status
+    token = data['settings']['telegram']['token']
+    chat_id = str(user['telegramId']).strip().lstrip('@')
+    lang = user.get('telegram_lang') or 'ru'
+    username = user.get('username')
+    # Only what the message shows: never hand SSH credentials to the task.
+    public_server = {'name': server.get('name'), 'host': server.get('host')}
+
+    async def deliver():
+        error = None
+        try:
+            await tg_bot.send_profile_notification(
+                token, chat_id, kind=kind, server=public_server, proto=protocol, conn_name=conn_name,
+                config=config, generate_vpn_link_fn=generate_vpn_link, lang=lang,
+            )
+        except Exception as exc:
+            error = f'{username}: {exc}'
+            logger.warning('Could not deliver profile %s to user %s: %s', conn_name, user_id, exc)
+        async with DATA_LOCK:
+            current = load_data()
+            user_notifications.record_result(current, error)
+            save_data(current)
+
+    return user_notifications.QUEUED if user_notifications.schedule(deliver) else user_notifications.DISABLED
+
+
 # ===================== API tokens =====================
 
 API_TOKEN_PREFIX = 'awp_'  # "Amnezia Web Panel" — makes tokens visually distinct in logs / configs
@@ -2289,6 +2326,8 @@ class AddConnectionRequest(BaseModel):
     # AIVPN profile options
     aivpn_expiry: Optional[str] = None
     aivpn_one_time: Optional[bool] = False
+    # Push the new profile to the assigned user's Telegram chat.
+    notify_user: bool = True
 
 
 class EditConnectionRequest(BaseModel):
@@ -2315,6 +2354,15 @@ class ConnectionActionRequest(BaseModel):
 class TransferConnectionRequest(ConnectionActionRequest):
     """Move one client to a server that already runs the same protocol."""
     target_server_id: int
+    notify_user: bool = True
+
+
+class BulkTransferConnectionsRequest(BaseModel):
+    """Move several clients of one protocol to another server in one run."""
+    protocol: str = 'awg'
+    client_ids: List[str] = Field(default_factory=list)
+    target_server_id: int
+    notify_users: bool = True
 
 class RenameConnectionRequest(BaseModel):
     protocol: str = 'awg'
@@ -2355,6 +2403,7 @@ class AddUserRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    notify_user: bool = True
 
 
 
@@ -2429,6 +2478,27 @@ class NotificationRequest(BaseModel):
 
 class NotificationToggleRequest(BaseModel):
     enabled: bool
+
+
+class UserNotificationSettingsRequest(BaseModel):
+    enabled: bool = True
+    on_create: bool = True
+    on_transfer: bool = True
+
+
+class WeeklyDigestSettingsRequest(BaseModel):
+    enabled: bool = False
+    chat_id: str = ''
+    weekday: int = Field(0, ge=0, le=6)
+    hour: int = Field(10, ge=0, le=23)
+    timezone: str = 'Europe/Moscow'
+    inactive_days: int = Field(7, ge=1, le=90)
+
+
+class TelegramBackupSettingsRequest(BaseModel):
+    enabled: bool = False
+    chat_id: str = ''
+    interval_hours: int = 24
 
 
 class TelegramInviteRequest(BaseModel):
@@ -2511,6 +2581,7 @@ class AddUserConnectionRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    notify_user: bool = True
 
 
 class CreateApiTokenRequest(BaseModel):
@@ -2574,6 +2645,7 @@ def _start_conn_monitor():
 
 @app.on_event("startup")
 async def startup():
+    user_notifications.bind_loop(asyncio.get_running_loop())
     _start_conn_monitor()
     data = load_data()
     changed = False
@@ -2806,9 +2878,117 @@ async def _send_telegram_message(token: str, chat_id: str, text: str):
         raise RuntimeError(payload.get('description', 'Telegram rejected the message'))
 
 
+async def _send_telegram_document(token: str, chat_id: str, filename: str, content: bytes, caption: str):
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            f'https://api.telegram.org/bot{token}/sendDocument',
+            data={'chat_id': chat_id, 'caption': caption},
+            files={'document': (filename, content, 'application/vnd.sqlite3')},
+        )
+    payload = response.json()
+    if not response.is_success or not payload.get('ok'):
+        raise RuntimeError(payload.get('description', 'Telegram rejected the document'))
+
+
+# Retry pause after a failed scheduled digest/backup, so a broken chat ID does
+# not produce a request every scheduler tick.
+FAMILY_JOB_RETRY_SECONDS = 1800
+_family_job_failures: Dict[str, float] = {}
+
+
+async def send_weekly_digest(manual: bool = False) -> dict:
+    """Send the weekly activity digest; scheduled runs also move the baseline."""
+    data = load_data()
+    cfg = activity_stats.digest_settings(data)
+    token = data.get('settings', {}).get('telegram', {}).get('token', '')
+    chat_id = str(cfg.get('chat_id') or '').strip()
+    if not token:
+        raise ValueError('Configure the Telegram bot token first')
+    if not chat_id:
+        raise ValueError('Specify the Chat ID for the digest')
+    now = datetime.now(timezone.utc)
+    digest = activity_stats.build_digest(data, data.get('digest_state') or {}, now, int(cfg.get('inactive_days') or 7))
+    await _send_telegram_message(token, chat_id, digest['text'][:4000])
+    if not manual:
+        # A manual "send now" must not shift the weekly window.
+        async with DATA_LOCK:
+            current = load_data()
+            current['digest_state'] = {
+                'last_sent_at': now.isoformat(),
+                'baseline_at': now.isoformat(),
+                'baseline': digest['totals'],
+            }
+            save_data(current)
+    return digest
+
+
+async def send_telegram_backup() -> dict:
+    """Send a panel database snapshot to the configured Telegram chat."""
+    data = load_data()
+    cfg = activity_stats.backup_settings(data)
+    token = data.get('settings', {}).get('telegram', {}).get('token', '')
+    chat_id = str(cfg.get('chat_id') or '').strip()
+    now = datetime.now(timezone.utc)
+    error = None
+    try:
+        if not token:
+            raise ValueError('Configure the Telegram bot token first')
+        if not chat_id:
+            raise ValueError('Specify the Chat ID for backups')
+        if not STATE_STORE.key_fingerprint:
+            raise ValueError('PANEL_MASTER_KEY is not set: the backup would contain plaintext credentials')
+        # A database created before the key was set keeps plaintext secrets
+        # until rewritten; encrypt them now and verify before anything leaves.
+        if await asyncio.to_thread(STATE_STORE.plaintext_secret_paths):
+            async with DATA_LOCK:
+                await asyncio.to_thread(STATE_STORE.reseal)
+            if await asyncio.to_thread(STATE_STORE.plaintext_secret_paths):
+                raise ValueError('Stored secrets are still unencrypted; the backup was not sent')
+        snapshot = await asyncio.to_thread(STATE_STORE.export_database, True)
+        if len(snapshot) > activity_stats.TELEGRAM_DOCUMENT_LIMIT:
+            raise ValueError('The database is larger than the 50 MB Telegram limit')
+        caption = activity_stats.backup_caption(data, STATE_STORE.key_fingerprint, now)
+        await _send_telegram_document(token, chat_id, f'amnezia-panel-{now:%Y%m%d-%H%M}.db', snapshot, caption)
+    except Exception as exc:
+        error = str(exc)
+    async with DATA_LOCK:
+        current = load_data()
+        stored = current.setdefault('settings', {}).setdefault('telegram_backup', dict(activity_stats.DEFAULT_BACKUP_SETTINGS))
+        stored['last_status'] = 'error' if error else 'success'
+        stored['last_error'] = error or ''
+        if not error:
+            stored['last_sent_at'] = now.isoformat()
+        save_data(current)
+    if error:
+        raise RuntimeError(error)
+    return {'status': 'sent', 'sent_at': now.isoformat()}
+
+
+async def run_family_jobs_if_due():
+    data = load_data()
+    now = datetime.now(timezone.utc)
+    jobs = (
+        ('digest', activity_stats.digest_due(activity_stats.digest_settings(data), data.get('digest_state') or {}, now), send_weekly_digest),
+        ('backup', activity_stats.backup_due(activity_stats.backup_settings(data), now), send_telegram_backup),
+    )
+    for name, due, job in jobs:
+        if not due or time.monotonic() - _family_job_failures.get(name, -FAMILY_JOB_RETRY_SECONDS) < FAMILY_JOB_RETRY_SECONDS:
+            continue
+        try:
+            await job()
+            _family_job_failures.pop(name, None)
+        except Exception as exc:
+            _family_job_failures[name] = time.monotonic()
+            logger.warning('Scheduled %s delivery failed: %s', name, exc)
+
+
 async def notification_scheduler():
     """Deliver due notifications; their schedule remains durable in data.json."""
     while True:
+        try:
+            await run_family_jobs_if_due()
+        except Exception:
+            logger.exception('Family jobs scheduler error')
         try:
             now = datetime.now(timezone.utc)
             async with NOTIFICATION_LOCK:
@@ -3031,13 +3211,15 @@ async def periodic_background_tasks():
                     
                     # Current date/time for reset checking
                     now = datetime.now()
-                    
+                    activity_now = datetime.now(timezone.utc)
+
                     for uc_id, delta, curr_bytes in updates:
                         if uc_id in uc_map:
                             uc_map[uc_id]['last_bytes'] = curr_bytes
                             uid = uc_map[uc_id]['user_id']
                             if uid in users_map:
                                 u = users_map[uid]
+                                activity_stats.record_traffic(u, uc_map[uc_id], delta, activity_now)
                                 # Check if reset is needed BEFORE adding new consumption
                                 strategy = u.get('traffic_reset_strategy', 'never')
                                 last_reset_iso = u.get('last_reset_at')
@@ -5128,6 +5310,10 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
             }
             data['user_connections'].append(conn)
             save_data(data)
+            result['user_notification'] = notify_user_profile(
+                data, req.user_id, user_notifications.KIND_CREATED, server,
+                req.protocol, req.name, result.get('config'), req.notify_user,
+            )
 
         return result
     except Exception as e:
@@ -5163,167 +5349,355 @@ def api_remove_connection(request: Request, server_id: int, req: ConnectionActio
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
-@app.post('/api/servers/{server_id}/connections/transfer', tags=["Connections"])
-async def api_transfer_connection(request: Request, server_id: int, req: TransferConnectionRequest):
-    """Move a VPN client to another managed VPS running the same protocol.
+TRANSFERABLE_PROTOCOLS = {'awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'xray', 'telemt', 'aivpn'}
+BULK_TRANSFER_LIMIT = 100
+# Serialises transfers with each other. DATA_LOCK is only taken for the short
+# load/mutate/save steps, so remote SSH work never stalls the rest of the panel.
+TRANSFER_LOCK = asyncio.Lock()
+
+
+class TransferError(Exception):
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _client_name_taken(clients, name):
+    return any(
+        (item.get('userData') or {}).get('clientName') == name or item.get('clientName') == name
+        for item in clients
+    )
+
+
+async def _transfer_client_between(snapshot, server_id, protocol, client_id,
+                                   source_manager, source_clients, target_server, target_manager, target_clients):
+    """Recreate one client on the target, then remove it from the source.
 
     The target client is created before the source client is removed. If source
     removal fails, the new target client is removed as a rollback so the panel
-    never reports a successful move while two active profiles exist.
+    never reports a successful move while two active profiles exist. Only
+    remote state changes here; `_record_transfer` persists the result.
     """
+    source_client = next((item for item in source_clients if item.get('clientId') == client_id), None)
+    if not source_client:
+        raise TransferError('Connection was not found on the source server', 404)
+
+    source_data = source_client.get('userData') or {}
+    connection = next(
+        (
+            item for item in snapshot.get('user_connections', [])
+            if item.get('server_id') == server_id
+            and item.get('protocol') == protocol
+            and item.get('client_id') == client_id
+        ),
+        None,
+    )
+    client_name = source_data.get('clientName') or source_client.get('clientName') or (connection or {}).get('name') or client_id
+    enabled = source_client.get('enabled', source_data.get('enabled', True))
+    if _client_name_taken(target_clients, client_name):
+        raise TransferError('A connection with this name already exists on the target server', 409)
+
+    target_port = (target_server.get('protocols') or {}).get(protocol, {}).get('port', '55424')
+    base_protocol = protocol_base(protocol)
+    if base_protocol == 'wireguard':
+        result = await asyncio.to_thread(target_manager.add_client, client_name, target_server['host'])
+    elif base_protocol == 'telemt':
+        result = await asyncio.to_thread(
+            _manager_call,
+            target_manager,
+            'add_client',
+            protocol,
+            client_name,
+            target_server['host'],
+            target_port,
+            telemt_quota=source_data.get('quota'),
+            telemt_expiry=source_data.get('expiry'),
+            secret=source_data.get('token'),
+        )
+    elif base_protocol == 'aivpn':
+        result = await asyncio.to_thread(
+            _manager_call,
+            target_manager,
+            'add_client',
+            protocol,
+            client_name,
+            target_server['host'],
+            target_port,
+            expires_at=normalize_rfc3339(source_data.get('expiresAt')),
+            one_time=bool(source_data.get('oneTime')),
+        )
+    else:
+        result = await asyncio.to_thread(
+            _manager_call,
+            target_manager,
+            'add_client',
+            protocol,
+            client_name,
+            target_server['host'],
+            target_port,
+        )
+
+    if not isinstance(result, dict) or not result.get('client_id'):
+        raise RuntimeError('Target server did not return the new client identifier')
+    new_client_id = result['client_id']
+    if not enabled:
+        try:
+            await asyncio.to_thread(_manager_call, target_manager, 'toggle_client', protocol, new_client_id, False)
+        except Exception as disable_error:
+            await asyncio.to_thread(_manager_call, target_manager, 'remove_client', protocol, new_client_id)
+            raise RuntimeError('Could not preserve the disabled state of the profile') from disable_error
+
+    try:
+        await asyncio.to_thread(_manager_call, source_manager, 'remove_client', protocol, client_id)
+    except Exception as remove_error:
+        try:
+            await asyncio.to_thread(_manager_call, target_manager, 'remove_client', protocol, new_client_id)
+        except Exception:
+            logger.exception('Failed to roll back target client %s after source removal failure', new_client_id)
+        raise RuntimeError('Could not remove the source profile; the transfer was rolled back') from remove_error
+
+    # Keep later clients of the same batch from reusing this name on the target.
+    target_clients.append({'clientId': new_client_id, 'userData': {'clientName': client_name}})
+    return {
+        'source_client_id': client_id,
+        'client_id': new_client_id,
+        'name': client_name,
+        'config': result.get('config') or '',
+    }
+
+
+def _record_transfer(data, source_uid, target_uid, fallback_ids, protocol, moved):
+    """Re-point panel links at the moved client in freshly loaded state.
+
+    Server indices can shift while SSH work runs without DATA_LOCK (reorder,
+    delete), so both ends are resolved again through their stable uids.
+    Returns the ids of users whose profile moved.
+    """
+    source_id, _ = find_server_by_uid(data, source_uid)
+    target_id, _ = find_server_by_uid(data, target_uid)
+    if source_uid is None:
+        source_id = fallback_ids[0]
+    if target_uid is None:
+        target_id = fallback_ids[1]
+    user_ids = []
+    if source_id is not None and target_id is not None:
+        for item in data.get('user_connections', []):
+            if (item.get('server_id') == source_id and item.get('protocol') == protocol
+                    and item.get('client_id') == moved['source_client_id']):
+                item.update({
+                    'server_id': target_id,
+                    'client_id': moved['client_id'],
+                    'name': moved['name'],
+                    'transferred_at': datetime.now(timezone.utc).isoformat(),
+                })
+                user_ids.append(item.get('user_id'))
+    else:
+        logger.warning('Transferred client %s but a server was removed meanwhile; links left unchanged',
+                       moved['client_id'])
+    _audit(
+        data,
+        'connection_transferred',
+        source_server_id=source_id,
+        target_server_id=target_id,
+        protocol=protocol,
+        source_client_id=moved['source_client_id'],
+        target_client_id=moved['client_id'],
+        client_name=moved['name'],
+    )
+    return user_ids
+
+
+def _transfer_precheck(data, server_id, target_server_id, protocol):
+    if protocol_base(protocol) not in TRANSFERABLE_PROTOCOLS:
+        raise TransferError('This protocol does not support profile transfer')
+    if target_server_id == server_id:
+        raise TransferError('Choose a different target server')
+    if not 0 <= server_id < len(data['servers']):
+        raise TransferError('Source server not found', 404)
+    if not 0 <= target_server_id < len(data['servers']):
+        raise TransferError('Target server not found', 404)
+    if protocol not in (data['servers'][target_server_id].get('protocols') or {}):
+        raise TransferError('The selected server does not have this protocol installed')
+
+
+async def _commit_transfer(snapshot, server_id, target_server_id, protocol, moved):
+    """Persist one finished move under a short DATA_LOCK section."""
+    ends = (snapshot['servers'][server_id].get('uid'), snapshot['servers'][target_server_id].get('uid'))
+    async with DATA_LOCK:
+        data = load_data()
+        moved['user_ids'] = _record_transfer(data, *ends, (server_id, target_server_id), protocol, moved)
+        save_data(data)
+    return data
+
+
+def _notify_transferred(data, moved, target_server, protocol, requested):
+    """Send each owner of a moved profile its new configuration."""
+    statuses = [
+        notify_user_profile(data, user_id, user_notifications.KIND_TRANSFERRED, target_server,
+                            protocol, moved['name'], moved['config'], requested)
+        for user_id in moved.get('user_ids', [])
+    ]
+    if user_notifications.QUEUED in statuses:
+        return user_notifications.QUEUED
+    return statuses[0] if statuses else user_notifications.NO_USER
+
+
+async def _open_transfer_ends(source_server, target_server, protocol):
+    """Connect to both servers and read their client lists (no locks held)."""
+    source_ssh = get_ssh(source_server)
+    target_ssh = None
+    try:
+        await asyncio.to_thread(source_ssh.connect)
+        source_manager = get_protocol_manager(source_ssh, protocol)
+        source_clients = await asyncio.to_thread(_manager_call, source_manager, 'get_clients', protocol)
+        target_ssh = get_ssh(target_server)
+        await asyncio.to_thread(target_ssh.connect)
+        target_manager = get_protocol_manager(target_ssh, protocol)
+        target_clients = await asyncio.to_thread(_manager_call, target_manager, 'get_clients', protocol)
+    except Exception:
+        for ssh in (target_ssh, source_ssh):
+            if ssh:
+                await asyncio.to_thread(ssh.disconnect)
+        raise
+    return (source_ssh, source_manager, source_clients), (target_ssh, target_manager, target_clients)
+
+
+@app.post('/api/servers/{server_id}/connections/transfer', tags=["Connections"])
+async def api_transfer_connection(request: Request, server_id: int, req: TransferConnectionRequest):
+    """Move a VPN client to another managed VPS running the same protocol."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    if protocol_base(req.protocol) not in {'awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'xray', 'telemt', 'aivpn'}:
-        return JSONResponse({'error': 'This protocol does not support profile transfer'}, status_code=400)
     if not req.client_id:
         return JSONResponse({'error': 'Client ID is required'}, status_code=400)
-    if req.target_server_id == server_id:
-        return JSONResponse({'error': 'Choose a different target server'}, status_code=400)
 
-    source_ssh = None
-    target_ssh = None
-    new_client_id = None
+    ends = None
     try:
-        async with DATA_LOCK:
-            data = load_data()
-            if not 0 <= server_id < len(data['servers']):
-                return JSONResponse({'error': 'Source server not found'}, status_code=404)
-            if not 0 <= req.target_server_id < len(data['servers']):
-                return JSONResponse({'error': 'Target server not found'}, status_code=404)
-
-            source_server = data['servers'][server_id]
-            target_server = data['servers'][req.target_server_id]
-            if req.protocol not in (target_server.get('protocols') or {}):
-                return JSONResponse({'error': 'The selected server does not have this protocol installed'}, status_code=400)
-
-            source_ssh = get_ssh(source_server)
-            await asyncio.to_thread(source_ssh.connect)
-            source_manager = get_protocol_manager(source_ssh, req.protocol)
-            source_clients = await asyncio.to_thread(_manager_call, source_manager, 'get_clients', req.protocol)
-            source_client = next((item for item in source_clients if item.get('clientId') == req.client_id), None)
-            if not source_client:
-                return JSONResponse({'error': 'Connection was not found on the source server'}, status_code=404)
-
-            source_data = source_client.get('userData') or {}
-            connection = next(
-                (
-                    item for item in data.get('user_connections', [])
-                    if item.get('server_id') == server_id
-                    and item.get('protocol') == req.protocol
-                    and item.get('client_id') == req.client_id
-                ),
-                None,
+        async with TRANSFER_LOCK:
+            snapshot = load_data()
+            _transfer_precheck(snapshot, server_id, req.target_server_id, req.protocol)
+            target_server = snapshot['servers'][req.target_server_id]
+            ends = await _open_transfer_ends(snapshot['servers'][server_id], target_server, req.protocol)
+            (_, source_manager, source_clients), (_, target_manager, target_clients) = ends
+            moved = await _transfer_client_between(
+                snapshot, server_id, req.protocol, req.client_id,
+                source_manager, source_clients, target_server, target_manager, target_clients,
             )
-            client_name = source_data.get('clientName') or source_client.get('clientName') or (connection or {}).get('name') or req.client_id
-            enabled = source_client.get('enabled', source_data.get('enabled', True))
-
-            target_ssh = get_ssh(target_server)
-            await asyncio.to_thread(target_ssh.connect)
-            target_manager = get_protocol_manager(target_ssh, req.protocol)
-            target_clients = await asyncio.to_thread(_manager_call, target_manager, 'get_clients', req.protocol)
-            if any(
-                (item.get('userData') or {}).get('clientName') == client_name
-                or item.get('clientName') == client_name
-                for item in target_clients
-            ):
-                return JSONResponse({'error': 'A connection with this name already exists on the target server'}, status_code=409)
-
-            target_port = (target_server.get('protocols') or {}).get(req.protocol, {}).get('port', '55424')
-            base_protocol = protocol_base(req.protocol)
-            if base_protocol == 'wireguard':
-                result = await asyncio.to_thread(target_manager.add_client, client_name, target_server['host'])
-            elif base_protocol == 'telemt':
-                result = await asyncio.to_thread(
-                    _manager_call,
-                    target_manager,
-                    'add_client',
-                    req.protocol,
-                    client_name,
-                    target_server['host'],
-                    target_port,
-                    telemt_quota=source_data.get('quota'),
-                    telemt_expiry=source_data.get('expiry'),
-                    secret=source_data.get('token'),
-                )
-            elif base_protocol == 'aivpn':
-                result = await asyncio.to_thread(
-                    _manager_call,
-                    target_manager,
-                    'add_client',
-                    req.protocol,
-                    client_name,
-                    target_server['host'],
-                    target_port,
-                    expires_at=normalize_rfc3339(source_data.get('expiresAt')),
-                    one_time=bool(source_data.get('oneTime')),
-                )
-            else:
-                result = await asyncio.to_thread(
-                    _manager_call,
-                    target_manager,
-                    'add_client',
-                    req.protocol,
-                    client_name,
-                    target_server['host'],
-                    target_port,
-                )
-
-            if not isinstance(result, dict) or not result.get('client_id'):
-                raise RuntimeError('Target server did not return the new client identifier')
-            new_client_id = result['client_id']
-            if not enabled:
-                try:
-                    await asyncio.to_thread(_manager_call, target_manager, 'toggle_client', req.protocol, new_client_id, False)
-                except Exception as disable_error:
-                    await asyncio.to_thread(_manager_call, target_manager, 'remove_client', req.protocol, new_client_id)
-                    raise RuntimeError('Could not preserve the disabled state of the profile') from disable_error
-
-            try:
-                await asyncio.to_thread(_manager_call, source_manager, 'remove_client', req.protocol, req.client_id)
-            except Exception as remove_error:
-                try:
-                    await asyncio.to_thread(_manager_call, target_manager, 'remove_client', req.protocol, new_client_id)
-                except Exception:
-                    logger.exception('Failed to roll back target client %s after source removal failure', new_client_id)
-                raise RuntimeError('Could not remove the source profile; the transfer was rolled back') from remove_error
-
-            for item in data.get('user_connections', []):
-                if (item.get('server_id') == server_id and item.get('protocol') == req.protocol
-                        and item.get('client_id') == req.client_id):
-                    item.update({
-                        'server_id': req.target_server_id,
-                        'client_id': new_client_id,
-                        'name': client_name,
-                        'transferred_at': datetime.now(timezone.utc).isoformat(),
-                    })
-            _audit(
-                data,
-                'connection_transferred',
-                source_server_id=server_id,
-                target_server_id=req.target_server_id,
-                protocol=req.protocol,
-                source_client_id=req.client_id,
-                target_client_id=new_client_id,
-                client_name=client_name,
-            )
-            save_data(data)
-            config = result.get('config') or ''
-            return {
-                'status': 'success',
-                'client_id': new_client_id,
-                'server_id': req.target_server_id,
-                'name': client_name,
-                'config': config or '',
-                'vpn_link': generate_vpn_link(config) if config else '',
-            }
+            data = await _commit_transfer(snapshot, server_id, req.target_server_id, req.protocol, moved)
+        config = moved['config']
+        return {
+            'status': 'success',
+            'client_id': moved['client_id'],
+            'server_id': req.target_server_id,
+            'name': moved['name'],
+            'config': config,
+            'vpn_link': generate_vpn_link(config) if config else '',
+            'user_notification': _notify_transferred(data, moved, target_server, req.protocol, req.notify_user),
+        }
+    except TransferError as e:
+        return JSONResponse({'error': str(e)}, status_code=e.status_code)
     except Exception as e:
         logger.exception('Error transferring connection')
         return JSONResponse({'error': str(e)}, status_code=500)
     finally:
-        if target_ssh:
-            await asyncio.to_thread(target_ssh.disconnect)
-        if source_ssh:
-            await asyncio.to_thread(source_ssh.disconnect)
+        if ends:
+            for ssh, _, _ in reversed(ends):
+                await asyncio.to_thread(ssh.disconnect)
+
+
+@app.post('/api/servers/{server_id}/connections/transfer-bulk', tags=["Connections"])
+async def api_transfer_connections_bulk(request: Request, server_id: int, req: BulkTransferConnectionsRequest):
+    """Move the selected clients of one protocol to another managed VPS.
+
+    Every client is moved with the same create-then-remove guarantee as a
+    single transfer. A failure affects only that client; progress is saved
+    after each successful move so a crash never loses completed work.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    client_ids = list(dict.fromkeys(cid for cid in req.client_ids if cid))
+    if not client_ids:
+        return JSONResponse({'error': 'Select at least one connection'}, status_code=400)
+    if len(client_ids) > BULK_TRANSFER_LIMIT:
+        return JSONResponse({'error': f'At most {BULK_TRANSFER_LIMIT} connections can be moved at once'}, status_code=400)
+
+    ends = None
+    results = []
+    try:
+        async with TRANSFER_LOCK:
+            snapshot = load_data()
+            _transfer_precheck(snapshot, server_id, req.target_server_id, req.protocol)
+            target_server = snapshot['servers'][req.target_server_id]
+            ends = await _open_transfer_ends(snapshot['servers'][server_id], target_server, req.protocol)
+            (_, source_manager, source_clients), (_, target_manager, target_clients) = ends
+
+            names = {
+                item.get('clientId'): (item.get('userData') or {}).get('clientName') or item.get('clientName') or item.get('clientId')
+                for item in source_clients
+            }
+            moved_items = []
+            data = snapshot
+            for client_id in client_ids:
+                try:
+                    moved = await _transfer_client_between(
+                        snapshot, server_id, req.protocol, client_id,
+                        source_manager, source_clients, target_server, target_manager, target_clients,
+                    )
+                except Exception as e:
+                    if not isinstance(e, TransferError):
+                        logger.exception('Bulk transfer of client %s failed', client_id)
+                    results.append({
+                        'client_id': client_id,
+                        'name': names.get(client_id, client_id),
+                        'status': 'error',
+                        'error': str(e),
+                    })
+                    continue
+                data = await _commit_transfer(snapshot, server_id, req.target_server_id, req.protocol, moved)
+                moved_items.append(moved)
+                results.append({
+                    'client_id': client_id,
+                    'name': moved['name'],
+                    'status': 'success',
+                    'new_client_id': moved['client_id'],
+                })
+
+            transferred = len(moved_items)
+            async with DATA_LOCK:
+                data = load_data()
+                _audit(
+                    data,
+                    'connections_bulk_transferred',
+                    source_server_id=server_id,
+                    target_server_id=req.target_server_id,
+                    protocol=req.protocol,
+                    requested=len(client_ids),
+                    transferred=transferred,
+                )
+                save_data(data)
+
+        notified = iter([
+            _notify_transferred(data, moved, target_server, req.protocol, req.notify_users)
+            for moved in moved_items
+        ])
+        for item in results:
+            if item['status'] == 'success':
+                item['user_notification'] = next(notified)
+        failed = len(results) - transferred
+        return {
+            'status': 'success' if not failed else ('partial' if transferred else 'error'),
+            'transferred': transferred,
+            'failed': failed,
+            'results': results,
+        }
+    except TransferError as e:
+        return JSONResponse({'error': str(e)}, status_code=e.status_code)
+    except Exception as e:
+        logger.exception('Error in bulk connection transfer')
+        return JSONResponse({'error': str(e), 'results': results}, status_code=500)
+    finally:
+        if ends:
+            for ssh, _, _ in reversed(ends):
+                await asyncio.to_thread(ssh.disconnect)
 
 
 @app.post('/api/servers/{server_id}/connections/edit', tags=["Connections"])
@@ -5782,6 +6156,10 @@ def api_add_user(request: Request, req: AddUserRequest):
                     if conn_result.get('config'):
                         result['config'] = conn_result['config']
                         result.update(config_payloads(conn_result['config'], server, req.protocol))
+                    result['user_notification'] = notify_user_profile(
+                        data, new_user['id'], user_notifications.KIND_CREATED, server,
+                        req.protocol, conn_name, conn_result.get('config'), req.notify_user,
+                    )
         return result
     except Exception as e:
         logger.exception("Error adding user")
@@ -5980,6 +6358,11 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
         if result.get('config'):
             resp['config'] = result['config']
             resp.update(config_payloads(result['config'], server, req.protocol))
+        if result.get('client_id'):
+            kind = user_notifications.KIND_ASSIGNED if req.client_id else user_notifications.KIND_CREATED
+            resp['user_notification'] = notify_user_profile(
+                data, user_id, kind, server, req.protocol, req.name, result.get('config'), req.notify_user,
+            )
         return resp
     except Exception as e:
         logger.exception("Error adding user connection")
@@ -6412,6 +6795,93 @@ async def api_delete_notification(notification_id: str, request: Request):
             return JSONResponse({'error': 'Notification not found'}, status_code=404)
         save_data(data)
     return {'status': 'deleted'}
+
+
+@app.get('/api/notifications/family', tags=["Notifications"])
+async def api_family_notification_settings(request: Request):
+    """Profile delivery, weekly digest and Telegram backup settings with status."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    settings = data.get('settings', {})
+    digest = activity_stats.digest_settings(data)
+    digest['last_sent_at'] = (data.get('digest_state') or {}).get('last_sent_at')
+    return {
+        'user_notifications': user_notifications.settings(data),
+        'weekly_digest': digest,
+        'telegram_backup': activity_stats.backup_settings(data),
+        'master_key_set': bool(STATE_STORE.key_fingerprint),
+        'bot_configured': bool(settings.get('telegram', {}).get('token')),
+        'alerts_chat_id': settings.get('alerts', {}).get('chat_id', ''),
+    }
+
+
+@app.post('/api/notifications/user-profiles', tags=["Notifications"])
+async def api_save_user_notification_settings(request: Request, payload: UserNotificationSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    async with DATA_LOCK:
+        data = load_data()
+        stored = data.setdefault('settings', {}).setdefault('user_notifications', {})
+        stored.update(payload.dict())
+        save_data(data)
+    return user_notifications.settings(data)
+
+
+@app.post('/api/notifications/digest', tags=["Notifications"])
+async def api_save_digest_settings(request: Request, payload: WeeklyDigestSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        ZoneInfo(payload.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return JSONResponse({'error': 'Unknown timezone'}, status_code=400)
+    if payload.enabled and not payload.chat_id.strip():
+        return JSONResponse({'error': 'Specify the Chat ID for the digest'}, status_code=400)
+    async with DATA_LOCK:
+        data = load_data()
+        data.setdefault('settings', {})['weekly_digest'] = {**payload.dict(), 'chat_id': payload.chat_id.strip()}
+        save_data(data)
+    return activity_stats.digest_settings(data)
+
+
+@app.post('/api/notifications/digest/send', tags=["Notifications"])
+async def api_send_digest_now(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        digest = await send_weekly_digest(manual=True)
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    return {'status': 'sent', 'text': digest['text']}
+
+
+@app.post('/api/notifications/telegram-backup', tags=["Notifications"])
+async def api_save_telegram_backup_settings(request: Request, payload: TelegramBackupSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if payload.interval_hours not in activity_stats.BACKUP_INTERVALS:
+        return JSONResponse({'error': 'Unsupported backup interval'}, status_code=400)
+    if payload.enabled and not payload.chat_id.strip():
+        return JSONResponse({'error': 'Specify the Chat ID for backups'}, status_code=400)
+    if payload.enabled and not STATE_STORE.key_fingerprint:
+        return JSONResponse({'error': 'Set PANEL_MASTER_KEY first: without it the backup contains plaintext credentials'}, status_code=400)
+    async with DATA_LOCK:
+        data = load_data()
+        stored = data.setdefault('settings', {}).setdefault('telegram_backup', dict(activity_stats.DEFAULT_BACKUP_SETTINGS))
+        stored.update({**payload.dict(), 'chat_id': payload.chat_id.strip()})
+        save_data(data)
+    return activity_stats.backup_settings(data)
+
+
+@app.post('/api/notifications/telegram-backup/send', tags=["Notifications"])
+async def api_send_telegram_backup_now(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await send_telegram_backup()
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
 
 
 @app.get('/api/settings', tags=["Settings"])
