@@ -1692,6 +1692,24 @@ def _find_invite(data: dict, token: str):
     return next((i for i in data.get('invites', []) if secrets.compare_digest(i.get('token_hash', ''), _invite_hash(token))), None)
 
 
+def _claim_owner_session_key(token: str) -> str:
+    """Return the per-invitation session key holding the anonymous claim owner."""
+    return 'claim_owner_' + _invite_hash(token)
+
+
+def _claim_owner_id(request: Request, token: str) -> Optional[str]:
+    """Read the opaque owner identifier created when this browser claimed access."""
+    owner_id = request.session.get(_claim_owner_session_key(token))
+    return owner_id if isinstance(owner_id, str) and owner_id else None
+
+
+def _claim_belongs_to_owner(claim: dict, owner_id: Optional[str]) -> bool:
+    """Compare anonymous owner identifiers without leaking a partial match."""
+    if not owner_id:
+        return False
+    return secrets.compare_digest(str(claim.get('owner_id') or ''), owner_id)
+
+
 def _audit(data: dict, event: str, **details):
     data.setdefault('audit_log', []).append({'id': str(uuid.uuid4()), 'event': event, 'created_at': datetime.now(timezone.utc).isoformat(), **details})
 
@@ -6468,8 +6486,8 @@ async def api_claim(token: str, payload: ClaimRequest, request: Request):
     try: client_id,config=await _create_invite_profile(data,invite,name)
     except Exception:
         logger.exception('Invite profile creation failed'); return _public_error('Profile could not be created')
-    owner_key = 'claim_owner_' + _invite_hash(token)
-    owner_id = request.session.get(owner_key) or secrets.token_urlsafe(24)
+    owner_key = _claim_owner_session_key(token)
+    owner_id = _claim_owner_id(request, token) or secrets.token_urlsafe(24)
     request.session[owner_key] = owner_id
     guest = _ensure_invite_guest(data, owner_id)
     claim={'id':str(uuid.uuid4()),'invite_id':invite['id'],'owner_id':owner_id,'client_id':client_id,'device_name':name,'server_id':invite['server_id'],'protocol':invite['protocol'],'reissues':0,'last_reissue_at':None,'created_at':datetime.now(timezone.utc).isoformat(),'last_ip':request.client.host if request.client else ''}
@@ -6483,11 +6501,12 @@ async def api_claim(token: str, payload: ClaimRequest, request: Request):
 @app.get('/api/claim/{token}/profiles', tags=["Invites"])
 async def api_claim_profiles(token: str, request: Request):
     data = load_data(); invite = _find_invite(data, token)
-    if not invite or not invite.get('enabled'):
+    owner_id = _claim_owner_id(request, token)
+    if not invite or not invite.get('enabled') or not owner_id:
         return {'profiles': []}
     profiles = []
     for claim in data.get('invite_claims', []):
-        if claim.get('invite_id') != invite['id']:
+        if claim.get('invite_id') != invite['id'] or not _claim_belongs_to_owner(claim, owner_id):
             continue
         try:
             server = data['servers'][claim['server_id']]
@@ -6507,7 +6526,10 @@ async def api_claim_profiles(token: str, request: Request):
 async def api_reissue_claim(token: str, claim_id: str, payload: ClaimRequest, request: Request):
     if not _claim_rate_allowed(request, token): return _public_error('Too many attempts')
     data=load_data(); invite=_find_invite(data,token); claim=next((c for c in data.get('invite_claims',[]) if c['id']==claim_id),None)
-    if not invite or not claim or claim.get('invite_id') != invite['id'] or not invite.get('enabled'): return _public_error()
+    owner_id = _claim_owner_id(request, token)
+    if (not invite or not claim or claim.get('invite_id') != invite['id']
+            or not _claim_belongs_to_owner(claim, owner_id) or not invite.get('enabled')):
+        return _public_error()
     if claim.get('reissues',0) >= invite.get('max_reissues',0): return _public_error('Reissue limit reached')
     if claim.get('last_reissue_at'):
         last=datetime.fromisoformat(claim['last_reissue_at'])
