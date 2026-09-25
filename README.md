@@ -253,6 +253,11 @@ Docker Compose additionally reads these from your shell or from an `.env` file n
 
 ## 🔧 Project Details
 
+### Product Overview
+
+For a Russian-language product overview with workflows, security boundaries and
+operational examples, see [Amnezia Web Panel: product overview](docs/product-overview.md).
+
 ### API Documentation
 
 The project includes self-documenting API endpoints, organised into clear tag groups:
