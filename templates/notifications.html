@@ -16,6 +16,49 @@
     <button class="btn btn-secondary" type="submit">Сохранить системные тревоги</button>
   </form>
 </div>
+<div id="familyWarnings"></div>
+<div class="grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:var(--space-lg);align-items:start;margin-bottom:var(--space-lg);">
+  <div class="card">
+    <h3 class="card-title">📨 Профили пользователям</h3>
+    <p class="form-hint">Когда администратор создаёт, назначает или переносит профиль, бот присылает владельцу новую конфигурацию. Нужен привязанный Telegram у пользователя.</p>
+    <form id="profileNotifyForm" onsubmit="saveProfileNotify(event)">
+      <div class="form-group"><label class="check-row"><input type="checkbox" id="pnEnabled"> Отправлять профили пользователям</label></div>
+      <div class="form-group"><label class="check-row"><input type="checkbox" id="pnOnCreate"> При создании и назначении профиля</label></div>
+      <div class="form-group"><label class="check-row"><input type="checkbox" id="pnOnTransfer"> При переносе профиля на другой VPS</label></div>
+      <div id="pnStatus" class="form-hint"></div>
+      <button class="btn btn-secondary" type="submit">Сохранить</button>
+    </form>
+  </div>
+  <div class="card">
+    <h3 class="card-title">📊 Еженедельная сводка</h3>
+    <p class="form-hint">Трафик каждого пользователя за неделю и список тех, кто давно не подключался. Активность считается по трафику и собирается раз в 10 минут.</p>
+    <form id="digestForm" onsubmit="saveDigest(event)">
+      <div class="form-group"><label class="check-row"><input type="checkbox" id="dgEnabled"> Присылать сводку</label></div>
+      <div class="form-group"><label class="form-label">Chat ID</label><input id="dgChatId" class="form-input" placeholder="Как у системных тревог"></div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">День</label><select id="dgWeekday" class="form-input"><option value="0">Понедельник</option><option value="1">Вторник</option><option value="2">Среда</option><option value="3">Четверг</option><option value="4">Пятница</option><option value="5">Суббота</option><option value="6">Воскресенье</option></select></div>
+        <div class="form-group"><label class="form-label">Час</label><input id="dgHour" type="number" min="0" max="23" class="form-input" value="10"></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Часовой пояс</label><input id="dgTimezone" class="form-input" value="Europe/Moscow"></div>
+        <div class="form-group"><label class="form-label">Порог неактивности, дней</label><input id="dgInactive" type="number" min="1" max="90" class="form-input" value="7"></div>
+      </div>
+      <div id="dgStatus" class="form-hint"></div>
+      <div style="display:flex;gap:var(--space-sm);flex-wrap:wrap;"><button class="btn btn-secondary" type="submit">Сохранить</button><button class="btn btn-secondary" type="button" id="dgSendBtn" onclick="sendDigestNow()">Отправить сейчас</button></div>
+    </form>
+  </div>
+  <div class="card">
+    <h3 class="card-title">💾 Бэкап в Telegram</h3>
+    <p class="form-hint">Снимок базы панели регулярно уходит в Telegram и хранится вне VPS. Восстановление: «Настройки» → «Восстановить», с тем же <code>PANEL_MASTER_KEY</code>.</p>
+    <form id="tgBackupForm" onsubmit="saveTgBackup(event)">
+      <div class="form-group"><label class="check-row"><input type="checkbox" id="bkEnabled"> Отправлять бэкап</label></div>
+      <div class="form-group"><label class="form-label">Chat ID</label><input id="bkChatId" class="form-input" placeholder="Ваш личный Chat ID"></div>
+      <div class="form-group"><label class="form-label">Как часто</label><select id="bkInterval" class="form-input"><option value="24">Каждый день</option><option value="168">Каждую неделю</option></select></div>
+      <div id="bkStatus" class="form-hint"></div>
+      <div style="display:flex;gap:var(--space-sm);flex-wrap:wrap;"><button class="btn btn-secondary" type="submit">Сохранить</button><button class="btn btn-secondary" type="button" id="bkSendBtn" onclick="sendBackupNow()">Отправить сейчас</button></div>
+    </form>
+  </div>
+</div>
 <div class="grid" style="display:grid;grid-template-columns:minmax(300px,430px) 1fr;gap:var(--space-lg);align-items:start;">
   <div class="card">
     <h3 class="card-title">Новое уведомление</h3>
@@ -51,6 +94,33 @@ async function createNotification(event) { event.preventDefault(); const res=awa
 async function sendTest(){ const res=await fetch('/api/notifications/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(form())}); const data=await res.json(); showToast(res.ok?'Тестовое сообщение отправлено':(data.error||'Ошибка'),res.ok?'success':'error'); }
 async function toggleNotification(id,enabled){ await fetch(`/api/notifications/${id}/toggle`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})}); loadNotifications(); }
 async function deleteNotification(id){ if(!confirm('Удалить уведомление?'))return; await fetch(`/api/notifications/${id}`,{method:'DELETE'}); loadNotifications(); }
-runAt.value = new Date(Date.now()+5*60000).toISOString().slice(0,16); loadNotifications(); loadAlerts();
+const postJson = (url, body) => fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined});
+const statusLine = (label, at, error) => {
+  const parts = [];
+  if (at) parts.push(`${label}: ${formatTime(at)}`);
+  if (error) parts.push(`<span style="color:var(--danger);">Ошибка: ${escapeHtml(error)}</span>`);
+  return parts.join(' · ');
+};
+async function loadFamily() {
+  const r = await fetch('/api/notifications/family'); if (!r.ok) return; const f = await r.json();
+  const pn = f.user_notifications, dg = f.weekly_digest, bk = f.telegram_backup;
+  pnEnabled.checked = !!pn.enabled; pnOnCreate.checked = !!pn.on_create; pnOnTransfer.checked = !!pn.on_transfer;
+  pnStatus.innerHTML = statusLine('Последняя отправка', pn.last_attempt_at, pn.last_error);
+  dgEnabled.checked = !!dg.enabled; dgChatId.value = dg.chat_id || ''; dgChatId.placeholder = f.alerts_chat_id || 'Например: 123456789';
+  dgWeekday.value = String(dg.weekday ?? 0); dgHour.value = dg.hour ?? 10; dgTimezone.value = dg.timezone || 'Europe/Moscow'; dgInactive.value = dg.inactive_days || 7;
+  dgStatus.innerHTML = statusLine('Последняя сводка', dg.last_sent_at, '');
+  bkEnabled.checked = !!bk.enabled; bkChatId.value = bk.chat_id || ''; bkInterval.value = String(bk.interval_hours || 24);
+  bkStatus.innerHTML = statusLine('Последний бэкап', bk.last_sent_at, bk.last_status === 'error' ? bk.last_error : '');
+  const warnings = [];
+  if (!f.bot_configured) warnings.push('Токен Telegram-бота не задан: сообщения не будут отправляться. Укажите его в настройках.');
+  if (!f.master_key_set) { warnings.push('<code>PANEL_MASTER_KEY</code> не задан: без него бэкап содержал бы открытые SSH-пароли, поэтому отправка бэкапа в Telegram недоступна.'); bkEnabled.disabled = true; bkSendBtn.disabled = true; }
+  familyWarnings.innerHTML = warnings.map(w => `<div class="card" style="margin-bottom:var(--space-lg);border-color:var(--warning);"><span style="color:var(--warning);">⚠️</span> ${w}</div>`).join('');
+}
+async function saveProfileNotify(e) { e.preventDefault(); const r = await postJson('/api/notifications/user-profiles', {enabled: pnEnabled.checked, on_create: pnOnCreate.checked, on_transfer: pnOnTransfer.checked}); const d = await r.json(); showToast(r.ok ? 'Настройки сохранены' : (d.error || 'Ошибка'), r.ok ? 'success' : 'error'); }
+async function saveDigest(e) { e.preventDefault(); const r = await postJson('/api/notifications/digest', {enabled: dgEnabled.checked, chat_id: dgChatId.value.trim(), weekday: parseInt(dgWeekday.value), hour: parseInt(dgHour.value) || 0, timezone: dgTimezone.value.trim(), inactive_days: parseInt(dgInactive.value) || 7}); const d = await r.json(); showToast(r.ok ? 'Сводка настроена' : (d.error || 'Ошибка'), r.ok ? 'success' : 'error'); }
+async function sendDigestNow() { dgSendBtn.disabled = true; try { const r = await postJson('/api/notifications/digest/send'); const d = await r.json(); showToast(r.ok ? 'Сводка отправлена' : (d.error || 'Ошибка'), r.ok ? 'success' : 'error'); } finally { dgSendBtn.disabled = false; } }
+async function saveTgBackup(e) { e.preventDefault(); const r = await postJson('/api/notifications/telegram-backup', {enabled: bkEnabled.checked, chat_id: bkChatId.value.trim(), interval_hours: parseInt(bkInterval.value)}); const d = await r.json(); showToast(r.ok ? 'Бэкап настроен' : (d.error || 'Ошибка'), r.ok ? 'success' : 'error'); }
+async function sendBackupNow() { bkSendBtn.disabled = true; try { const r = await postJson('/api/notifications/telegram-backup/send'); const d = await r.json(); showToast(r.ok ? 'Бэкап отправлен' : (d.error || 'Ошибка'), r.ok ? 'success' : 'error'); } finally { bkSendBtn.disabled = false; loadFamily(); } }
+runAt.value = new Date(Date.now()+5*60000).toISOString().slice(0,16); loadNotifications(); loadAlerts(); loadFamily();
 </script>
 {% endblock %}

@@ -26,6 +26,7 @@ from connection_service import (
     self_service_protocol_display_name,
     server_self_service_protocols,
 )
+import user_notifications
 from telegram_invite_service import (
     TELEGRAM_INVITE_PREFIX,
     TelegramInviteError,
@@ -191,6 +192,24 @@ TG_TRANSLATIONS = {
         "tg_id_label": "Telegram ID",
         "description_label": "Description",
         "protocol_display": "Protocol",
+        "profile_notify_created": "🆕 Your administrator issued a new VPN profile for you: <b>{name}</b>.\nImport it into the app using the configuration below.",
+        "profile_notify_assigned": "🔗 A VPN profile was added to your account: <b>{name}</b>.\nImport it into the app using the configuration below.",
+        "profile_notify_transferred": "🔄 Your VPN profile <b>{name}</b> was moved to a new server.\nThe old configuration no longer works — replace it with the one below.",
+        "profile_notify_no_config": "Open /connections and tap the profile to get its configuration.",
+        "btn_my_stats": "My statistics",
+        "stats_title": "Statistics for <b>{username}</b>",
+        "stats_month": "This month",
+        "stats_total": "Total",
+        "stats_limit": "Limit",
+        "stats_left": "left",
+        "stats_expires": "Access until",
+        "stats_profiles": "Profiles",
+        "stats_last_active": "last active",
+        "stats_no_activity": "no activity yet",
+        "stats_today": "today",
+        "stats_days_ago": "{days} d ago",
+        "profile_sent_to_user": "The profile was sent to the user in Telegram.",
+        "profile_send_failed": "Could not send the profile to the user",
     },
     "ru": {
         "hi": "Привет",
@@ -323,6 +342,24 @@ TG_TRANSLATIONS = {
         "tg_id_label": "Telegram ID",
         "description_label": "Описание",
         "protocol_display": "Протокол",
+        "profile_notify_created": "🆕 Администратор выдал вам новый VPN-профиль: <b>{name}</b>.\nИмпортируйте его в приложение с помощью конфигурации ниже.",
+        "profile_notify_assigned": "🔗 К вашему аккаунту добавлен VPN-профиль: <b>{name}</b>.\nИмпортируйте его в приложение с помощью конфигурации ниже.",
+        "profile_notify_transferred": "🔄 Ваш VPN-профиль <b>{name}</b> перенесён на новый сервер.\nСтарая конфигурация больше не работает — замените её на новую ниже.",
+        "profile_notify_no_config": "Откройте /connections и нажмите на профиль, чтобы получить конфигурацию.",
+        "btn_my_stats": "Моя статистика",
+        "stats_title": "Статистика <b>{username}</b>",
+        "stats_month": "За этот месяц",
+        "stats_total": "Всего",
+        "stats_limit": "Лимит",
+        "stats_left": "осталось",
+        "stats_expires": "Доступ до",
+        "stats_profiles": "Профили",
+        "stats_last_active": "активность",
+        "stats_no_activity": "активности пока не было",
+        "stats_today": "сегодня",
+        "stats_days_ago": "{days} дн. назад",
+        "profile_sent_to_user": "Профиль отправлен пользователю в Telegram.",
+        "profile_send_failed": "Не удалось отправить профиль пользователю",
     },
 }
 
@@ -521,6 +558,8 @@ async def _claim_telegram_invite(
 
     accepted_at = datetime.now(timezone.utc).isoformat()
     user["telegramId"] = tg_id
+    # Profiles pushed later by the panel are written in this language.
+    user["telegram_lang"] = lang
     invite.update({
         "enabled": False,
         "accepted_at": accepted_at,
@@ -645,6 +684,7 @@ def _build_connections_keyboard(conns: list, data: dict, lang: str = "en") -> di
         rows.append(row)
     if ss_enabled:
         rows.append([{"text": f"➕ {_tt(lang, 'btn_create_connection')}", "callback_data": "user_create"}])
+    rows.append([{"text": f"📊 {_tt(lang, 'btn_my_stats')}", "callback_data": "user_stats"}])
     rows.append([{"text": f"🆘 {_tt(lang, 'btn_vpn_not_working')}", "callback_data": "user_vpn_not_working"}])
     rows.append([{"text": f"🔄 {_tt(lang, 'btn_refresh_list')}", "callback_data": "refresh"}])
     return {"inline_keyboard": rows}
@@ -1631,12 +1671,30 @@ async def _admin_create_client(api: TelegramAPI, chat_id: int, message_id: int, 
     try:
         server, result, client_id, assigned_user = await asyncio.to_thread(_create)
         assigned_text = f"\n{_tt(lang, 'assigned_to', username=_e(assigned_user.get('username')))}" if assigned_user else f"\n{_tt(lang, 'assigned_not_linked')}"
-        await api.edit_message(chat_id, message_id, _tt(lang, "connection_created", name=_e(name)) + assigned_text)
         config = result.get("config")
+        status, recipient = user_notifications.resolve_recipient(load_data_fn(), user_id, user_notifications.KIND_CREATED)
+        # An admin issuing a profile to themselves already sees it in this chat.
+        push_to_owner = bool(
+            client_id and status == user_notifications.QUEUED
+            and str(recipient.get("telegramId") or "").lstrip("@") != str(chat_id)
+        )
+        if push_to_owner:
+            assigned_text += f"\n📨 {_tt(lang, 'profile_sent_to_user')}"
+        await api.edit_message(chat_id, message_id, _tt(lang, "connection_created", name=_e(name)) + assigned_text)
         if config:
             await _send_config_text(api, chat_id, server, proto, name, config, generate_vpn_link_fn, lang)
         elif client_id:
             await _send_config_by_client(api, chat_id, server, proto, client_id, name, generate_vpn_link_fn, lang)
+        if push_to_owner:
+            try:
+                await _deliver_profile(
+                    api, str(recipient["telegramId"]).lstrip("@"), kind=user_notifications.KIND_CREATED,
+                    server=server, proto=proto, conn_name=name, config=config,
+                    generate_vpn_link_fn=generate_vpn_link_fn, lang=recipient.get("telegram_lang") or "ru",
+                )
+            except Exception as notify_error:
+                logger.warning("Bot admin: could not deliver profile to its owner: %s", notify_error)
+                await api.send_message(chat_id, f"⚠️ {_tt(lang, 'profile_send_failed')}: {_e(notify_error)}")
     except Exception as e:
         logger.exception("Bot admin: add client failed")
         await api.edit_message(chat_id, message_id, f" {_tt(lang, 'error')}: {_e(e)}", reply_markup={"inline_keyboard": [[{"text": f"⬅️ {_tt(lang, 'btn_protocol')}", "callback_data": _ref("proto", {"sid": server_id, "proto": proto})}]]})
@@ -1647,11 +1705,108 @@ async def _send_config_text(api: TelegramAPI, chat_id: int, server: dict, proto:
     if protocol_base(proto) in ("xray", "telemt"):
         await api.send_message(chat_id, f"🔗 <b>{_tt(lang, 'connection_link_label')}</b>:\n<code>{_e(config)}</code>")
     else:
-        await api.send_message(chat_id, f"<b>📄 Configuration:</b>\n<pre>{_e(config)}</pre>")
+        await api.send_message(chat_id, f"<b>📄 {_tt(lang, 'config_label')}:</b>\n<pre>{_e(config)}</pre>")
         vpn_link = generate_vpn_link_fn(config, server, proto) if config else ""
         if vpn_link:
             await api.send_message(chat_id, f" <b>{_tt(lang, 'vpn_link_label')}</b>:\n<code>{_e(vpn_link)}</code>")
         await api.send_document(chat_id, filename=f"{conn_name}.conf", content=config.encode("utf-8"), caption=f" {_tt(lang, 'config_file_label')}: {conn_name}")
+
+
+_PROFILE_NOTIFY_KEYS = {
+    "created": "profile_notify_created",
+    "assigned": "profile_notify_assigned",
+    "transferred": "profile_notify_transferred",
+}
+
+
+async def send_profile_notification(
+    token: str,
+    chat_id: str,
+    *,
+    kind: str,
+    server: dict,
+    proto: str,
+    conn_name: str,
+    config: Optional[str],
+    generate_vpn_link_fn: Callable,
+    lang: str = "ru",
+):
+    """Push a profile the administrator issued or moved to its owner's chat."""
+    async with httpx.AsyncClient() as client:
+        await _deliver_profile(
+            TelegramAPI(token, client), chat_id, kind=kind, server=server, proto=proto,
+            conn_name=conn_name, config=config, generate_vpn_link_fn=generate_vpn_link_fn, lang=lang,
+        )
+
+
+async def _deliver_profile(api: TelegramAPI, chat_id, *, kind: str, server: dict, proto: str, conn_name: str, config: Optional[str], generate_vpn_link_fn: Callable, lang: str = "ru"):
+    lang = lang if lang in TG_TRANSLATIONS else "ru"
+    intro = _tt(lang, _PROFILE_NOTIFY_KEYS.get(kind, "profile_notify_created"), name=_e(conn_name))
+    if not config:
+        intro += f"\n\n{_tt(lang, 'profile_notify_no_config')}"
+    sent = await api.send_message(chat_id, intro)
+    # The first message tells us whether the chat is reachable at all
+    # (blocked bot, deleted account); later sends reuse the same chat.
+    if not sent.get("ok"):
+        raise RuntimeError(sent.get("description") or "Telegram rejected the message")
+    if config:
+        await _send_config_text(api, chat_id, server, proto, conn_name, config, generate_vpn_link_fn, lang)
+
+
+def _days_ago_text(value: Optional[str], lang: str) -> str:
+    if not value:
+        return _tt(lang, "stats_no_activity")
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except ValueError:
+        return _tt(lang, "stats_no_activity")
+    now = datetime.now(moment.tzinfo) if moment.tzinfo else datetime.now()
+    days = (now.date() - moment.date()).days
+    when = _tt(lang, "stats_today") if days <= 0 else _tt(lang, "stats_days_ago", days=days)
+    return f"{_tt(lang, 'stats_last_active')}: {when}"
+
+
+def _user_stats_text(data: dict, panel_user: dict, lang: str = "en") -> str:
+    month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+    month = panel_user.get("traffic_month", 0) if panel_user.get("traffic_month_key") == month_key else 0
+    lines = [
+        f"📊 {_tt(lang, 'stats_title', username=_e(panel_user.get('username')))}",
+        "",
+        f"{_tt(lang, 'stats_month')}: <b>{_format_bytes(month)}</b>",
+        f"{_tt(lang, 'stats_total')}: <b>{_format_bytes(panel_user.get('traffic_total', 0))}</b>",
+    ]
+    limit = int(panel_user.get("traffic_limit") or 0)
+    if limit > 0:
+        used = int(panel_user.get("traffic_used") or 0)
+        lines.append(
+            f"{_tt(lang, 'stats_limit')}: <b>{_format_bytes(used)}</b> / {_format_bytes(limit)} "
+            f"({_tt(lang, 'stats_left')} {_format_bytes(max(0, limit - used))})"
+        )
+    if panel_user.get("expiration_date"):
+        lines.append(f"{_tt(lang, 'stats_expires')}: <b>{_e(str(panel_user['expiration_date'])[:10])}</b>")
+    conns = [c for c in data.get("user_connections", []) if c.get("user_id") == panel_user.get("id")]
+    if conns:
+        lines += ["", f"<b>{_tt(lang, 'stats_profiles')}:</b>"]
+        servers = data.get("servers", [])
+        for conn in conns:
+            sid = conn.get("server_id")
+            server_name = ""
+            if isinstance(sid, int) and 0 <= sid < len(servers):
+                server_name = servers[sid].get("name") or servers[sid].get("host", "")
+            lines.append(
+                f"🔐 {_e(conn.get('name', 'Connection'))} · {_e(server_name)} — "
+                f"{_days_ago_text(conn.get('last_active_at'), lang)}"
+            )
+    return "\n".join(lines)
+
+
+async def _user_stats(api: TelegramAPI, chat_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], load_data_fn: Callable, lang: str = "en"):
+    await api.answer_callback(callback_id)
+    panel_user = _find_user(load_data_fn, tg_id, tg_username)
+    if not panel_user:
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'access_denied')}")
+        return
+    await api.send_message(chat_id, _user_stats_text(load_data_fn(), panel_user, lang))
 
 
 async def _admin_toggle_client(api: TelegramAPI, chat_id: int, message_id: int, server_id: int, proto: str, client_id: str, enable: bool, load_data_fn: Callable, lang: str = "en"):
@@ -2222,6 +2377,12 @@ async def _dispatch(
             return
         if data_str == "user_create_cancel":
             await _user_create_cancel(api, chat_id, message_id, callback_id, tg_id, tg_username, load_data_fn, lang)
+            return
+        if data_str == "user_stats":
+            if not _is_private_chat(chat):
+                await _reject_non_private(api, chat_id, lang, callback_id)
+                return
+            await _user_stats(api, chat_id, callback_id, tg_id, tg_username, load_data_fn, lang)
             return
         if data_str == "user_vpn_not_working":
             if not _is_private_chat(chat):

@@ -101,6 +101,10 @@ Configuration panel for system parameters and preferences:
       Invitation payloads are stored only as SHA-256 hashes, never expire automatically, are invalidated after use, and a replacement link revokes the prior pending link.
     *   **VPN issue reports**: a user can report that VPN is not working from the bot. The panel notifies all linked administrators and, for AmneziaWG/WireGuard, includes the public peer endpoint last observed by the VPS.
       See [Telegram User Invitations](docs/telegram-user-invitations.md) for the administrator flow, API contract, and security model.
+    *   **Profile delivery**: when an administrator creates, assigns or transfers a profile, the bot pushes the new configuration to its owner's Telegram chat. Configurable on the Notifications page and per operation.
+    *   **Weekly digest & user statistics**: a weekly summary of per-user traffic and users who stopped connecting; users see their own monthly traffic and last activity via **My statistics** in the bot.
+    *   **Backups to Telegram**: a scheduled (daily or weekly) `panel.db` snapshot sent to a chosen chat, available only when `PANEL_MASTER_KEY` is set.
+      Design notes: [docs/rnd-family-features.md](docs/rnd-family-features.md).
 *   **🔄 Built-in Update Checker**:
     *   View your current panel version directly in Settings.
     *   One-click check for fresh GitHub releases to stay up to date.
@@ -108,6 +112,7 @@ Configuration panel for system parameters and preferences:
     *   **Remnawave Sync**: Automatically import and sync users from Remnawave.
     *   **Encrypted SQLite Backup**: Download and restore a consistent `.db` snapshot of all panel state; legacy `data.json` exports remain importable for migration.
     *   **Profile transfer between VPS**: Move an individual client to another managed VPS with the same protocol installed. The panel creates the replacement profile first, removes the source profile only after success, updates linked users and self-service claims, and records the action in the audit log.
+    *   **Bulk transfer**: select several profiles on the server page and move them to another VPS in one run (`POST /api/servers/{id}/connections/transfer-bulk`); each profile keeps the create-then-remove guarantee and failures are reported per profile.
     *   **Backup / Migrate protocols (Alpha)**: Move protocol configurations between nodes for maintenance, recovery, and migration workflows.
 *   **🔗 Public Sharing**:
     *   Generate password-protected links for users to download their configurations without panel access.

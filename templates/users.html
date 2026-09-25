@@ -337,6 +337,10 @@
             </div>
         </div>
 
+        <div class="form-group">
+            <label class="check-row"><input type="checkbox" id="ucNotifyUser" checked> {{ _('notify_user_telegram') }}</label>
+        </div>
+
         <div class="modal-footer">
             <button class="btn btn-secondary" onclick="closeModal('addUserConnModal')">{{ _('cancel') }}</button>
             <button class="btn btn-primary" onclick="doAddUserConnection()" id="ucAddBtn">
@@ -747,6 +751,7 @@
             }
             const result = await apiCall('/api/users/add', 'POST', body);
             showToast(_('success'), 'success');
+            showUserNotificationStatus(result.user_notification);
 
             if (result.config) {
                 currentConfig = result.config;
@@ -883,6 +888,7 @@
                 server_id: parseInt(document.getElementById('ucServer').value),
                 protocol: document.getElementById('ucProtocol').value,
                 name: document.getElementById('ucName').value || 'VPN Connection',
+                notify_user: document.getElementById('ucNotifyUser').checked,
             };
 
             // Remember the options for the next add
@@ -896,10 +902,11 @@
                 const selected = [...document.getElementById('ucExistingClient').selectedOptions]
                     .map(o => o.value).filter(Boolean);
                 if (!selected.length) throw new Error(_('select_connection'));
-                let ok = 0, failed = 0, lastErr = '';
+                let ok = 0, failed = 0, lastErr = '', notifyStatus = '';
                 for (const clientId of selected) {
                     try {
-                        await apiCall(`/api/users/${currentUserId}/connections/add`, 'POST', { ...body, client_id: clientId });
+                        const linked = await apiCall(`/api/users/${currentUserId}/connections/add`, 'POST', { ...body, client_id: clientId });
+                        notifyStatus = linked.user_notification || notifyStatus;
                         ok++;
                     } catch (e) {
                         failed++;
@@ -910,6 +917,7 @@
                 showToast(failed
                     ? `${_('conn_linked')}: ${ok}, ${_('error')}: ${failed} (${lastErr})`
                     : _('conn_linked') + (ok > 1 ? ` (${ok})` : ''), failed ? 'error' : 'success');
+                showUserNotificationStatus(notifyStatus);
                 closeModal('addUserConnModal');
                 refreshUsersList();
                 const connsModal = document.getElementById('userConnsModal');
@@ -930,6 +938,7 @@
 
             const result = await apiCall(`/api/users/${currentUserId}/connections/add`, 'POST', body);
             showToast(_('connection_created').replace('{}', body.name), 'success');
+            showUserNotificationStatus(result.user_notification);
             closeModal('addUserConnModal');
 
             // Linking an existing peer: no config popup — the admin already

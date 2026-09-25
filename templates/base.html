@@ -258,6 +258,13 @@
             }, 4000);
         }
 
+        // Outcome of pushing a profile to its owner's Telegram (user_notifications.py)
+        function showUserNotificationStatus(status) {
+            if (status === 'queued') showToast(_('notify_status_queued'), 'success');
+            else if (status === 'no_telegram') showToast(_('notify_status_no_telegram'), 'info');
+            else if (status === 'no_bot') showToast(_('notify_status_no_bot'), 'info');
+        }
+
         /* ===== Modal Management ===== */
         function openModal(id) {
             const modal = document.getElementById(id);

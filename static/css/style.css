@@ -927,6 +927,13 @@ a:hover {
     margin-top: var(--space-xs);
 }
 
+.check-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    cursor: pointer;
+}
+
 /* ===== Modal ===== */
 .modal-backdrop {
     position: fixed;
@@ -1417,6 +1424,61 @@ a:hover {
 /* Deep-linked peer card (from the users page connections modal). */
 .client-item.peer-highlight {
     border: 2px solid #7038da;
+}
+
+/* Multi-select for bulk transfer on the server page */
+.client-select {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    cursor: pointer;
+    accent-color: var(--accent);
+}
+
+.client-item.client-selected {
+    border-color: var(--accent);
+    background: var(--accent-glow);
+}
+
+.bulk-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-md);
+    margin-bottom: var(--space-md);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-md);
+    background: var(--accent-glow);
+}
+
+.bulk-bar__count {
+    font-weight: 600;
+    margin-right: auto;
+}
+
+.bulk-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
+    max-height: 160px;
+    overflow-y: auto;
+    margin-bottom: var(--space-md);
+}
+
+.bulk-results {
+    max-height: 280px;
+    overflow-y: auto;
+    margin-bottom: var(--space-md);
+}
+
+.bulk-result {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-md);
+    padding: var(--space-sm) 0;
+    border-bottom: 1px solid var(--border-color);
+    font-size: var(--text-sm);
 }
 
 .protocol-name {
