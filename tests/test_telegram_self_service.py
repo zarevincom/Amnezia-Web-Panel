@@ -616,6 +616,50 @@ class TestVpnProblemReports(unittest.IsolatedAsyncioTestCase):
         self.api.send_message = AsyncMock()
         self.api.answer_callback = AsyncMock()
 
+    async def test_problem_button_is_available_without_connections_when_self_service_is_disabled(self):
+        self.data['user_connections'] = []
+        self.data['settings']['self_service']['enabled'] = False
+        self.data['settings']['self_service']['telegram_enabled'] = False
+
+        await _dispatch_message(
+            self.api,
+            _text_message(chat_id=111, from_id=111, text='/start'),
+            lambda: self.data,
+        )
+
+        reply_markup = self.api.send_message.call_args.kwargs['reply_markup']
+        callbacks = {
+            button['callback_data']
+            for row in reply_markup['inline_keyboard']
+            for button in row
+        }
+        self.assertIn('user_vpn_not_working', callbacks)
+        self.assertNotIn('user_create', callbacks)
+
+    async def test_refresh_keeps_problem_button_without_connections_when_self_service_is_disabled(self):
+        self.data['user_connections'] = []
+        self.data['settings']['self_service']['enabled'] = False
+        self.data['settings']['self_service']['telegram_enabled'] = False
+
+        await _dispatch_callback(
+            self.api,
+            _callback_update(111, 111, 'refresh'),
+            lambda: self.data,
+        )
+
+        reply_markup = self.api.edit_message.call_args.kwargs['reply_markup']
+        callbacks = {
+            button['callback_data']
+            for row in reply_markup['inline_keyboard']
+            for button in row
+        }
+        self.assertIn('user_vpn_not_working', callbacks)
+        self.assertNotIn('user_create', callbacks)
+
+    def test_empty_wireguard_endpoint_is_not_reported_as_an_ip_address(self):
+        self.assertEqual(tg_bot._endpoint_ip('(none)'), '')
+        self.assertEqual(tg_bot._endpoint_ip(' (NONE) '), '')
+
     async def test_user_can_report_vpn_problem_with_observed_peer_ip(self):
         update = _callback_update(111, 111, 'user_vpn_not_working')
         profiles = [{

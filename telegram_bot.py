@@ -671,7 +671,7 @@ def _support_admin_chat_ids(data: dict) -> list[str]:
 def _endpoint_ip(endpoint) -> str:
     """Return the host portion of a WireGuard endpoint without its UDP port."""
     endpoint = str(endpoint or "").strip()
-    if not endpoint:
+    if not endpoint or endpoint.lower() == "(none)":
         return ""
     if endpoint.startswith("["):
         host, _, _ = endpoint[1:].partition("]")
@@ -1105,8 +1105,8 @@ async def _send_user_connections(api: TelegramAPI, chat_id: int, panel_user: dic
 
     if not conns:
         greeting = f"👋 {_tt(lang, 'hi')}, <b>{_e(first_name)}</b>!\n\n" if first_name else ""
+        kb = _build_connections_keyboard(conns, data, lang)
         if _self_service_telegram_enabled(data):
-            kb = _build_connections_keyboard(conns, data, lang)
             await api.send_message(
                 chat_id,
                 greeting + f"{_tt(lang, 'registered_as', username=_e(panel_user.get('username')))}.\n\n"
@@ -1118,6 +1118,7 @@ async def _send_user_connections(api: TelegramAPI, chat_id: int, panel_user: dic
                 chat_id,
                 greeting + f"{_tt(lang, 'registered_as', username=_e(panel_user.get('username')))}.\n\n"
                 f"{_tt(lang, 'no_connections_contact_admin')}",
+                reply_markup=kb,
             )
         return
 
@@ -1140,11 +1141,11 @@ async def _handle_refresh(api: TelegramAPI, chat_id: int, message_id: int, callb
     data = load_data_fn()
     conns = [c for c in data.get("user_connections", []) if c.get("user_id") == panel_user.get("id")]
     if not conns:
+        kb = _build_connections_keyboard(conns, data, lang)
         if _self_service_telegram_enabled(data):
-            kb = _build_connections_keyboard(conns, data, lang)
             await api.edit_message(chat_id, message_id, _tt(lang, "no_connections_create_short"), reply_markup=kb)
         else:
-            await api.edit_message(chat_id, message_id, _tt(lang, "no_connections"))
+            await api.edit_message(chat_id, message_id, _tt(lang, "no_connections"), reply_markup=kb)
         return
     kb = _build_connections_keyboard(conns, data, lang)
     await api.edit_message(chat_id, message_id, _tt(lang, "your_connections", count=len(conns)), reply_markup=kb)
@@ -2016,11 +2017,16 @@ async def _user_delete_confirm(api: TelegramAPI, chat_id: int, message_id: int, 
     data = load_data_fn()
     conns = [c for c in data.get("user_connections", []) if c.get("user_id") == panel_user.get("id")]
     if not conns:
+        kb = _build_connections_keyboard(conns, data, lang)
         if _self_service_telegram_enabled(data):
-            kb = _build_connections_keyboard(conns, data, lang)
             await api.edit_message(chat_id, message_id, f"✅ {_tt(lang, 'connection_deleted')}\n\n{_tt(lang, 'no_connections_create_short')}", reply_markup=kb)
         else:
-            await api.edit_message(chat_id, message_id, f"✅ {_tt(lang, 'connection_deleted_no_connections')}")
+            await api.edit_message(
+                chat_id,
+                message_id,
+                f"✅ {_tt(lang, 'connection_deleted_no_connections')}",
+                reply_markup=kb,
+            )
         return
     kb = _build_connections_keyboard(conns, data, lang)
     await api.edit_message(chat_id, message_id, f"✅ {_tt(lang, 'connection_deleted')}\n\n{_tt(lang, 'your_connections', count=len(conns))}", reply_markup=kb)
