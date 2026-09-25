@@ -88,7 +88,7 @@ OPENAPI_TAGS = [
     {"name": "Sharing", "description": "Public, token-protected configuration sharing for end users — no panel session required."},
     {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, encrypted SQLite backup/restore and legacy JSON migration."},
     {"name": "Notifications", "description": "Scheduled Telegram personal messages."},
-    {"name": "Invites", "description": "Admin-managed public VPN profile invitations and claims, plus one-time Telegram account binding links issued by the bot or an authenticated admin integration."},
+    {"name": "Invites", "description": "One-time Telegram account binding links issued by the bot or an authenticated admin integration."},
     {"name": "API Tokens", "description": "Bearer tokens for external integrations. Send the token in `Authorization: Bearer <token>`; tokens have admin-equivalent rights and are tied to the admin user that created them."},
 ]
 
@@ -235,7 +235,6 @@ load_translations()
 # Global lock for multi-step state changes performed by async routes.
 DATA_LOCK = asyncio.Lock()
 NOTIFICATION_LOCK = asyncio.Lock()
-INVITE_ATTEMPTS = {}
 
 
 def load_data():
@@ -245,8 +244,6 @@ def load_data():
     data.setdefault('user_connections', [])
     data.setdefault('api_tokens', [])
     data.setdefault('notifications', [])
-    data.setdefault('invites', [])
-    data.setdefault('invite_claims', [])
     data.setdefault('telegram_invites', [])
     data.setdefault('audit_log', [])
     settings = data.setdefault('settings', {
@@ -1688,58 +1685,8 @@ async def _get_telegram_bot_username(token: str) -> str:
     return str(username).lstrip('@')
 
 
-def _find_invite(data: dict, token: str):
-    return next((i for i in data.get('invites', []) if secrets.compare_digest(i.get('token_hash', ''), _invite_hash(token))), None)
-
-
-def _claim_owner_session_key(token: str) -> str:
-    """Return the per-invitation session key holding the anonymous claim owner."""
-    return 'claim_owner_' + _invite_hash(token)
-
-
-def _claim_owner_id(request: Request, token: str) -> Optional[str]:
-    """Read the opaque owner identifier created when this browser claimed access."""
-    owner_id = request.session.get(_claim_owner_session_key(token))
-    return owner_id if isinstance(owner_id, str) and owner_id else None
-
-
-def _claim_belongs_to_owner(claim: dict, owner_id: Optional[str]) -> bool:
-    """Compare anonymous owner identifiers without leaking a partial match."""
-    if not owner_id:
-        return False
-    return secrets.compare_digest(str(claim.get('owner_id') or ''), owner_id)
-
-
 def _audit(data: dict, event: str, **details):
     data.setdefault('audit_log', []).append({'id': str(uuid.uuid4()), 'event': event, 'created_at': datetime.now(timezone.utc).isoformat(), **details})
-
-
-def _claim_rate_allowed(request: Request, token: str) -> bool:
-    key = f"{request.client.host if request.client else 'unknown'}:{token}"
-    now = time.monotonic()
-    attempts = [t for t in INVITE_ATTEMPTS.get(key, []) if now - t < 3600]
-    attempts.append(now)
-    INVITE_ATTEMPTS[key] = attempts
-    return len(attempts) <= 10
-
-
-def _public_error(message='This invitation is unavailable'):
-    return JSONResponse({'error': message}, status_code=400)
-
-
-def _ensure_invite_guest(data: dict, owner_id: str) -> dict:
-    """Keep self-service profiles visible in the panel's shared user list."""
-    user = next((u for u in data.get('users', []) if u.get('invite_owner_id') == owner_id), None)
-    if user:
-        return user
-    user = {
-        'id': str(uuid.uuid4()), 'username': f'guest-{owner_id[:8]}',
-        'password_hash': hash_password(secrets.token_urlsafe(24)), 'role': 'user',
-        'enabled': True, 'created_at': datetime.now(timezone.utc).isoformat(),
-        'invite_owner_id': owner_id, 'description': 'Self-service invitation user',
-    }
-    data.setdefault('users', []).append(user)
-    return user
 
 
 # ===================== API tokens =====================
@@ -2484,26 +2431,9 @@ class NotificationToggleRequest(BaseModel):
     enabled: bool
 
 
-class InviteRequest(BaseModel):
-    name: str
-    server_id: int
-    protocol: str = 'awg'
-    max_claims: int = 1
-    expires_at: str
-    profile_expires_at: Optional[str] = None
-    password: Optional[str] = None
-    max_reissues: int = 1
-    reissue_cooldown_hours: int = 24
-
-
 class TelegramInviteRequest(BaseModel):
     """Request a non-expiring, one-time Telegram account binding link."""
 
-
-class ClaimRequest(BaseModel):
-    device_name: str
-    password: Optional[str] = None
-    captcha: Optional[str] = None
 
 class AutoBackupSettings(BaseModel):
     enabled: bool = False
@@ -2704,16 +2634,6 @@ async def startup():
         data['notifications'] = []
         changed = True
         logger.info("Initialised empty notifications collection")
-
-    # Backfill profiles created by the public self-service station before the
-    # shared-connections link was introduced.
-    for claim in data.get('invite_claims', []):
-        if any(c.get('invite_claim_id') == claim.get('id') for c in data.get('user_connections', [])):
-            continue
-        owner_id = claim.get('owner_id') or f"legacy-{claim.get('id', '')}"
-        guest = _ensure_invite_guest(data, owner_id)
-        data['user_connections'].append({'id': str(uuid.uuid4()), 'user_id': guest['id'], 'server_id': claim['server_id'], 'protocol': claim['protocol'], 'client_id': claim['client_id'], 'name': claim.get('device_name', 'Self-service profile'), 'invite_claim_id': claim['id'], 'created_at': claim.get('created_at', datetime.now(timezone.utc).isoformat())})
-        changed = True
 
     # SSL settings migration
     if 'ssl' not in data.get('settings', {}):
@@ -5376,10 +5296,6 @@ async def api_transfer_connection(request: Request, server_id: int, req: Transfe
                         'name': client_name,
                         'transferred_at': datetime.now(timezone.utc).isoformat(),
                     })
-            for claim in data.get('invite_claims', []):
-                if (claim.get('server_id') == server_id and claim.get('protocol') == req.protocol
-                        and claim.get('client_id') == req.client_id):
-                    claim.update({'server_id': req.target_server_id, 'client_id': new_client_id})
             _audit(
                 data,
                 'connection_transferred',
@@ -6166,8 +6082,6 @@ def api_my_connections(request: Request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     conns = [c for c in data.get('user_connections', []) if c['user_id'] == user['id']]
-    if user.get('role') in ('admin', 'support'):
-        conns += [c for c in data.get('user_connections', []) if c.get('invite_claim_id')]
     for c in conns:
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
@@ -6396,156 +6310,6 @@ async def api_get_alert_settings(request: Request):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     return load_data().get('settings', {}).get('alerts', {})
-
-
-@app.get('/invites', response_class=HTMLResponse, tags=["System Templates"])
-async def invites_page(request: Request):
-    if not _check_admin(request):
-        return RedirectResponse('/login')
-    data = load_data()
-    return tpl(request, 'invites.html', invites=data.get('invites', []), servers=data.get('servers', []))
-
-
-@app.post('/api/invites', tags=["Invites"])
-async def api_create_invite(request: Request, payload: InviteRequest):
-    if not _check_admin(request): return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    data = load_data()
-    if payload.server_id < 0 or payload.server_id >= len(data.get('servers', [])) or not payload.name.strip():
-        return JSONResponse({'error': 'Invalid invitation settings'}, status_code=400)
-    if payload.max_claims < 1 or payload.max_reissues < 0 or payload.reissue_cooldown_hours < 1:
-        return JSONResponse({'error': 'Invalid limits'}, status_code=400)
-    try:
-        expires = datetime.fromisoformat(payload.expires_at.replace('Z', '+00:00'))
-        if expires.tzinfo is None: expires = expires.replace(tzinfo=timezone.utc)
-    except ValueError: return JSONResponse({'error': 'Invalid expiry date'}, status_code=400)
-    raw_token = secrets.token_urlsafe(32)
-    invite = {'id':str(uuid.uuid4()), 'name':payload.name.strip(), 'token_hash':_invite_hash(raw_token), 'server_id':payload.server_id, 'protocol':payload.protocol, 'max_claims':payload.max_claims, 'claims_count':0, 'expires_at':expires.astimezone(timezone.utc).isoformat(), 'profile_expires_at':payload.profile_expires_at or None, 'password_hash':hash_password(payload.password) if payload.password else None, 'max_reissues':payload.max_reissues, 'reissue_cooldown_hours':payload.reissue_cooldown_hours, 'enabled':True, 'created_at':datetime.now(timezone.utc).isoformat()}
-    data['invites'].append(invite); _audit(data, 'invite_created', invite_id=invite['id']); save_data(data)
-    return {'invite':invite, 'url':str(request.base_url).rstrip('/') + '/claim/' + raw_token}
-
-
-@app.post('/api/invites/{invite_id}/toggle', tags=["Invites"])
-async def api_toggle_invite(invite_id: str, request: Request):
-    if not _check_admin(request): return JSONResponse({'error':'Forbidden'},status_code=403)
-    data=load_data(); invite=next((i for i in data['invites'] if i['id']==invite_id),None)
-    if not invite: return JSONResponse({'error':'Not found'},status_code=404)
-    invite['enabled']=not invite.get('enabled',True); save_data(data); return invite
-
-
-@app.get('/claim/{token}', response_class=HTMLResponse, tags=["System Templates"])
-async def claim_page(token: str, request: Request):
-    data=load_data(); invite=_find_invite(data,token)
-    if not invite or not invite.get('enabled') or datetime.fromisoformat(invite['expires_at']) <= datetime.now(timezone.utc):
-        return HTMLResponse('<h1>Invitation unavailable</h1>',status_code=404)
-    response = templates.TemplateResponse('claim.html', {'request': request, 'token': token, 'needs_password': bool(invite.get('password_hash')), 'invite_name': invite.get('name', 'VPN access')})
-    response.headers['Cache-Control'] = 'no-store'
-    response.headers['Referrer-Policy'] = 'no-referrer'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    return response
-
-
-@app.get('/api/claim/captcha', tags=["Invites"])
-async def api_claim_captcha(request: Request):
-    if not CaptchaGenerator:
-        return JSONResponse({'error': 'Unavailable'}, status_code=503)
-    captcha = CaptchaGenerator(2).gen_captcha_image(difficult_level=2)
-    request.session['claim_captcha'] = captcha.characters.lower()
-    image = io.BytesIO(); captcha.image.save(image, format='PNG'); image.seek(0)
-    return StreamingResponse(image, media_type='image/png', headers={'Cache-Control': 'no-store'})
-
-
-async def _create_invite_profile(data, invite, device_name):
-    server=data['servers'][invite['server_id']]; proto=invite['protocol']; ssh=get_ssh(server); ssh.connect()
-    try:
-        manager=get_protocol_manager(ssh,proto); port=server.get('protocols',{}).get(proto,{}).get('port','55424')
-        result=_manager_call(manager,'add_client',proto,device_name,server['host'],port)
-        if isinstance(result, str):
-            config=result
-            clients=_manager_call(manager,'get_clients',proto)
-            client_id=next((c.get('clientId') for c in clients if c.get('name') == device_name), None)
-        else:
-            client_id=result.get('clientId') or result.get('client_id')
-            config=result.get('config') or _manager_call(manager,'get_client_config',proto,client_id,server['host'],port)
-        if not client_id:
-            raise RuntimeError('Created profile could not be identified')
-        return client_id, config
-    finally: ssh.disconnect()
-
-
-@app.post('/api/claim/{token}', tags=["Invites"])
-async def api_claim(token: str, payload: ClaimRequest, request: Request):
-    if not _claim_rate_allowed(request,token): return _public_error('Too many attempts')
-    data=load_data(); invite=_find_invite(data,token)
-    if not invite or not invite.get('enabled') or datetime.fromisoformat(invite['expires_at']) <= datetime.now(timezone.utc) or invite.get('claims_count',0)>=invite.get('max_claims',1):
-        _audit(data,'invite_claim_rejected',reason='unavailable'); save_data(data); return _public_error()
-    if invite.get('password_hash') and not verify_password(payload.password or '',invite['password_hash']):
-        _audit(data,'invite_claim_rejected',invite_id=invite['id'],reason='password'); save_data(data); return _public_error('Invalid password')
-    name=re.sub(r'[^\w .-]','',payload.device_name).strip()[:48]
-    if not name: return _public_error('Device name is required')
-    try: client_id,config=await _create_invite_profile(data,invite,name)
-    except Exception:
-        logger.exception('Invite profile creation failed'); return _public_error('Profile could not be created')
-    owner_key = _claim_owner_session_key(token)
-    owner_id = _claim_owner_id(request, token) or secrets.token_urlsafe(24)
-    request.session[owner_key] = owner_id
-    guest = _ensure_invite_guest(data, owner_id)
-    claim={'id':str(uuid.uuid4()),'invite_id':invite['id'],'owner_id':owner_id,'client_id':client_id,'device_name':name,'server_id':invite['server_id'],'protocol':invite['protocol'],'reissues':0,'last_reissue_at':None,'created_at':datetime.now(timezone.utc).isoformat(),'last_ip':request.client.host if request.client else ''}
-    data['invite_claims'].append(claim)
-    data.setdefault('user_connections', []).append({'id': str(uuid.uuid4()), 'user_id': guest['id'], 'server_id': invite['server_id'], 'protocol': invite['protocol'], 'client_id': client_id, 'name': name, 'invite_claim_id': claim['id'], 'created_at': claim['created_at']})
-    invite['claims_count']+=1; _audit(data,'invite_claimed',invite_id=invite['id'],claim_id=claim['id']); save_data(data)
-    request.session['claim_session_' + _invite_hash(token)] = claim['id']
-    return {'claim_id':claim['id'],'config':config,'filename':name + '.conf','vpn_link':generate_vpn_link(config),'expires_at':invite.get('profile_expires_at'),'can_reissue':invite.get('max_reissues',0)>0}
-
-
-@app.get('/api/claim/{token}/profiles', tags=["Invites"])
-async def api_claim_profiles(token: str, request: Request):
-    data = load_data(); invite = _find_invite(data, token)
-    owner_id = _claim_owner_id(request, token)
-    if not invite or not invite.get('enabled') or not owner_id:
-        return {'profiles': []}
-    profiles = []
-    for claim in data.get('invite_claims', []):
-        if claim.get('invite_id') != invite['id'] or not _claim_belongs_to_owner(claim, owner_id):
-            continue
-        try:
-            server = data['servers'][claim['server_id']]
-            ssh = get_ssh(server); ssh.connect()
-            manager = get_protocol_manager(ssh, claim['protocol'])
-            port = server.get('protocols', {}).get(claim['protocol'], {}).get('port', '55424')
-            config = _manager_call(manager, 'get_client_config', claim['protocol'], claim['client_id'], server['host'], port)
-            ssh.disconnect()
-            if config:
-                profiles.append({'id': claim['id'], 'name': claim['device_name'], 'filename': claim['device_name'] + '.conf', 'protocol': claim['protocol'], 'server': server.get('name') or server['host'], 'expires_at': invite.get('profile_expires_at'), 'config': config, 'vpn_link': generate_vpn_link(config), 'can_reissue': claim.get('reissues', 0) < invite.get('max_reissues', 0)})
-        except Exception:
-            logger.warning('Could not load claim profile %s', claim['id'])
-    return {'profiles': profiles}
-
-
-@app.post('/api/claim/{token}/{claim_id}/reissue', tags=["Invites"])
-async def api_reissue_claim(token: str, claim_id: str, payload: ClaimRequest, request: Request):
-    if not _claim_rate_allowed(request, token): return _public_error('Too many attempts')
-    data=load_data(); invite=_find_invite(data,token); claim=next((c for c in data.get('invite_claims',[]) if c['id']==claim_id),None)
-    owner_id = _claim_owner_id(request, token)
-    if (not invite or not claim or claim.get('invite_id') != invite['id']
-            or not _claim_belongs_to_owner(claim, owner_id) or not invite.get('enabled')):
-        return _public_error()
-    if claim.get('reissues',0) >= invite.get('max_reissues',0): return _public_error('Reissue limit reached')
-    if claim.get('last_reissue_at'):
-        last=datetime.fromisoformat(claim['last_reissue_at'])
-        if datetime.now(timezone.utc) < last + timedelta(hours=invite.get('reissue_cooldown_hours',24)): return _public_error('Reissue is temporarily unavailable')
-    try:
-        server=data['servers'][claim['server_id']]; ssh=get_ssh(server); ssh.connect(); manager=get_protocol_manager(ssh,claim['protocol'])
-        old_client_id = claim['client_id']; _manager_call(manager,'remove_client',claim['protocol'],old_client_id); ssh.disconnect()
-        client_id,config=await _create_invite_profile(data,invite,payload.device_name or claim['device_name'])
-    except Exception:
-        logger.exception('Invite reissue failed'); return _public_error('Profile could not be reissued')
-    claim.update({'client_id':client_id,'previous_client_id':old_client_id,'revoked_at':datetime.now(timezone.utc).isoformat(),'device_name':payload.device_name or claim['device_name'],'reissues':claim.get('reissues',0)+1,'last_reissue_at':datetime.now(timezone.utc).isoformat()})
-    for connection in data.get('user_connections', []):
-        if connection.get('invite_claim_id') == claim['id']:
-            connection.update({'client_id': client_id, 'name': claim['device_name'], 'updated_at': claim['last_reissue_at']})
-    _audit(data,'invite_reissued',invite_id=invite['id'],claim_id=claim['id']); save_data(data)
-    return {'claim_id':claim['id'],'config':config,'filename':claim['device_name'] + '.conf','vpn_link':generate_vpn_link(config),'can_reissue':claim['reissues'] < invite.get('max_reissues',0)}
 
 
 @app.post('/api/notifications/alerts', tags=["Notifications"])

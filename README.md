@@ -278,7 +278,7 @@ Routes are grouped in the docs as:
 | **Self-service** | Endpoints called by a regular user for their own data (`/api/my/*`). |
 | **Sharing** | Public, token-protected configuration sharing — no panel session required. |
 | **Settings** | Panel-wide settings, Telegram bot, Remnawave sync, encrypted SQLite backup/restore and legacy JSON migration. |
-| **Invites** | Admin-managed public VPN profile invitations and one-time Telegram account binding links. |
+| **Invites** | One-time Telegram account binding links for panel users. |
 | **API Tokens** | Create and revoke bearer tokens for external integrations. |
 
 **Authentication for external integrations** — both session cookies and `Authorization: Bearer <token>` are accepted on every admin endpoint. Example:

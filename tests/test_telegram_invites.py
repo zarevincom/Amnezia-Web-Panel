@@ -3,10 +3,14 @@ import asyncio
 import copy
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import app as panel
 import telegram_bot as tg_bot
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _start_update(telegram_id, payload, chat_type="private"):
@@ -349,3 +353,12 @@ class TestTelegramInviteApi:
     def test_openapi_documents_telegram_invitation_endpoint(self):
         schema = panel.app.openapi()
         assert "/api/users/{user_id}/telegram-invites" in schema["paths"]
+        assert "/api/invites" not in schema["paths"]
+        assert not any(path.startswith("/api/claim") for path in schema["paths"])
+        assert "/invites" not in {route.path for route in panel.app.routes}
+        assert "/claim/{token}" not in {route.path for route in panel.app.routes}
+        assert 'href="/invites"' not in (PROJECT_ROOT / "templates/base.html").read_text(
+            encoding="utf-8"
+        )
+        assert not (PROJECT_ROOT / "templates/invites.html").exists()
+        assert not (PROJECT_ROOT / "templates/claim.html").exists()
