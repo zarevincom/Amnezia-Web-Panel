@@ -616,5 +616,6 @@
   "notify_status_no_telegram": "该用户未绑定 Telegram，请手动发送配置",
   "notify_status_no_bot": "未配置 Telegram 机器人令牌，配置未发送",
   "notify_badge_sent": "📨 已通过 Telegram 发送",
-  "notify_badge_no_telegram": "无 Telegram"
+  "notify_badge_no_telegram": "无 Telegram",
+  "notify_badge_no_bot": "未发送：未配置机器人"
 }

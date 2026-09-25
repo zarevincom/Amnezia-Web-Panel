@@ -3813,7 +3813,8 @@
 
     function renderBulkTransferResults(result) {
         const notifyBadge = (status) => status === 'queued' ? ` · ${_('notify_badge_sent')}`
-            : status === 'no_telegram' ? ` · ${_('notify_badge_no_telegram')}` : '';
+            : status === 'no_telegram' ? ` · ${_('notify_badge_no_telegram')}`
+            : status === 'no_bot' ? ` · ${_('notify_badge_no_bot')}` : '';
         document.getElementById('bulkTransferResultSummary').textContent = _('bulk_transfer_done')
             .replace('{ok}', result.transferred || 0).replace('{failed}', result.failed || 0);
         document.getElementById('bulkTransferResultList').innerHTML = (result.results || []).map((item) => `

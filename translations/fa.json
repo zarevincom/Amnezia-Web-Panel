@@ -616,5 +616,6 @@
   "notify_status_no_telegram": "کاربر تلگرام متصل ندارد — پیکربندی را دستی ارسال کنید",
   "notify_status_no_bot": "توکن ربات تلگرام تنظیم نشده — پروفایل ارسال نشد",
   "notify_badge_sent": "📨 در تلگرام ارسال شد",
-  "notify_badge_no_telegram": "بدون تلگرام"
+  "notify_badge_no_telegram": "بدون تلگرام",
+  "notify_badge_no_bot": "ارسال نشد: ربات تنظیم نشده"
 }

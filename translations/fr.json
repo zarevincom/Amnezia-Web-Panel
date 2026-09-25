@@ -616,5 +616,6 @@
   "notify_status_no_telegram": "L'utilisateur n'a pas de Telegram lié — envoyez la configuration manuellement",
   "notify_status_no_bot": "Le jeton du bot Telegram n'est pas configuré — le profil n'a pas été envoyé",
   "notify_badge_sent": "📨 envoyé sur Telegram",
-  "notify_badge_no_telegram": "pas de Telegram"
+  "notify_badge_no_telegram": "pas de Telegram",
+  "notify_badge_no_bot": "non envoyé : bot non configuré"
 }

@@ -210,6 +210,36 @@ class BulkTransferTests(unittest.TestCase):
         self.assertIn('connection_transferred', events)
         self.assertIn('connections_bulk_transferred', events)
 
+    def test_data_lock_is_free_during_remote_work(self):
+        data = _data()
+        source = FakeManager([{'clientId': 'k1', 'userData': {'clientName': 'phone'}}])
+        target = FakeManager([])
+        seen = []
+        original_add = target.add_client
+
+        def add_client(*args):
+            seen.append(panel.DATA_LOCK.locked())
+            return original_add(*args)
+
+        target.add_client = add_client
+        result, _, _ = self._run(data, source, target, ['k1'])
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(seen, [False])
+
+    def test_links_follow_servers_reordered_during_transfer(self):
+        data = _data(user_connections=[
+            {'id': 'c1', 'user_id': 'mom', 'server_id': 0, 'protocol': 'awg2', 'client_id': 'k1', 'name': 'phone'},
+        ])
+        data['servers'][0]['uid'], data['servers'][1]['uid'] = 'fin', 'ger'
+        # Another admin swapped the servers while SSH work was running.
+        data['servers'].reverse()
+        for conn in data['user_connections']:
+            conn['server_id'] = 1
+        moved = {'source_client_id': 'k1', 'client_id': 'new-k1', 'name': 'phone', 'config': ''}
+        user_ids = panel._record_transfer(data, 'fin', 'ger', (0, 1), 'awg2', moved)
+        self.assertEqual(user_ids, ['mom'])
+        self.assertEqual((data['user_connections'][0]['server_id'], data['user_connections'][0]['client_id']), (0, 'new-k1'))
+
     def test_failed_source_removal_rolls_back_target(self):
         data = _data()
         source = FakeManager([{'clientId': 'k1', 'userData': {'clientName': 'phone'}}], fail_remove={'k1'})
@@ -279,6 +309,7 @@ class TelegramBackupTests(unittest.TestCase):
         data = _data()
         data['settings']['telegram_backup'] = {'enabled': True, 'chat_id': '42'}
         store = Mock(key_fingerprint='abc123')
+        store.plaintext_secret_paths.return_value = []
         store.export_database.return_value = b'SQLite format 3\x00'
         with patch.object(panel, 'load_data', return_value=data), \
              patch.object(panel, 'save_data'), \
@@ -290,6 +321,56 @@ class TelegramBackupTests(unittest.TestCase):
         self.assertTrue(filename.endswith('.db'))
         self.assertIn('abc123', caption)
         self.assertEqual(data['settings']['telegram_backup']['last_status'], 'success')
+        store.reseal.assert_not_called()
+        store.export_database.assert_called_once_with(True)
+
+    def test_plaintext_legacy_secrets_are_resealed_before_sending(self):
+        data = _data()
+        data['settings']['telegram_backup'] = {'enabled': True, 'chat_id': '42'}
+        store = Mock(key_fingerprint='abc123')
+        store.plaintext_secret_paths.side_effect = [['servers[0].password'], []]
+        store.export_database.return_value = b'SQLite format 3\x00'
+        with patch.object(panel, 'load_data', return_value=data), \
+             patch.object(panel, 'save_data'), \
+             patch.object(panel, 'STATE_STORE', store), \
+             patch.object(panel, '_send_telegram_document', new=AsyncMock()) as send:
+            asyncio.run(panel.send_telegram_backup())
+        store.reseal.assert_called_once()
+        send.assert_awaited_once()
+
+    def test_backup_refused_when_reseal_leaves_plaintext(self):
+        data = _data()
+        data['settings']['telegram_backup'] = {'enabled': True, 'chat_id': '42'}
+        store = Mock(key_fingerprint='abc123')
+        store.plaintext_secret_paths.return_value = ['servers[0].password']
+        with patch.object(panel, 'load_data', return_value=data), \
+             patch.object(panel, 'save_data'), \
+             patch.object(panel, 'STATE_STORE', store), \
+             patch.object(panel, '_send_telegram_document', new=AsyncMock()) as send:
+            with self.assertRaisesRegex(RuntimeError, 'still unencrypted'):
+                asyncio.run(panel.send_telegram_backup())
+        send.assert_not_awaited()
+        store.export_database.assert_not_called()
+
+
+class StorageResealTests(unittest.TestCase):
+    def test_key_added_later_reseals_and_compact_export_drops_plaintext(self):
+        import tempfile
+        from pathlib import Path
+        from storage import SQLiteStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db, legacy = Path(tmp) / 'panel.db', Path(tmp) / 'data.json'
+            plain = SQLiteStateStore(str(db), str(legacy))
+            plain.load()
+            plain.save({'servers': [{'host': '192.0.2.1', 'password': 'hunter2-secret'}]})
+
+            keyed = SQLiteStateStore(str(db), str(legacy), master_key='later-key')
+            self.assertEqual(keyed.plaintext_secret_paths(), ['servers[0].password'])
+            keyed.reseal()
+            self.assertEqual(keyed.plaintext_secret_paths(), [])
+            self.assertEqual(keyed.load()['servers'][0]['password'], 'hunter2-secret')
+            self.assertNotIn(b'hunter2-secret', keyed.export_database(compact=True))
 
 
 class BotFamilyTests(unittest.IsolatedAsyncioTestCase):
@@ -318,6 +399,23 @@ class BotFamilyTests(unittest.IsolatedAsyncioTestCase):
                 conn_name='phone', config='[Interface]', generate_vpn_link_fn=lambda *a: '', lang='ru',
             )
         api.send_message.assert_awaited_once()
+
+    async def test_delivery_fails_when_config_file_is_refused(self):
+        api = AsyncMock()
+        api.send_message = AsyncMock(return_value={'ok': True})
+        api.send_document = AsyncMock(return_value={'ok': False, 'description': 'Bad Request: file is empty'})
+        with self.assertRaisesRegex(RuntimeError, 'file is empty'):
+            await tg_bot._deliver_profile(
+                api, '111', kind='created', server={'name': 'Germany'}, proto='awg2',
+                conn_name='phone', config='[Interface]', generate_vpn_link_fn=lambda *a: '', lang='ru',
+            )
+
+    async def test_admin_config_view_stays_lenient(self):
+        api = AsyncMock()
+        api.send_message = AsyncMock(return_value={'ok': False})
+        api.send_document = AsyncMock(return_value={'ok': False})
+        await tg_bot._send_config_text(api, 1, {'name': 'x'}, 'awg2', 'phone', '[Interface]', lambda *a: '', 'en')
+        api.send_document.assert_awaited_once()
 
     async def test_delivery_sends_intro_then_config(self):
         api = AsyncMock()

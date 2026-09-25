@@ -2937,7 +2937,14 @@ async def send_telegram_backup() -> dict:
             raise ValueError('Specify the Chat ID for backups')
         if not STATE_STORE.key_fingerprint:
             raise ValueError('PANEL_MASTER_KEY is not set: the backup would contain plaintext credentials')
-        snapshot = await asyncio.to_thread(STATE_STORE.export_database)
+        # A database created before the key was set keeps plaintext secrets
+        # until rewritten; encrypt them now and verify before anything leaves.
+        if await asyncio.to_thread(STATE_STORE.plaintext_secret_paths):
+            async with DATA_LOCK:
+                await asyncio.to_thread(STATE_STORE.reseal)
+            if await asyncio.to_thread(STATE_STORE.plaintext_secret_paths):
+                raise ValueError('Stored secrets are still unencrypted; the backup was not sent')
+        snapshot = await asyncio.to_thread(STATE_STORE.export_database, True)
         if len(snapshot) > activity_stats.TELEGRAM_DOCUMENT_LIMIT:
             raise ValueError('The database is larger than the 50 MB Telegram limit')
         caption = activity_stats.backup_caption(data, STATE_STORE.key_fingerprint, now)
@@ -5344,6 +5351,9 @@ def api_remove_connection(request: Request, server_id: int, req: ConnectionActio
 
 TRANSFERABLE_PROTOCOLS = {'awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'xray', 'telemt', 'aivpn'}
 BULK_TRANSFER_LIMIT = 100
+# Serialises transfers with each other. DATA_LOCK is only taken for the short
+# load/mutate/save steps, so remote SSH work never stalls the rest of the panel.
+TRANSFER_LOCK = asyncio.Lock()
 
 
 class TransferError(Exception):
@@ -5359,14 +5369,14 @@ def _client_name_taken(clients, name):
     )
 
 
-async def _transfer_client_between(data, server_id, target_server_id, protocol, client_id,
+async def _transfer_client_between(snapshot, server_id, protocol, client_id,
                                    source_manager, source_clients, target_server, target_manager, target_clients):
     """Recreate one client on the target, then remove it from the source.
 
     The target client is created before the source client is removed. If source
     removal fails, the new target client is removed as a rollback so the panel
-    never reports a successful move while two active profiles exist. Updates
-    `data` in place; the caller persists it.
+    never reports a successful move while two active profiles exist. Only
+    remote state changes here; `_record_transfer` persists the result.
     """
     source_client = next((item for item in source_clients if item.get('clientId') == client_id), None)
     if not source_client:
@@ -5375,7 +5385,7 @@ async def _transfer_client_between(data, server_id, target_server_id, protocol, 
     source_data = source_client.get('userData') or {}
     connection = next(
         (
-            item for item in data.get('user_connections', [])
+            item for item in snapshot.get('user_connections', [])
             if item.get('server_id') == server_id
             and item.get('protocol') == protocol
             and item.get('client_id') == client_id
@@ -5446,35 +5456,55 @@ async def _transfer_client_between(data, server_id, target_server_id, protocol, 
             logger.exception('Failed to roll back target client %s after source removal failure', new_client_id)
         raise RuntimeError('Could not remove the source profile; the transfer was rolled back') from remove_error
 
-    user_ids = []
-    for item in data.get('user_connections', []):
-        if (item.get('server_id') == server_id and item.get('protocol') == protocol
-                and item.get('client_id') == client_id):
-            item.update({
-                'server_id': target_server_id,
-                'client_id': new_client_id,
-                'name': client_name,
-                'transferred_at': datetime.now(timezone.utc).isoformat(),
-            })
-            user_ids.append(item.get('user_id'))
     # Keep later clients of the same batch from reusing this name on the target.
     target_clients.append({'clientId': new_client_id, 'userData': {'clientName': client_name}})
-    _audit(
-        data,
-        'connection_transferred',
-        source_server_id=server_id,
-        target_server_id=target_server_id,
-        protocol=protocol,
-        source_client_id=client_id,
-        target_client_id=new_client_id,
-        client_name=client_name,
-    )
     return {
+        'source_client_id': client_id,
         'client_id': new_client_id,
         'name': client_name,
         'config': result.get('config') or '',
-        'user_ids': user_ids,
     }
+
+
+def _record_transfer(data, source_uid, target_uid, fallback_ids, protocol, moved):
+    """Re-point panel links at the moved client in freshly loaded state.
+
+    Server indices can shift while SSH work runs without DATA_LOCK (reorder,
+    delete), so both ends are resolved again through their stable uids.
+    Returns the ids of users whose profile moved.
+    """
+    source_id, _ = find_server_by_uid(data, source_uid)
+    target_id, _ = find_server_by_uid(data, target_uid)
+    if source_uid is None:
+        source_id = fallback_ids[0]
+    if target_uid is None:
+        target_id = fallback_ids[1]
+    user_ids = []
+    if source_id is not None and target_id is not None:
+        for item in data.get('user_connections', []):
+            if (item.get('server_id') == source_id and item.get('protocol') == protocol
+                    and item.get('client_id') == moved['source_client_id']):
+                item.update({
+                    'server_id': target_id,
+                    'client_id': moved['client_id'],
+                    'name': moved['name'],
+                    'transferred_at': datetime.now(timezone.utc).isoformat(),
+                })
+                user_ids.append(item.get('user_id'))
+    else:
+        logger.warning('Transferred client %s but a server was removed meanwhile; links left unchanged',
+                       moved['client_id'])
+    _audit(
+        data,
+        'connection_transferred',
+        source_server_id=source_id,
+        target_server_id=target_id,
+        protocol=protocol,
+        source_client_id=moved['source_client_id'],
+        target_client_id=moved['client_id'],
+        client_name=moved['name'],
+    )
+    return user_ids
 
 
 def _transfer_precheck(data, server_id, target_server_id, protocol):
@@ -5490,16 +5520,46 @@ def _transfer_precheck(data, server_id, target_server_id, protocol):
         raise TransferError('The selected server does not have this protocol installed')
 
 
+async def _commit_transfer(snapshot, server_id, target_server_id, protocol, moved):
+    """Persist one finished move under a short DATA_LOCK section."""
+    ends = (snapshot['servers'][server_id].get('uid'), snapshot['servers'][target_server_id].get('uid'))
+    async with DATA_LOCK:
+        data = load_data()
+        moved['user_ids'] = _record_transfer(data, *ends, (server_id, target_server_id), protocol, moved)
+        save_data(data)
+    return data
+
+
 def _notify_transferred(data, moved, target_server, protocol, requested):
     """Send each owner of a moved profile its new configuration."""
     statuses = [
         notify_user_profile(data, user_id, user_notifications.KIND_TRANSFERRED, target_server,
                             protocol, moved['name'], moved['config'], requested)
-        for user_id in moved['user_ids']
+        for user_id in moved.get('user_ids', [])
     ]
     if user_notifications.QUEUED in statuses:
         return user_notifications.QUEUED
     return statuses[0] if statuses else user_notifications.NO_USER
+
+
+async def _open_transfer_ends(source_server, target_server, protocol):
+    """Connect to both servers and read their client lists (no locks held)."""
+    source_ssh = get_ssh(source_server)
+    target_ssh = None
+    try:
+        await asyncio.to_thread(source_ssh.connect)
+        source_manager = get_protocol_manager(source_ssh, protocol)
+        source_clients = await asyncio.to_thread(_manager_call, source_manager, 'get_clients', protocol)
+        target_ssh = get_ssh(target_server)
+        await asyncio.to_thread(target_ssh.connect)
+        target_manager = get_protocol_manager(target_ssh, protocol)
+        target_clients = await asyncio.to_thread(_manager_call, target_manager, 'get_clients', protocol)
+    except Exception:
+        for ssh in (target_ssh, source_ssh):
+            if ssh:
+                await asyncio.to_thread(ssh.disconnect)
+        raise
+    return (source_ssh, source_manager, source_clients), (target_ssh, target_manager, target_clients)
 
 
 @app.post('/api/servers/{server_id}/connections/transfer', tags=["Connections"])
@@ -5510,52 +5570,38 @@ async def api_transfer_connection(request: Request, server_id: int, req: Transfe
     if not req.client_id:
         return JSONResponse({'error': 'Client ID is required'}, status_code=400)
 
-    source_ssh = None
-    target_ssh = None
+    ends = None
     try:
-        async with DATA_LOCK:
-            data = load_data()
-            _transfer_precheck(data, server_id, req.target_server_id, req.protocol)
-            source_server = data['servers'][server_id]
-            target_server = data['servers'][req.target_server_id]
-
-            source_ssh = get_ssh(source_server)
-            await asyncio.to_thread(source_ssh.connect)
-            source_manager = get_protocol_manager(source_ssh, req.protocol)
-            source_clients = await asyncio.to_thread(_manager_call, source_manager, 'get_clients', req.protocol)
-            if not any(item.get('clientId') == req.client_id for item in source_clients):
-                raise TransferError('Connection was not found on the source server', 404)
-
-            target_ssh = get_ssh(target_server)
-            await asyncio.to_thread(target_ssh.connect)
-            target_manager = get_protocol_manager(target_ssh, req.protocol)
-            target_clients = await asyncio.to_thread(_manager_call, target_manager, 'get_clients', req.protocol)
-
+        async with TRANSFER_LOCK:
+            snapshot = load_data()
+            _transfer_precheck(snapshot, server_id, req.target_server_id, req.protocol)
+            target_server = snapshot['servers'][req.target_server_id]
+            ends = await _open_transfer_ends(snapshot['servers'][server_id], target_server, req.protocol)
+            (_, source_manager, source_clients), (_, target_manager, target_clients) = ends
             moved = await _transfer_client_between(
-                data, server_id, req.target_server_id, req.protocol, req.client_id,
+                snapshot, server_id, req.protocol, req.client_id,
                 source_manager, source_clients, target_server, target_manager, target_clients,
             )
-            save_data(data)
-            config = moved['config']
-            return {
-                'status': 'success',
-                'client_id': moved['client_id'],
-                'server_id': req.target_server_id,
-                'name': moved['name'],
-                'config': config,
-                'vpn_link': generate_vpn_link(config) if config else '',
-                'user_notification': _notify_transferred(data, moved, target_server, req.protocol, req.notify_user),
-            }
+            data = await _commit_transfer(snapshot, server_id, req.target_server_id, req.protocol, moved)
+        config = moved['config']
+        return {
+            'status': 'success',
+            'client_id': moved['client_id'],
+            'server_id': req.target_server_id,
+            'name': moved['name'],
+            'config': config,
+            'vpn_link': generate_vpn_link(config) if config else '',
+            'user_notification': _notify_transferred(data, moved, target_server, req.protocol, req.notify_user),
+        }
     except TransferError as e:
         return JSONResponse({'error': str(e)}, status_code=e.status_code)
     except Exception as e:
         logger.exception('Error transferring connection')
         return JSONResponse({'error': str(e)}, status_code=500)
     finally:
-        if target_ssh:
-            await asyncio.to_thread(target_ssh.disconnect)
-        if source_ssh:
-            await asyncio.to_thread(source_ssh.disconnect)
+        if ends:
+            for ssh, _, _ in reversed(ends):
+                await asyncio.to_thread(ssh.disconnect)
 
 
 @app.post('/api/servers/{server_id}/connections/transfer-bulk', tags=["Connections"])
@@ -5574,45 +5620,28 @@ async def api_transfer_connections_bulk(request: Request, server_id: int, req: B
     if len(client_ids) > BULK_TRANSFER_LIMIT:
         return JSONResponse({'error': f'At most {BULK_TRANSFER_LIMIT} connections can be moved at once'}, status_code=400)
 
-    source_ssh = None
-    target_ssh = None
+    ends = None
     results = []
     try:
-        async with DATA_LOCK:
-            data = load_data()
-            _transfer_precheck(data, server_id, req.target_server_id, req.protocol)
-            source_server = data['servers'][server_id]
-            target_server = data['servers'][req.target_server_id]
-
-            source_ssh = get_ssh(source_server)
-            await asyncio.to_thread(source_ssh.connect)
-            source_manager = get_protocol_manager(source_ssh, req.protocol)
-            source_clients = await asyncio.to_thread(_manager_call, source_manager, 'get_clients', req.protocol)
-
-            target_ssh = get_ssh(target_server)
-            await asyncio.to_thread(target_ssh.connect)
-            target_manager = get_protocol_manager(target_ssh, req.protocol)
-            target_clients = await asyncio.to_thread(_manager_call, target_manager, 'get_clients', req.protocol)
+        async with TRANSFER_LOCK:
+            snapshot = load_data()
+            _transfer_precheck(snapshot, server_id, req.target_server_id, req.protocol)
+            target_server = snapshot['servers'][req.target_server_id]
+            ends = await _open_transfer_ends(snapshot['servers'][server_id], target_server, req.protocol)
+            (_, source_manager, source_clients), (_, target_manager, target_clients) = ends
 
             names = {
                 item.get('clientId'): (item.get('userData') or {}).get('clientName') or item.get('clientName') or item.get('clientId')
                 for item in source_clients
             }
             moved_items = []
+            data = snapshot
             for client_id in client_ids:
                 try:
                     moved = await _transfer_client_between(
-                        data, server_id, req.target_server_id, req.protocol, client_id,
+                        snapshot, server_id, req.protocol, client_id,
                         source_manager, source_clients, target_server, target_manager, target_clients,
                     )
-                    save_data(data)
-                    moved_items.append(moved)
-                    results.append({
-                        'client_id': client_id,
-                        'name': moved['name'],
-                        'status': 'success',
-                        'new_client_id': moved['client_id'],
-                    })
                 except Exception as e:
                     if not isinstance(e, TransferError):
                         logger.exception('Bulk transfer of client %s failed', client_id)
@@ -5622,18 +5651,29 @@ async def api_transfer_connections_bulk(request: Request, server_id: int, req: B
                         'status': 'error',
                         'error': str(e),
                     })
+                    continue
+                data = await _commit_transfer(snapshot, server_id, req.target_server_id, req.protocol, moved)
+                moved_items.append(moved)
+                results.append({
+                    'client_id': client_id,
+                    'name': moved['name'],
+                    'status': 'success',
+                    'new_client_id': moved['client_id'],
+                })
 
             transferred = len(moved_items)
-            _audit(
-                data,
-                'connections_bulk_transferred',
-                source_server_id=server_id,
-                target_server_id=req.target_server_id,
-                protocol=req.protocol,
-                requested=len(client_ids),
-                transferred=transferred,
-            )
-            save_data(data)
+            async with DATA_LOCK:
+                data = load_data()
+                _audit(
+                    data,
+                    'connections_bulk_transferred',
+                    source_server_id=server_id,
+                    target_server_id=req.target_server_id,
+                    protocol=req.protocol,
+                    requested=len(client_ids),
+                    transferred=transferred,
+                )
+                save_data(data)
 
         notified = iter([
             _notify_transferred(data, moved, target_server, req.protocol, req.notify_users)
@@ -5655,10 +5695,9 @@ async def api_transfer_connections_bulk(request: Request, server_id: int, req: B
         logger.exception('Error in bulk connection transfer')
         return JSONResponse({'error': str(e), 'results': results}, status_code=500)
     finally:
-        if target_ssh:
-            await asyncio.to_thread(target_ssh.disconnect)
-        if source_ssh:
-            await asyncio.to_thread(source_ssh.disconnect)
+        if ends:
+            for ssh, _, _ in reversed(ends):
+                await asyncio.to_thread(ssh.disconnect)
 
 
 @app.post('/api/servers/{server_id}/connections/edit', tags=["Connections"])

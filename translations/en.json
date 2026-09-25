@@ -657,5 +657,6 @@
   "notify_status_no_telegram": "The user has no linked Telegram — send the configuration manually",
   "notify_status_no_bot": "The Telegram bot token is not configured — the profile was not sent",
   "notify_badge_sent": "📨 sent in Telegram",
-  "notify_badge_no_telegram": "no Telegram"
+  "notify_badge_no_telegram": "no Telegram",
+  "notify_badge_no_bot": "not sent: bot is not configured"
 }

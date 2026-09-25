@@ -1700,16 +1700,30 @@ async def _admin_create_client(api: TelegramAPI, chat_id: int, message_id: int, 
         await api.edit_message(chat_id, message_id, f" {_tt(lang, 'error')}: {_e(e)}", reply_markup={"inline_keyboard": [[{"text": f"⬅️ {_tt(lang, 'btn_protocol')}", "callback_data": _ref("proto", {"sid": server_id, "proto": proto})}]]})
 
 
-async def _send_config_text(api: TelegramAPI, chat_id: int, server: dict, proto: str, conn_name: str, config: str, generate_vpn_link_fn: Callable, lang: str = "en"):
-    await api.send_message(chat_id, f"✅ <b>{_e(conn_name)}</b>\n🌐 {_tt(lang, 'servers_title')}: <b>{_e(server.get('name') or server.get('host'))}</b>\n {_tt(lang, 'protocol_label')}: <b>{_e(proto.upper())}</b>")
+def _ensure_sent(response) -> dict:
+    """Raise when the Bot API refused a send (blocked bot, too long, bad file)."""
+    if not isinstance(response, dict) or not response.get("ok"):
+        description = response.get("description") if isinstance(response, dict) else None
+        raise RuntimeError(description or "Telegram rejected the message")
+    return response
+
+
+async def _send_config_text(api: TelegramAPI, chat_id: int, server: dict, proto: str, conn_name: str, config: str, generate_vpn_link_fn: Callable, lang: str = "en", strict: bool = False):
+    """Send a profile's configuration; strict=True raises if any part was refused."""
+    async def send(pending):
+        response = await pending
+        if strict:
+            _ensure_sent(response)
+
+    await send(api.send_message(chat_id, f"✅ <b>{_e(conn_name)}</b>\n🌐 {_tt(lang, 'servers_title')}: <b>{_e(server.get('name') or server.get('host'))}</b>\n {_tt(lang, 'protocol_label')}: <b>{_e(proto.upper())}</b>"))
     if protocol_base(proto) in ("xray", "telemt"):
-        await api.send_message(chat_id, f"🔗 <b>{_tt(lang, 'connection_link_label')}</b>:\n<code>{_e(config)}</code>")
+        await send(api.send_message(chat_id, f"🔗 <b>{_tt(lang, 'connection_link_label')}</b>:\n<code>{_e(config)}</code>"))
     else:
-        await api.send_message(chat_id, f"<b>📄 {_tt(lang, 'config_label')}:</b>\n<pre>{_e(config)}</pre>")
+        await send(api.send_message(chat_id, f"<b>📄 {_tt(lang, 'config_label')}:</b>\n<pre>{_e(config)}</pre>"))
         vpn_link = generate_vpn_link_fn(config, server, proto) if config else ""
         if vpn_link:
-            await api.send_message(chat_id, f" <b>{_tt(lang, 'vpn_link_label')}</b>:\n<code>{_e(vpn_link)}</code>")
-        await api.send_document(chat_id, filename=f"{conn_name}.conf", content=config.encode("utf-8"), caption=f" {_tt(lang, 'config_file_label')}: {conn_name}")
+            await send(api.send_message(chat_id, f" <b>{_tt(lang, 'vpn_link_label')}</b>:\n<code>{_e(vpn_link)}</code>"))
+        await send(api.send_document(chat_id, filename=f"{conn_name}.conf", content=config.encode("utf-8"), caption=f" {_tt(lang, 'config_file_label')}: {conn_name}"))
 
 
 _PROFILE_NOTIFY_KEYS = {
@@ -1744,13 +1758,10 @@ async def _deliver_profile(api: TelegramAPI, chat_id, *, kind: str, server: dict
     intro = _tt(lang, _PROFILE_NOTIFY_KEYS.get(kind, "profile_notify_created"), name=_e(conn_name))
     if not config:
         intro += f"\n\n{_tt(lang, 'profile_notify_no_config')}"
-    sent = await api.send_message(chat_id, intro)
-    # The first message tells us whether the chat is reachable at all
-    # (blocked bot, deleted account); later sends reuse the same chat.
-    if not sent.get("ok"):
-        raise RuntimeError(sent.get("description") or "Telegram rejected the message")
+    _ensure_sent(await api.send_message(chat_id, intro))
     if config:
-        await _send_config_text(api, chat_id, server, proto, conn_name, config, generate_vpn_link_fn, lang)
+        # Strict: a refused config, link or file must not count as delivered.
+        await _send_config_text(api, chat_id, server, proto, conn_name, config, generate_vpn_link_fn, lang, strict=True)
 
 
 def _days_ago_text(value: Optional[str], lang: str) -> str:

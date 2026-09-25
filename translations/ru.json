@@ -657,5 +657,6 @@
   "notify_status_no_telegram": "У пользователя не привязан Telegram — отправьте конфигурацию вручную",
   "notify_status_no_bot": "Токен Telegram-бота не задан — профиль не отправлен",
   "notify_badge_sent": "📨 отправлен в Telegram",
-  "notify_badge_no_telegram": "нет Telegram"
+  "notify_badge_no_telegram": "нет Telegram",
+  "notify_badge_no_bot": "не отправлен: бот не настроен"
 }
