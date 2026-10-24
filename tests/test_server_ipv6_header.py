@@ -15,6 +15,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 import app as panel
+import json_state
 
 
 def server_with():
@@ -28,6 +29,7 @@ class ServerStatsIpv6Tests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self._data_file = panel.DATA_FILE
         panel.DATA_FILE = os.path.join(self.tmp, 'data.json')
+        json_state.install(self, panel)
         with open(panel.DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump({'servers': [server_with()], 'users': [], 'user_connections': []}, f)
         self._monitor_flag = panel._conn_monitor_started
