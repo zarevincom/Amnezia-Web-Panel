@@ -111,6 +111,7 @@ class ConnectionService:
         get_protocol_manager,
         manager_call,
         generate_vpn_link,
+        protocol_public_endpoint=None,
     ):
         self.load_data = load_data
         self.save_data = save_data
@@ -119,6 +120,10 @@ class ConnectionService:
         self.get_protocol_manager = get_protocol_manager
         self.manager_call = manager_call
         self.generate_vpn_link = generate_vpn_link
+        # Optional: without it a connection is issued for the server's own
+        # address and the instance's listen port, as it always was.
+        self.protocol_public_endpoint = protocol_public_endpoint or (
+            lambda server, protocol: (server.get('host', ''), None))
         self._provision_locks = defaultdict(asyncio.Lock)
         self._rate_events = defaultdict(list)
 
@@ -165,6 +170,7 @@ class ConnectionService:
                 self._validate_create_request(data, settings, user_id, server_id, protocol, clean_name, source)
                 server = dict(data['servers'][server_id])
                 port = server.get('protocols', {}).get(protocol, {}).get('port', '55424')
+                pub_host, pub_port = self.protocol_public_endpoint(server, protocol)
 
             # get_ssh() blocks on ensure_connected — keep it off the event loop.
             ssh = await asyncio.to_thread(self.get_ssh, server)
@@ -179,8 +185,9 @@ class ConnectionService:
                     'add_client',
                     protocol,
                     clean_name,
-                    server.get('host', ''),
+                    pub_host,
                     port,
+                    public_port=pub_port,
                 )
                 remote_client_id = result.get('client_id')
                 if not remote_client_id:

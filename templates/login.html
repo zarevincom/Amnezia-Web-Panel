@@ -4,6 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="robots" content="noindex, nofollow">
     <meta name="theme-color" content="#0a0a0f" id="metaThemeColor">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -196,7 +197,10 @@
     </div>
 
     <script>
-        window.I18N = {{ translations_json | safe }};
+        // The login page only needs the three strings its inline JS references;
+        // dumping the full UI dictionary here would publicly showcase every
+        // panel feature (servers, protocols, integrations) in view-source.
+        window.I18N = {{ login_translations_json | safe }};
         window._ = function (key) { return window.I18N[key] || key; };
 
         /* Theme toggle */

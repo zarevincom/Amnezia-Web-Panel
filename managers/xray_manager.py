@@ -141,6 +141,11 @@ class XrayManager:
         return 'Up' in out
 
     def check_protocol_installed(self):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.container_name)
+            if _st is not None:
+                return _st[0]
         out, _, _ = self.ssh.run_sudo_command(
             f"docker ps -a --filter name=^{self.container_name}$ --format '{{{{.Names}}}}'"
         )
@@ -678,7 +683,7 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 
         return clients_table
 
-    def get_client_config(self, protocol, client_id, server_host, port):
+    def get_client_config(self, protocol, client_id, server_host, port, public_port=None):
         clients = self._get_clients_table()
         client = next((c for c in clients if c['clientId'] == client_id), None)
         if not client: return None
@@ -701,14 +706,16 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
         encoded_name = urllib.parse.quote(name)
         
         url = (
-            f"vless://{client_id}@{server_host}:{meta.get('port', port)}"
+            # meta.json is synced from the live server.json, so it beats the
+            # port the panel remembers; an explicit public port beats both.
+            f"vless://{client_id}@{server_host}:{public_port or meta.get('port', port)}"
             f"?type=tcp&security=reality&pbk={meta['public_key']}"
             f"&sni={sni}&fp=chrome&sid={meta['short_id']}"
             f"&spx=%2F&flow=xtls-rprx-vision#{encoded_name}"
         )
         return url
 
-    def add_client(self, protocol, client_name, server_host, port):
+    def add_client(self, protocol, client_name, server_host, port, public_port=None):
         client_id = str(uuid.uuid4())
         
         config = self._get_server_json()
@@ -750,7 +757,7 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
 
         return {
             'client_id': client_id,
-            'config': self.get_client_config(protocol, client_id, server_host, port)
+            'config': self.get_client_config(protocol, client_id, server_host, port, public_port)
         }
 
     def toggle_client(self, protocol, client_id, enable):

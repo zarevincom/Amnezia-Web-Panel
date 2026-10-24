@@ -419,7 +419,7 @@ a:hover {
 }
 
 .btn-sm {
-    padding: 6px 14px;
+    padding: 6px 12px;
     font-size: 0.8rem;
     border-radius: var(--radius-sm);
 }
@@ -677,6 +677,7 @@ a:hover {
     justify-content: center;
     font-size: 1.4rem;
     flex-shrink: 0;
+    color: #fff;
     box-shadow: 0 2px 12px rgba(139, 92, 246, 0.2);
 }
 
@@ -871,6 +872,15 @@ a:hover {
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
     box-shadow: var(--shadow-lg);
+}
+
+/* An open panel is moved to <body> and placed by searchable-select.js in
+   viewport coordinates (inline left/top/width), so no modal can clip it.
+   Above .modal-backdrop (1000) and below .toast-container (2000). */
+.searchable-select-panel.is-floating {
+    position: fixed;
+    inset: auto;
+    z-index: 1100;
 }
 
 .searchable-select-search {
@@ -2177,6 +2187,15 @@ a:hover {
     margin-bottom: var(--space-md);
 }
 
+.protocol-ctrl button.btn.btn-secondary.btn-sm {
+    padding: 6px 5px;
+}
+
+/* ===== User connections modal: room for a wide connections table ===== */
+#userConnsModal .modal {
+    max-width: 1160px;
+}
+
 /* ===== QR Code ===== */
 .qr-container {
     display: flex;
@@ -2956,4 +2975,11 @@ body,
         min-width: 0;
         margin: 0;
     }
+}
+
+/* RKN Block installed actions: 2x2 grid of buttons */
+#rknblock-installed-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
 }

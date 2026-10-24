@@ -9,6 +9,11 @@
  * single source of truth, so existing code that reads `.value`, sets it, or
  * listens for `change` keeps working untouched.
  *
+ * While open, the panel is parked in <body> and positioned in viewport
+ * coordinates: a modal is a scroll box with a transform on it, and such a box
+ * clips even position: fixed children, so a panel left inside one gets cut off
+ * at the modal's edge. See position().
+ *
  * Labels come from data attributes so translations stay in the templates:
  *   data-search-placeholder="..."   search box placeholder
  *   data-search-empty="..."         shown when nothing matches
@@ -18,16 +23,47 @@
 
     var ID_SEQ = 0;
 
+    /* Gap between the trigger and the panel, and the margin the panel keeps
+       from the viewport edges. */
+    var PANEL_GAP = 4;
+    var VIEWPORT_MARGIN = 8;
+    /* Roughly two rows: the list is never squeezed below this, so on a very
+       short viewport the panel overlaps the trigger instead of collapsing. */
+    var MIN_LIST_HEIGHT = 64;
+
+    function clamp(value, min, max) {
+        return Math.min(Math.max(value, min), Math.max(min, max));
+    }
+
     function textOf(option) {
         return (option.textContent || '').trim();
     }
 
+    /* Is the element still rendered? A modal that was closed keeps its box and
+       its rect, so the fallback below (browsers without checkVisibility) only
+       catches a detached or display: none trigger. */
+    function isVisible(el) {
+        if (el.checkVisibility) {
+            return el.checkVisibility({ visibilityProperty: true, opacityProperty: true });
+        }
+        var rect = el.getBoundingClientRect();
+        return !!(rect.width || rect.height);
+    }
+
     function SearchableSelect(select) {
+        var self = this;
         this.select = select;
         this.id = 'ss-' + (++ID_SEQ);
         this.open = false;
         this.activeIndex = -1;
         this.items = [];
+        // Kept on the instance so show() and hide() add and remove the very
+        // same listener.
+        this.onViewportChange = function (e) {
+            // Scrolling the option list is not the panel moving.
+            if (e && e.target && self.panel.contains(e.target)) return;
+            self.position();
+        };
         this.build();
     }
 
@@ -119,7 +155,8 @@
             self.syncTrigger();
         });
         document.addEventListener('click', function (e) {
-            if (self.open && !wrapper.contains(e.target)) {
+            // The open panel sits in <body>, so it is outside the wrapper.
+            if (self.open && !wrapper.contains(e.target) && !panel.contains(e.target)) {
                 self.hide();
             }
         });
@@ -170,6 +207,7 @@
         });
         this.empty.hidden = visible !== 0;
         this.setActive(this.firstVisibleIndex());
+        if (this.open) this.position();   // filtering just changed the height
     };
 
     SearchableSelect.prototype.visibleItems = function () {
@@ -238,6 +276,9 @@
                 this.trigger.focus();
                 break;
             case 'Tab':
+                // Focus is inside the panel, which lives in <body>; hand it
+                // back so the next tab stop is the one after this field.
+                this.trigger.focus();
                 this.hide();
                 break;
         }
@@ -254,21 +295,107 @@
 
     SearchableSelect.prototype.show = function () {
         if (this.open) return;
+        var self = this;
         this.open = true;
         this.panel.hidden = false;
+        // Out of the modal and into <body>: nothing between the panel and the
+        // page can clip it there.
+        document.body.appendChild(this.panel);
+        this.panel.classList.add('is-floating');
         this.wrapper.classList.add('is-open');
         this.trigger.setAttribute('aria-expanded', 'true');
         this.syncTrigger();               // pick up programmatic value changes
         this.search.value = '';
         this.filter('');
         this.setActive(this.select.selectedIndex);
+        this.position();
         this.search.focus();
+
+        window.addEventListener('resize', this.onViewportChange);
+        // Capture phase: a scroll inside the modal never bubbles to window.
+        document.addEventListener('scroll', this.onViewportChange, true);
+        // The panel no longer rides along with the trigger, so close once the
+        // trigger is scrolled out of its own modal rather than leave the panel
+        // floating over the page.
+        if (window.IntersectionObserver) {
+            if (!this.observer) {
+                this.observer = new IntersectionObserver(function (entries) {
+                    if (self.open && !entries[entries.length - 1].isIntersecting) {
+                        self.hide();
+                    }
+                });
+            }
+            this.observer.observe(this.trigger);
+        }
+        // Closing a modal flips a class on it; the panel is no longer inside
+        // it, so it would be left hanging over the page. Any ancestor that
+        // changes class, style or hidden is reason enough to re-check.
+        if (window.MutationObserver) {
+            if (!this.ancestorObserver) {
+                this.ancestorObserver = new MutationObserver(function () {
+                    if (self.open && !isVisible(self.trigger)) self.hide();
+                });
+            }
+            for (var node = this.wrapper.parentNode; node && node.nodeType === 1; node = node.parentNode) {
+                this.ancestorObserver.observe(node, {
+                    attributes: true,
+                    attributeFilter: ['class', 'style', 'hidden'],
+                });
+            }
+        }
+    };
+
+    /**
+     * Place the open panel under the trigger in viewport coordinates, flipping
+     * above it and shrinking the option list when there is not enough room
+     * below. Runs on open and on every scroll or resize while open.
+     */
+    SearchableSelect.prototype.position = function () {
+        if (!isVisible(this.trigger)) {   // the field is gone (modal closed)
+            this.hide();
+            return;
+        }
+
+        var rect = this.trigger.getBoundingClientRect();
+        var panel = this.panel;
+        panel.style.width = rect.width + 'px';
+
+        // Natural size first: the list keeps the cap it has in CSS. That
+        // shrinks its scroll range for a moment, so remember where the user
+        // had scrolled to and put it back below.
+        var scrolled = this.list.scrollTop;
+        this.list.style.maxHeight = '';
+        var listHeight = this.list.offsetHeight;
+        var chrome = panel.offsetHeight - listHeight;   // search box + padding
+        var below = window.innerHeight - rect.bottom - PANEL_GAP - VIEWPORT_MARGIN;
+        var above = rect.top - PANEL_GAP - VIEWPORT_MARGIN;
+        var openDown = panel.offsetHeight <= below || below >= above;
+        var room = openDown ? below : above;
+
+        this.list.style.maxHeight =
+            Math.round(Math.max(MIN_LIST_HEIGHT, Math.min(listHeight, room - chrome))) + 'px';
+        this.list.scrollTop = scrolled;
+
+        var height = panel.offsetHeight;
+        var top = openDown ? rect.bottom + PANEL_GAP : rect.top - PANEL_GAP - height;
+        panel.style.top =
+            clamp(top, VIEWPORT_MARGIN, window.innerHeight - height - VIEWPORT_MARGIN) + 'px';
+        panel.style.left =
+            clamp(rect.left, VIEWPORT_MARGIN, window.innerWidth - rect.width - VIEWPORT_MARGIN) + 'px';
     };
 
     SearchableSelect.prototype.hide = function () {
         if (!this.open) return;
         this.open = false;
+        window.removeEventListener('resize', this.onViewportChange);
+        document.removeEventListener('scroll', this.onViewportChange, true);
+        if (this.observer) this.observer.disconnect();
+        if (this.ancestorObserver) this.ancestorObserver.disconnect();
         this.panel.hidden = true;
+        this.panel.classList.remove('is-floating');
+        this.panel.removeAttribute('style');    // drop the viewport coordinates
+        this.list.style.maxHeight = '';
+        this.wrapper.appendChild(this.panel);   // back under its own trigger
         this.wrapper.classList.remove('is-open');
         this.trigger.setAttribute('aria-expanded', 'false');
     };
