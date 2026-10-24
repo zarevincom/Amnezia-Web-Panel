@@ -7,6 +7,7 @@ import hashlib
 import secrets
 import uuid
 import asyncio
+import math
 import platform
 import re
 import shutil
@@ -33,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File, Form
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool, constr
 from typing import Optional, List, Dict
 import uvicorn
 import httpx
@@ -44,6 +45,7 @@ except ImportError:
     CaptchaGenerator = None
 
 from managers.ssh_manager import SSHManager
+from managers import ssh_trust
 from managers.awg_manager import AWGManager, normalize_special_junk
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
@@ -61,7 +63,15 @@ from telegram_invite_service import (
 )
 
 from exit_link_service import ExitLinkError, ExitLinkService
+from mail_service import (
+    DEFAULT_MAIL_SETTINGS,
+    MailError,
+    MailOptions,
+    MailService,
+    merge_mail_settings,
+)
 from pwa import build_manifest
+from captcha_challenges import captcha_challenges
 from connection_service import (
     ConnectionService,
     DEFAULT_SELF_SERVICE_SETTINGS,
@@ -91,6 +101,7 @@ OPENAPI_TAGS = [
     {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, encrypted SQLite backup/restore and legacy JSON migration."},
     {"name": "Notifications", "description": "Scheduled Telegram personal messages."},
     {"name": "Invites", "description": "One-time Telegram account binding links issued by the bot or an authenticated admin integration."},
+    {"name": "Email", "description": "SMTP delivery of configs and proxy links — to one user or to every user with an address."},
     {"name": "API Tokens", "description": "Bearer tokens for external integrations. Send the token in `Authorization: Bearer <token>`; tokens have admin-equivalent rights and are tied to the admin user that created them."},
 ]
 
@@ -135,9 +146,50 @@ async def custom_redoc():
     )
     response.headers['Cache-Control'] = 'no-store'
     return response
+
+
+@app.middleware("http")
+async def noindex_middleware(request, call_next):
+    """Keep every panel page out of search indexes.
+
+    The panel is an admin tool, often exposed on a public domain (e.g. a
+    DuckDNS name). Without this header a reachable instance can end up in
+    search results, advertising its login page to scanners. noindex/nofollow
+    via X-Robots-Tag covers HTML pages, API responses and error pages alike.
+    """
+    response = await call_next(request)
+    response.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    return response
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt():
+    """Politely ask crawlers to stay away (X-Robots-Tag above is the real lock;
+    robots.txt is only a hint and gets ignored by some bots)."""
+    return PlainTextResponse("User-agent: *\nDisallow: /\n")
+
+DOCS_PATHS = ('/docs', '/redoc', '/openapi.json')
+
+
+@app.middleware("http")
+async def docs_auth_middleware(request, call_next):
+    """Serve the API schema only to authenticated admins.
+
+    The OpenAPI document is a ready-made map of every endpoint and
+    parameter of the panel; leaving it open to anonymous visitors hands
+    scanners the feature list for free. Session cookie or admin Bearer
+    token both count.
+    """
+    if request.url.path in DOCS_PATHS and not _check_admin(request):
+        if request.url.path == '/openapi.json':
+            return JSONResponse({'error': 'Forbidden'}, status_code=403)
+        return RedirectResponse('/login')
+    return await call_next(request)
+
+# Sessions must wrap every other middleware: docs_auth_middleware above
+# reads request.session, so SessionMiddleware has to sit outside it.
 app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
 
-# Mount static files & templates
 class CachedStaticFiles(StaticFiles):
     """Static assets that carry ?v=<static mtime> (see static_version()) change
     their URL on every redeploy, so they can be cached for 180 days. Assets
@@ -156,7 +208,9 @@ class CachedStaticFiles(StaticFiles):
                 else 'public, max-age=3600, must-revalidate')
         return response
 
-app.mount("/static", CachedStaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+# Bundled resources live beside __file__, not beside the PyInstaller executable.
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
 if getattr(sys, 'frozen', False):
@@ -177,7 +231,8 @@ STATE_STORE = SQLiteStateStore(
     master_key=os.environ.get('PANEL_MASTER_KEY', ''),
     require_encryption=os.environ.get('PANEL_REQUIRE_ENCRYPTION', '').lower() in {'1', 'true', 'yes'},
 )
-CURRENT_VERSION = "v1.6.7"
+ssh_trust.configure(DATA_FILE)
+CURRENT_VERSION = "v1.7.9"
 USER_EQUIVALENT_ROLES = ('user', 'tg_user')
 PASSWORD_OPTIONAL_ROLES = ('none', 'tg_user')
 VALID_USER_ROLES = ('admin', 'support', *USER_EQUIVALENT_ROLES, 'none')
@@ -259,6 +314,9 @@ def load_data():
     settings.setdefault('captcha', {'enabled': False})
     settings.setdefault('exit_nodes', {'default_exit_uid': ''})
     settings.setdefault('telegram', {'token': '', 'enabled': False})
+    mail = settings.setdefault('mail', dict(DEFAULT_MAIL_SETTINGS))
+    for key, value in DEFAULT_MAIL_SETTINGS.items():
+        mail.setdefault(key, value)
     settings.setdefault('ssl', {
         'enabled': False,
         'domain': '',
@@ -288,6 +346,10 @@ def load_data():
         self_service.setdefault(key, value)
     for server in data.get('servers', []):
         server.setdefault('self_service_enabled', False)
+        # Legacy RKN toggle: the blocking contour is now a marketplace app
+        # (server['rknblock']). The old flag is dropped so every server shows
+        # "not installed" until the app is installed from the store.
+        server.pop('rkn_block_enabled', None)
     return data
 
 
@@ -1084,9 +1146,20 @@ def next_protocol_key(protocols: dict, base: str) -> str:
     return protocol_key(base, idx)
 
 
-def protocol_display_name(protocol: str) -> str:
+# The official Amnezia client has no separate AWG 3 container: it installs
+# AWG 3.x into amnezia-awg2 and only the config (HeaderProtectionKey) differs.
+AWG3_IN_AWG2_NAME = 'AmneziaWG 3 (amnezia-awg2)'
+
+
+def is_awg3_in_awg2(protocol: str, header_protection=False) -> bool:
+    return protocol_base(protocol) == 'awg2' and bool(header_protection)
+
+
+def protocol_display_name(protocol: str, header_protection=False) -> str:
     base = protocol_base(protocol)
     idx = protocol_instance(protocol)
+    if is_awg3_in_awg2(protocol, header_protection):
+        return AWG3_IN_AWG2_NAME if idx <= 1 else f'{AWG3_IN_AWG2_NAME} #{idx}'
     names = {
         'awg': 'AmneziaWG',
         'awg2': 'AmneziaWG 2.0',
@@ -1255,6 +1328,50 @@ def normalize_rfc3339(value: Optional[str]) -> Optional[str]:
 AWG_PROTOCOLS = ('awg', 'awg2', 'awg3', 'awg_legacy')
 
 
+# A public host is an IP (v4, or v6 in the brackets an endpoint needs to stay
+# readable next to the port) or a DNS name. Anything else -- a scheme, a path,
+# a space, a bare IPv6 -- would be copied verbatim into client configs, where
+# it reads as a valid endpoint and simply never connects.
+PUBLIC_HOST_MAX = 253
+PUBLIC_HOST_RE = re.compile(r'^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9._-]*)$')
+
+
+def normalize_public_host(value):
+    """Validated public host, or '' when the field is left empty."""
+    host = str(value or '').strip()
+    if not host:
+        return ''
+    if len(host) > PUBLIC_HOST_MAX or not PUBLIC_HOST_RE.match(host):
+        raise ValueError('Public host must be an IP address or a host name')
+    return host
+
+
+def normalize_public_port(value):
+    """Validated public port as a string, or '' when the field is left empty."""
+    port = str(value or '').strip()
+    if not port:
+        return ''
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError('Public port must be a number between 1 and 65535')
+    return port
+
+
+def protocol_public_endpoint(server, protocol):
+    """The address clients must dial for one protocol instance: (host, port).
+
+    Both default to what the panel itself uses -- the server address it opens
+    SSH to, and the instance's own listen port (the returned port is None then,
+    so managers keep using it). An instance can live somewhere else: a second
+    IP on the same box, a port forward, a domain name. `public_host` and
+    `public_port` on the instance record carry that, and every config and link
+    handed to a client follows them.
+    """
+    info = (server.get('protocols') or {}).get(protocol) or {}
+    host = str(info.get('public_host') or '').strip() or server.get('host', '')
+    public_port = str(info.get('public_port') or '').strip() or None
+    return host, public_port
+
+
 def join_dns(dns1, dns2):
     """Join the two DNS fields into the `a, b` form used in configs."""
     parts = [str(value).strip() for value in (dns1, dns2) if value and str(value).strip()]
@@ -1288,10 +1405,12 @@ AWG_CONFIG_KEYS = (
 )
 
 
-def protocol_short_name(protocol: str) -> str:
+def protocol_short_name(protocol: str, header_protection=False) -> str:
     """Short protocol tag for the server name, e.g. `AWG3`."""
     base = protocol_base(protocol)
     idx = protocol_instance(protocol)
+    if is_awg3_in_awg2(protocol, header_protection):
+        base = 'awg3'
     names = {
         'awg': 'AWG',
         'awg2': 'AWG2',
@@ -1313,7 +1432,8 @@ def protocol_short_name(protocol: str) -> str:
 def connection_display_name(server=None, protocol=None) -> str:
     """`<node> <container>`, e.g. `nl-01 AWG3` -- the name the client will show."""
     node = str((server or {}).get('name') or (server or {}).get('host') or '').strip()
-    tag = protocol_short_name(protocol) if protocol else ''
+    record = ((server or {}).get('protocols') or {}).get(protocol) or {} if protocol else {}
+    tag = protocol_short_name(protocol, record.get('header_protection')) if protocol else ''
     return ' '.join(part for part in (node, tag) if part)
 
 
@@ -1636,7 +1756,27 @@ self_service_connections = ConnectionService(
     get_protocol_manager=get_protocol_manager,
     manager_call=_manager_call,
     generate_vpn_link=generate_vpn_link,
+    protocol_public_endpoint=protocol_public_endpoint,
 )
+
+
+mail_svc = MailService(
+    load_data=load_data,
+    get_ssh=get_ssh,
+    get_protocol_manager=get_protocol_manager,
+    manager_call=_manager_call,
+    config_payloads=config_payloads,
+    protocol_display_name=protocol_display_name,
+    protocol_base=protocol_base,
+    translate=_t,
+)
+
+
+def _mail_error_response(exc: MailError, lang: str):
+    """MailError carries a translation key, so the browser gets the message in
+    the admin's language and the machine-readable key next to it."""
+    return JSONResponse({'error': _t(str(exc), lang), 'code': str(exc)},
+                        status_code=exc.status_code)
 
 
 def _exit_manager_factory(ssh):
@@ -1914,12 +2054,13 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
             for c_req in ops['create']:
                 proto_info = srv.get('protocols', {}).get(c_req['protocol'], {})
                 port = proto_info.get('port', '55424')
+                pub_host, pub_port = protocol_public_endpoint(srv, c_req['protocol'])
                 manager = get_protocol_manager(ssh, c_req['protocol'])
                 
                 if c_req['protocol'] == 'wireguard':
-                    res = await asyncio.to_thread(manager.add_client, c_req['name'], srv['host'])
+                    res = await asyncio.to_thread(manager.add_client, c_req['name'], pub_host, public_port=pub_port)
                 else:
-                    res = await asyncio.to_thread(_manager_call, manager, 'add_client', c_req['protocol'], c_req['name'], srv['host'], port)
+                    res = await asyncio.to_thread(_manager_call, manager, 'add_client', c_req['protocol'], c_req['name'], pub_host, port, public_port=pub_port)
                 
                 if res.get('client_id'):
                     new_conn = {
@@ -2097,6 +2238,8 @@ def get_current_user(request: Request):
     data = load_data()
     for u in data.get('users', []):
         if u['id'] == user_id:
+            if not u.get('enabled', True) or u.get('role') == 'none':
+                return None
             return u
     return None
 
@@ -2109,7 +2252,7 @@ def static_version():
     page renders new markup against old rules.
     """
     newest = 0.0
-    for root, _dirs, files in os.walk(os.path.join(application_path, 'static')):
+    for root, _dirs, files in os.walk(STATIC_DIR):
         for name in files:
             try:
                 newest = max(newest, os.path.getmtime(os.path.join(root, name)))
@@ -2132,6 +2275,11 @@ def tpl(request, template, **kwargs):
         'lang': lang,
         '_': lambda text_id: _t(text_id, lang),
         'translations_json': json.dumps(TRANSLATIONS.get(lang, TRANSLATIONS.get('en', {}))),
+        # The login page is the only public page; it must not dump the whole
+        # UI dictionary (a feature showcase of the panel) into view-source.
+        'login_translations_json': json.dumps({
+            k: _t(k, lang) for k in ('login', 'logging_in', 'login_error')
+        }),
         'all_translations_json': json.dumps(TRANSLATIONS)
     }
     ctx.update(kwargs)
@@ -2153,7 +2301,7 @@ def web_manifest(request: Request):
 @app.get('/sw.js')
 def service_worker():
     """Root-scoped service worker. Must not live under /static/ or scope is confined."""
-    path = os.path.join(application_path, 'static', 'sw.js')
+    path = os.path.join(STATIC_DIR, 'sw.js')
     return FileResponse(
         path,
         media_type='text/javascript',
@@ -2313,6 +2461,12 @@ class RenameProtocolRequest(BaseModel):
     name: str = ''  # empty = reset to default
 
 
+class PublicEndpointRequest(BaseModel):
+    protocol: str = ''
+    public_host: str = ''  # empty = the server's own address
+    public_port: str = ''  # empty = the instance's listen port
+
+
 class AddConnectionRequest(BaseModel):
     protocol: str = 'awg'
     name: str = 'Connection'
@@ -2369,6 +2523,14 @@ class RenameConnectionRequest(BaseModel):
     client_id: str = ''
     new_name: str = ''
     max_speed: float = -1  # Mbit/s; -1 = don't touch, 0 = unlimited
+
+
+class ConnectionSpeedRequest(BaseModel):
+    protocol: str = Field(default='awg', min_length=1, max_length=64)
+    client_id: str = Field(min_length=1, max_length=256)
+    # Validate numeric bounds in the handler so non-standard JSON NaN/Infinity
+    # also receive a JSON error without serializing the invalid number back.
+    max_speed: float = Field(strict=True, description='Finite Mbit/s, 0..1000000 in steps of 0.1; 0 = unlimited')
 
 class SaveConnectionConfigRequest(BaseModel):
     protocol: str = 'awg'
@@ -2450,6 +2612,12 @@ class SSLSettings(BaseModel):
     key_text: str = ''
     panel_port: int = 5000
 
+class DuckDNSApplyRequest(BaseModel):
+    enabled: bool = False
+    domain: str = ''
+    # Empty keeps the stored token: the settings page never echoes it back.
+    token: str = ''
+
 class TelegramSettings(BaseModel):
     token: str = ''
     enabled: bool = False
@@ -2505,6 +2673,20 @@ class TelegramInviteRequest(BaseModel):
     """Request a non-expiring, one-time Telegram account binding link."""
 
 
+class MailSettings(BaseModel):
+    enabled: bool = False
+    host: str = ''
+    port: int = Field(587, ge=1, le=65535)
+    security: str = 'starttls'      # none | starttls | ssl
+    username: str = ''
+    # Empty keeps the stored password: the settings page never echoes it back.
+    password: str = ''
+    from_email: str = ''
+    from_name: str = ''
+    reply_to: str = ''
+    timeout_seconds: int = Field(30, ge=5, le=300)
+
+
 class AutoBackupSettings(BaseModel):
     enabled: bool = False
     interval_hours: int = 24
@@ -2533,7 +2715,7 @@ class UpdateUserRequest(BaseModel):
     telegramId: Optional[str] = None
     email: Optional[str] = None
     description: Optional[str] = None
-    traffic_limit: Optional[float] = 0
+    traffic_limit: Optional[float] = None
     traffic_reset_strategy: Optional[str] = None
     expiration_date: Optional[str] = None
     password: Optional[str] = None
@@ -2553,6 +2735,7 @@ class SaveSettingsRequest(BaseModel):
     auto_backup: AutoBackupSettings = AutoBackupSettings()
     self_service: SelfServiceSettings = SelfServiceSettings()
     exit_nodes: ExitNodesSettings = ExitNodesSettings()
+    mail: MailSettings = MailSettings()
 
 
 class ToggleUserRequest(BaseModel):
@@ -2582,6 +2765,30 @@ class AddUserConnectionRequest(BaseModel):
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
     notify_user: bool = True
+
+
+class MailSendRequest(BaseModel):
+    include_configs: bool = True
+    include_links: bool = True
+    subject: str = ''
+    message: str = ''
+    # Overrides the address on the user record for this one send.
+    recipient: Optional[str] = None
+
+
+class MailBulkRequest(BaseModel):
+    include_configs: bool = True
+    include_links: bool = True
+    subject: str = ''
+    message: str = ''
+    # None means "every user that has an address".
+    user_ids: Optional[List[str]] = None
+    only_enabled: bool = True
+    skip_without_connections: bool = True
+
+
+class MailTestRequest(BaseModel):
+    recipient: str = ''
 
 
 class CreateApiTokenRequest(BaseModel):
@@ -2647,6 +2854,7 @@ def _start_conn_monitor():
 async def startup():
     user_notifications.bind_loop(asyncio.get_running_loop())
     _start_conn_monitor()
+    _start_duckdns_monitor()
     data = load_data()
     changed = False
     if not data.get('users'):
@@ -3314,9 +3522,25 @@ def login_page(request: Request):
 
 @app.get("/set_lang/{lang}", tags=["System Templates"])
 def set_lang(lang: str, request: Request):
+    if lang not in TRANSLATIONS:
+        return JSONResponse({'error': 'Unsupported language'}, status_code=400)
+    # Referer is untrusted: keep only a same-origin path, never an external URL.
     ref = request.headers.get("referer", "/")
-    response = RedirectResponse(url=ref)
-    response.set_cookie(key="lang", value=lang, max_age=31536000)
+    target = '/'
+    try:
+        parsed = urllib.parse.urlsplit(ref)
+        origin = urllib.parse.urlsplit(str(request.base_url))
+        same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
+        relative = not parsed.scheme and not parsed.netloc
+        if (same_origin or relative) and not any(c in ref for c in (chr(92), chr(13), chr(10))):
+            path = parsed.path or '/'
+            if path.startswith('/') and not path.startswith('//'):
+                target = urllib.parse.urlunsplit(('', '', path, parsed.query, ''))
+    except ValueError:
+        pass
+    response = RedirectResponse(url=target)
+    response.set_cookie(key="lang", value=lang, max_age=31536000,
+                        httponly=True, secure=request.url.scheme == 'https', samesite='lax')
     return response
 
 
@@ -3429,7 +3653,9 @@ def api_captcha(request: Request):
     # 2 is a multiplier for the image resolution size
     generator = CaptchaGenerator(2)
     captcha = generator.gen_captcha_image(difficult_level=2)
-    request.session['captcha_answer'] = captcha.characters
+    request.session.pop('captcha_answer', None)  # Remove legacy disclosed answers.
+    captcha_challenges.discard(request.session.pop('captcha_challenge_id', None))
+    request.session['captcha_challenge_id'] = captcha_challenges.issue(captcha.characters)
     
     img_bytes = io.BytesIO()
     captcha.image.save(img_bytes, format='PNG')
@@ -3442,13 +3668,12 @@ def api_captcha(request: Request):
 def api_login(request: Request, req: LoginRequest):
     data = load_data()
     captcha_settings = data.get('settings', {}).get('captcha', {})
+    request.session.pop('captcha_answer', None)  # Never accept legacy cookie answers.
     if captcha_settings.get('enabled') is True:
-        answer = request.session.get('captcha_answer')
+        challenge_id = request.session.pop('captcha_challenge_id', None)
         lang = request.cookies.get('lang', 'ru')
-        if not answer or not req.captcha or answer.lower() != req.captcha.lower():
-            request.session.pop('captcha_answer', None)
+        if not captcha_challenges.consume(challenge_id, req.captcha):
             return JSONResponse({'error': _t('invalid_captcha', lang)}, status_code=400)
-        request.session.pop('captcha_answer', None)
 
     for u in data.get('users', []):
         # Users without a password (role 'none', record-only) can never log in.
@@ -3497,6 +3722,86 @@ def _check_admin(request):
     return None
 
 
+class SSHTrustConfirmation(BaseModel):
+    token: constr(min_length=1, max_length=4096)
+    confirmed: StrictBool
+
+
+def _ssh_trust_admin(request):
+    # Keep session/Bearer authorization; reject cross-origin browser writes.
+    origin = request.headers.get('origin')
+    fetch_site = request.headers.get('sec-fetch-site')
+    # Modern browsers supply unforgeable-by-JS same-origin metadata even
+    # behind TLS-terminating proxies. Do not trust arbitrary Forwarded headers.
+    if origin and fetch_site != 'same-origin' and origin.rstrip('/') != str(request.base_url).rstrip('/'):
+        return False
+    if fetch_site in ('cross-site', 'same-site'):
+        return False
+    user = _check_admin(request)
+    return bool(user and user['role'] == 'admin')
+
+
+@app.post('/api/servers/{server_id}/ssh-trust/inspect', tags=["Servers"])
+def api_ssh_trust_inspect(request: Request, server_id: int):
+    if not _ssh_trust_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    servers = load_data()['servers']
+    if not 0 <= server_id < len(servers):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    try:
+        return ssh_trust.inspect(servers[server_id])
+    except Exception as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
+async def _finish_locked_worker(function):
+    """Do not release a caller's lock while its worker can still mutate state."""
+    worker = asyncio.create_task(asyncio.to_thread(function))
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        # Retrieve any worker exception, but preserve the request cancellation.
+        if not worker.cancelled():
+            worker.exception()
+        raise asyncio.CancelledError
+    return worker.result()
+
+
+@app.post('/api/servers/{server_id}/ssh-trust/confirm', tags=["Servers"])
+async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation):
+    if not _ssh_trust_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not req.confirmed:
+        return JSONResponse({'error': 'Explicit confirmation required'}, status_code=400)
+    servers = load_data()['servers']
+    if not 0 <= server_id < len(servers):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = servers[server_id]
+    try:
+        def unchanged():
+            current = load_data()['servers']
+            return (server_id < len(current) and
+                    all(current[server_id].get(k) == server.get(k)
+                        for k in ('uid', 'host', 'ssh_port')))
+        # Serialize the final endpoint check and trust write with server edits.
+        async with DATA_LOCK:
+            def enroll_and_reset():
+                result = ssh_trust.enroll(server, req.token, validate_endpoint=unchanged)
+                drop_ssh(server)
+                return result
+
+            result = await _finish_locked_worker(enroll_and_reset)
+        return result
+    except Exception as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
 @app.post('/api/servers/add', tags=["Servers"])
 def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
@@ -3538,69 +3843,73 @@ def api_add_server(request: Request, req: AddServerRequest):
 
 
 @app.post('/api/servers/{server_id}/edit', tags=["Servers"])
-def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
+async def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
     """Update connection details for an existing server entry. Verifies the new
     credentials by SSH-connecting before persisting, so a typo can't lock us out.
     """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-
-        new_host = (req.host or '').strip() or server['host']
-        new_user = (req.username or '').strip() or server['username']
-        new_port = int(req.ssh_port or server.get('ssh_port', 22))
-        new_name = (req.name or '').strip() or server.get('name') or new_host
-
-        # Credential resolution: a non-empty value in either field switches to
-        # that auth method (and clears the other). Both omitted => keep current.
-        if req.private_key:
-            new_pass, new_key = '', req.private_key
-        elif req.password:
-            new_pass, new_key = req.password, ''
-        else:
-            new_pass = server.get('password', '')
-            new_key = server.get('private_key', '')
-
-        if not new_pass and not new_key:
-            return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
-
-        # Verify the new connection details before committing the change.
-        ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+    def edit():
         try:
-            ssh.connect()
-            server_info = ssh.test_connection()
-            ssh.disconnect()
-        except Exception as e:
-            return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
+            data = load_data()
+            if server_id >= len(data['servers']):
+                return JSONResponse({'error': 'Server not found'}, status_code=404)
+            server = data['servers'][server_id]
 
-        server['name'] = new_name
-        server['host'] = new_host
-        server['ssh_port'] = new_port
-        server['username'] = new_user
-        server['password'] = new_pass
-        server['private_key'] = new_key
-        server['server_info'] = server_info
-        if req.expires_at is not None:
-            server['expires_at'] = req.expires_at or None
-        if req.payment_day is not None:
-            if req.payment_day and not 1 <= req.payment_day <= 31:
-                return JSONResponse({'error': 'Payment day must be between 1 and 31'}, status_code=400)
-            server['payment_day'] = req.payment_day or None
-        if req.price is not None:
-            server['price'] = req.price.strip()
-        if req.self_service_enabled is not None:
-            server['self_service_enabled'] = bool(req.self_service_enabled)
-        save_data(data)
-        # Drop the stale pooled connection: credentials/host may have changed.
-        drop_ssh(server)
-        return {'status': 'success', 'server_info': server_info}
-    except Exception as e:
-        logger.exception("Error editing server")
-        return JSONResponse({'error': str(e)}, status_code=500)
+            new_host = (req.host or '').strip() or server['host']
+            new_user = (req.username or '').strip() or server['username']
+            new_port = int(req.ssh_port or server.get('ssh_port', 22))
+            new_name = (req.name or '').strip() or server.get('name') or new_host
+
+            # Credential resolution: a non-empty value in either field switches to
+            # that auth method (and clears the other). Both omitted => keep current.
+            if req.private_key:
+                new_pass, new_key = '', req.private_key
+            elif req.password:
+                new_pass, new_key = req.password, ''
+            else:
+                new_pass = server.get('password', '')
+                new_key = server.get('private_key', '')
+
+            if not new_pass and not new_key:
+                return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
+
+            # Verify the new connection details before committing the change.
+            ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+            try:
+                ssh.connect()
+                server_info = ssh.test_connection()
+                ssh.disconnect()
+            except Exception as e:
+                return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
+
+            server['name'] = new_name
+            server['host'] = new_host
+            server['ssh_port'] = new_port
+            server['username'] = new_user
+            server['password'] = new_pass
+            server['private_key'] = new_key
+            server['server_info'] = server_info
+            if req.expires_at is not None:
+                server['expires_at'] = req.expires_at or None
+            if req.payment_day is not None:
+                if req.payment_day and not 1 <= req.payment_day <= 31:
+                    return JSONResponse({'error': 'Payment day must be between 1 and 31'}, status_code=400)
+                server['payment_day'] = req.payment_day or None
+            if req.price is not None:
+                server['price'] = req.price.strip()
+            if req.self_service_enabled is not None:
+                server['self_service_enabled'] = bool(req.self_service_enabled)
+            save_data(data)
+            # Drop the stale pooled connection: credentials/host may have changed.
+            drop_ssh(server)
+            return {'status': 'success', 'server_info': server_info}
+        except Exception as e:
+            logger.exception("Error editing server")
+            return JSONResponse({'error': str(e)}, status_code=500)
+
+    async with DATA_LOCK:
+        return await _finish_locked_worker(edit)
 
 
 @app.get('/api/servers/{server_id}/ping', tags=["Servers"])
@@ -3630,7 +3939,11 @@ async def api_server_ping(request: Request, server_id: int):
             await writer.wait_closed()
         except Exception:
             pass
-        return {'alive': True, 'ms': ms}
+        try:
+            trust = await asyncio.to_thread(ssh_trust.saved_status, server)
+            return {'alive': True, 'ms': ms, 'ssh_trust': trust, 'ssh_verified': False}
+        except Exception:
+            return {'alive': True, 'ms': ms, 'ssh_trust': 'error'}
     except asyncio.TimeoutError:
         return {'alive': False, 'error': 'timeout', 'ms': None}
     except Exception as e:
@@ -3687,20 +4000,21 @@ async def api_delete_server(request: Request, server_id: int):
             await exit_link_svc.forget_entry_peers(server)
         except Exception as e:
             logger.warning(f"exit-link cleanup before delete failed: {e}")
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-        await asyncio.to_thread(drop_ssh, server)
-        data['servers'].pop(server_id)
-        # Clean up connections for this server
-        data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
-        # Adjust server_ids for connections pointing to higher indices
-        for c in data.get('user_connections', []):
-            if c.get('server_id', 0) > server_id:
-                c['server_id'] -= 1
-        save_data(data)
-        return {'status': 'success'}
+        async with DATA_LOCK:
+            data = load_data()
+            if server_id >= len(data['servers']):
+                return JSONResponse({'error': 'Server not found'}, status_code=404)
+            server = data['servers'][server_id]
+            await _finish_locked_worker(lambda: drop_ssh(server))
+            data['servers'].pop(server_id)
+            # Clean up connections for this server
+            data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
+            # Adjust server_ids for connections pointing to higher indices
+            for c in data.get('user_connections', []):
+                if c.get('server_id', 0) > server_id:
+                    c['server_id'] -= 1
+            save_data(data)
+            return {'status': 'success'}
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=500)
 
@@ -3824,11 +4138,363 @@ def api_server_stats(request: Request, server_id: int):
             stats['net_rx'] = stats['net_tx'] = 0
         out, _, _ = ssh.run_command("uptime -p 2>/dev/null || uptime")
         stats['uptime'] = out.strip()
+        # Global IPv6 addresses for the page header. Some providers mark ULA
+        # (fd00::/8) addresses as scope global, so filter them out explicitly.
+        # Small point-to-point transit prefixes (/126 etc. between the box and
+        # the provider's router) are infrastructure, not a public address.
+        out, _, _ = ssh.run_command(
+            "ip -6 addr show scope global 2>/dev/null | "
+            "awk '/inet6/ && $2 !~ /^fd[0-9a-fA-F]{2}:/ {"
+            "split($2, a, \"/\"); if (a[2] <= 64) print a[1]}'"
+        )
+        stats['ipv6'] = [a for a in (line.strip() for line in out.splitlines()) if a]
         ssh.disconnect()
         return stats
     except Exception as e:
         logger.exception("Error getting server stats")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+RKN_RAW_BASE = ('https://raw.githubusercontent.com/PRVTPRO/Amnezia-Web-Panel/'
+                'main/scripts/rknblock')
+
+RKN_INSTALL_CMD = (
+    f'curl -fsSL {RKN_RAW_BASE}/install-rkn-extra.sh '
+    '-o /tmp/rkn-install.sh && bash /tmp/rkn-install.sh'
+)
+
+RKN_SCRIPT_URL = f'{RKN_RAW_BASE}/rkn-extra-block.sh'
+
+
+def _rkn_run_cmd(subcommand):
+    """Fetch the current script to /tmp, refresh the host copy, run a subcommand.
+
+    Server-side copies may predate newer subcommands (`uninstall`, `set`);
+    always driving a fresh copy keeps every server able to run every
+    subcommand regardless of the version it was installed with.
+    """
+    return (f'curl -fsSL {RKN_SCRIPT_URL} -o /tmp/rkn-extra-block-run.sh '
+            f'&& install -m 0755 /tmp/rkn-extra-block-run.sh /usr/local/sbin/rkn-extra-block '
+            f'&& bash /tmp/rkn-extra-block-run.sh {subcommand}; '
+            f'rc=$?; rm -f /tmp/rkn-extra-block-run.sh; exit $rc')
+
+
+def _rkn_record(server):
+    return server.get('rknblock') or {}
+
+
+async def _rkn_ssh_run(server, cmd, timeout):
+    ssh = await asyncio.to_thread(get_ssh, server)
+    await asyncio.to_thread(ssh.connect)
+    try:
+        out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd, timeout)
+    finally:
+        try:
+            ssh.disconnect()
+        except Exception:
+            pass
+    if code != 0:
+        return JSONResponse({'error': f'command failed: {(err or out or "").strip()[-500:]}'},
+                            status_code=500)
+    return None
+
+
+@app.post('/api/servers/{server_id}/rknblock/install', tags=["Servers"])
+async def api_rknblock_install(request: Request, server_id: int):
+    """Install the RKN/VK network blocking app (rkn-extra-block contour)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    err = await _rkn_ssh_run(server, RKN_INSTALL_CMD, 420)
+    if err is not None:
+        return err
+    rec = dict(_rkn_record(server))
+    rec['installed'] = True
+    rec['enabled'] = True
+    server['rknblock'] = rec
+    save_data(data)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'installed': True, 'enabled': True}
+
+
+@app.post('/api/servers/{server_id}/rknblock/uninstall', tags=["Servers"])
+async def api_rknblock_uninstall(request: Request, server_id: int):
+    """Fully remove the blocking contour: rules, sets, units, scripts, logs."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    err = await _rkn_ssh_run(server, _rkn_run_cmd('uninstall'), 180)
+    if err is not None:
+        return err
+    server.pop('rknblock', None)
+    save_data(data)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'installed': False}
+
+
+class RknBlockEnableRequest(BaseModel):
+    enabled: bool = True
+
+
+@app.post('/api/servers/{server_id}/rknblock/enable', tags=["Servers"])
+async def api_rknblock_enable(request: Request, server_id: int, req: RknBlockEnableRequest):
+    """Start or stop the blocking contour (rules jump in/out; lists stay)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    if not _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    err = await _rkn_ssh_run(server, _rkn_run_cmd('on' if req.enabled else 'off'), 180)
+    if err is not None:
+        return err
+    rec = dict(_rkn_record(server))
+    rec['installed'] = True
+    rec['enabled'] = bool(req.enabled)
+    server['rknblock'] = rec
+    save_data(data)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'enabled': bool(req.enabled)}
+
+
+@app.post('/api/servers/{server_id}/rknblock/update', tags=["Servers"])
+async def api_rknblock_update(request: Request, server_id: int):
+    """Re-download the C24Be lists and atomically reload the ipset sets."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    if not _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    err = await _rkn_ssh_run(server, _rkn_run_cmd('update'), 300)
+    if err is not None:
+        return err
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'updated': True}
+
+
+RKN_OPTION_FLAGS = ('block_in', 'block_out', 'log_in', 'log_out')
+
+
+class RknBlockOptionsRequest(BaseModel):
+    block_in: bool = True
+    block_out: bool = True
+    log_in: bool = True
+    log_out: bool = True
+
+
+@app.post('/api/servers/{server_id}/rknblock/options', tags=["Servers"])
+async def api_rknblock_options(request: Request, server_id: int, req: RknBlockOptionsRequest):
+    """Set per-direction block/log flags on the host contour (chains rebuilt only)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    if not _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    values = req.model_dump()
+    pairs = ' '.join(f'{k}={"on" if values[k] else "off"}' for k in RKN_OPTION_FLAGS)
+    err = await _rkn_ssh_run(server, _rkn_run_cmd(f'set {pairs}'), 120)
+    if err is not None:
+        return err
+    rec = dict(_rkn_record(server))
+    rec['installed'] = True
+    rec['flags'] = values
+    server['rknblock'] = rec
+    save_data(data)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'flags': values}
+
+
+RKN_SCAN_SSH_CMD = ("rkn-extra-block status 2>/dev/null | head -10; "
+                      "echo '===LOG==='; tail -n 2000 /var/log/rkn-scans.json 2>/dev/null")
+
+
+def _parse_rkn_scan_output(out, flag_enabled):
+    """Parse `rkn-extra-block status` + rkn-scans.json tail into a summary dict."""
+    agent_state = 'unknown'
+    log_part = ''
+    status_part = ''
+    if '===LOG===' in (out or ''):
+        status_part, log_part = out.split('===LOG===', 1)
+        first_line = status_part.strip().splitlines()[0] if status_part.strip() else ''
+        if ':' in first_line:
+            agent_state = first_line.split(':', 1)[1].strip()
+    # Наполненность наборов из cmd_status: "входящие...: v4=N сетей v6=M сетей"
+    sets = {'in4': 0, 'in6': 0, 'out4': 0, 'out6': 0}
+    counts = re.findall(r'v[46]=(\d+)', status_part)
+    if len(counts) >= 4:
+        sets = dict(zip(('in4', 'in6', 'out4', 'out6'), (int(c) for c in counts[:4])))
+    # Флаги направлений из строки "flags: block_in=on block_out=on log_in=on log_out=on"
+    flags = {}
+    m = re.search(r'flags:\s*([^\n]+)', status_part)
+    if m:
+        for kv in m.group(1).split():
+            if '=' in kv:
+                k, v = kv.split('=', 1)
+                flags[k.strip()] = v.strip()
+    # Дата последнего обновления баз из строки "last_update: 2026-10-16T12:00:00Z"
+    last_update = None
+    m = re.search(r'last_update:\s*(\S+)', status_part)
+    if m and m.group(1) != '—':
+        last_update = m.group(1)
+    events = []
+    for line in (log_part or '').splitlines():
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            ev = json.loads(line)
+            if isinstance(ev, dict) and 't' in ev:
+                events.append(ev)
+        except ValueError:
+            continue
+
+    now = datetime.now(timezone.utc)
+    day_ago = now - timedelta(hours=24)
+    by_org, by_dpt, by_dir = {}, {}, {}
+    last_24h = 0
+    last_ts = None
+    for ev in events:
+        org = str(ev.get('org') or '?')
+        by_org[org] = by_org.get(org, 0) + 1
+        dpt = ev.get('dpt', 0)
+        by_dpt[dpt] = by_dpt.get(dpt, 0) + 1
+        direction = ev.get('dir', '?')
+        by_dir[direction] = by_dir.get(direction, 0) + 1
+        try:
+            ts = datetime.fromisoformat(str(ev['t']).replace('Z', '+00:00'))
+            if ts >= day_ago:
+                last_24h += 1
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+        except ValueError:
+            pass
+
+    return {
+        'flag_enabled': bool(flag_enabled),
+        'agent_state': agent_state,
+        'sets': sets,
+        'flags': flags,
+        'last_update': last_update,
+        'total_events': len(events),
+        'last_24h': last_24h,
+        'last_event': last_ts.isoformat() if last_ts else None,
+        'by_org': sorted(by_org.items(), key=lambda kv: -kv[1])[:10],
+        'by_dpt': sorted(by_dpt.items(), key=lambda kv: -kv[1])[:10],
+        'by_dir': by_dir,
+        'recent': events[-5:][::-1],
+    }
+
+
+async def _fetch_rkn_scan_output(server):
+    """SSH to a server and fetch the rkn-extra-block status line + scan log tail."""
+    ssh = await asyncio.to_thread(get_ssh, server)
+    await asyncio.to_thread(ssh.connect)
+    try:
+        out, _, _ = await asyncio.to_thread(ssh.run_sudo_command, RKN_SCAN_SSH_CMD, 60)
+    finally:
+        try:
+            ssh.disconnect()
+        except Exception:
+            pass
+    return out
+
+
+@app.get('/api/servers/{server_id}/rkn_scans', tags=["Servers"])
+async def api_rkn_scans(request: Request, server_id: int):
+    """Compact scan statistics collected hourly by rkn-agent on the server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    out = await _fetch_rkn_scan_output(server)
+    record = server.get('rknblock') or {}
+    installed = bool(record.get('installed'))
+    parsed = _parse_rkn_scan_output(out, installed)
+    parsed['installed'] = installed
+    parsed['enabled'] = bool(record.get('enabled', True)) if installed else False
+    return parsed
+
+
+@app.post('/api/servers/{server_id}/rkn_scans/clear', tags=["Servers"])
+async def api_rkn_scans_clear(request: Request, server_id: int):
+    """Truncate the remote rkn-scans.json so the admin can acknowledge sightings."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    ssh = await asyncio.to_thread(get_ssh, server)
+    await asyncio.to_thread(ssh.connect)
+    try:
+        # Новые версии: переносят горизонт сбора (старое не подхватится агентом).
+        # Старые: просто обнулят файл — событие вернётся после часового прогона агента.
+        await asyncio.to_thread(
+            ssh.run_sudo_command,
+            'rkn-extra-block clearscans 2>/dev/null || : > /var/log/rkn-scans.json', 30)
+    finally:
+        try:
+            ssh.disconnect()
+        except Exception:
+            pass
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'cleared'}
+
+
+RKN_FLAG_CACHE = {}
+RKN_FLAG_CACHE_TTL = 900  # seconds; scan flags on the overview page
+
+
+@app.get('/api/servers/rkn_scan_flags', tags=["Servers"])
+async def api_rkn_scan_flags(request: Request):
+    """Lightweight per-server scan flags for the servers overview page.
+
+    Returns {server_id: {agent_state, events24, last, flag}} for servers whose
+    rkn-agent responded. Results are cached for RKN_FLAG_CACHE_TTL seconds so
+    the overview page doesn't SSH into every server on each load.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    now = time.time()
+
+    async def collect(idx, srv):
+        cached = RKN_FLAG_CACHE.get(idx)
+        if cached and now - cached['ts'] < RKN_FLAG_CACHE_TTL:
+            return idx, cached['data']
+        try:
+            out = await _fetch_rkn_scan_output(srv)
+            parsed = _parse_rkn_scan_output(out, srv.get('rkn_block_enabled', False))
+            summary = {'agent_state': parsed['agent_state'],
+                       'events24': parsed['last_24h'],
+                       'last': parsed['last_event'],
+                       'flag': parsed['flag_enabled'],
+                       'installed': parsed['flag_enabled'],
+                       'sets': parsed['sets']}
+        except Exception:
+            summary = None
+        RKN_FLAG_CACHE[idx] = {'ts': now, 'data': summary}
+        return idx, summary
+
+    results = await asyncio.gather(
+        *[collect(i, s) for i, s in enumerate(data['servers'])])
+    return {str(i): s for i, s in results if s}
 
 
 @app.post('/api/servers/{server_id}/check', tags=["Servers"])
@@ -3869,6 +4535,8 @@ def api_check_server(request: Request, server_id: int):
             merged['base_protocol'] = db_proto.get('base_protocol') or protocol_base(proto)
             merged['instance'] = db_proto.get('instance') or protocol_instance(proto)
             merged['display_name'] = db_proto.get('display_name') or protocol_display_name(proto)
+            if protocol_base(proto) == 'awg2' and 'header_protection' in merged:
+                merged['display_name'] = protocol_display_name(proto, merged['header_protection'])
             merged['container_name'] = db_proto.get('container_name') or protocol_container_name(proto)
             if protocol_base(proto) == 'adguard':
                 for key in ('web_port', 'mode', 'internal_ip', 'expose_web'):
@@ -3925,6 +4593,15 @@ def api_check_server(request: Request, server_id: int):
                 return proto, merge_saved_protocol_status(proto, {}, str(e)), str(e)
 
         protocols_to_check = list(dict.fromkeys(BASE_PROTOCOLS + list(server.get('protocols', {}).keys())))
+        # One batched round trip for all AWG containers (ps snapshot + configs
+        # + clientsTables) instead of 3-5 SSH commands per instance - this is
+        # what made /check take seconds on high-latency servers.
+        try:
+            awg_protos = [p for p in protocols_to_check if protocol_base(p) in AWG_PROTOCOLS]
+            if awg_protos:
+                AWGManager(ssh).prefetch_awg_state(awg_protos)
+        except Exception as e:
+            logger.warning(f"AWG status prefetch failed, falling back to per-instance checks: {e}")
         # Run checks sequentially. Several managers use the same SSH connection;
         # checking them in parallel through one SSH object can produce false
         # negatives and previously caused dynamic AWG instances to be removed.
@@ -3941,7 +4618,7 @@ def api_check_server(request: Request, server_id: int):
                         'awg_params': result.get('awg_params', {}),
                         'base_protocol': protocol_base(proto),
                         'instance': protocol_instance(proto),
-                        'display_name': protocol_display_name(proto),
+                        'display_name': protocol_display_name(proto, result.get('header_protection')),
                         'container_name': protocol_container_name(proto),
                     }
                     if protocol_base(proto) == 'adguard':
@@ -3964,6 +4641,13 @@ def api_check_server(request: Request, server_id: int):
                             'obfuscation': result.get('obfuscation'),
                         })
                     changed = True
+                record = server['protocols'][proto]
+                if protocol_base(proto) == 'awg2' and 'header_protection' in result:
+                    header_protection = bool(result['header_protection'])
+                    if bool(record.get('header_protection')) != header_protection:
+                        record['header_protection'] = header_protection
+                        record['display_name'] = protocol_display_name(proto, header_protection)
+                        changed = True
             else:
                 if proto in server['protocols']:
                     if should_preserve_saved_protocol(proto, result, err):
@@ -4068,6 +4752,13 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         install_base = protocol_base(install_protocol)
         # A reinstalled entry keeps its exit link and is re-linked below
         previous_link = None
+        # Where an instance is published is a property of the network, not
+        # of this install: reinstalling must not move clients back to the
+        # address the panel happens to manage the box through.
+        previous_record = (server.get('protocols') or {}).get(install_protocol) or {}
+        previous_public = {key: previous_record[key]
+                           for key in ('public_host', 'public_port')
+                           if previous_record.get(key)}
         # Reinstalling an instance is not the same as adding one: an instance a
         # user deliberately left unlinked must not be linked behind their back.
         reinstall = install_protocol in (server.get('protocols') or {})
@@ -4109,7 +4800,9 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 port=req.port,
                 tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
                 tls_domain=req.tls_domain,
-                max_connections=req.max_connections if req.max_connections is not None else 0
+                max_connections=req.max_connections if req.max_connections is not None else 0,
+                public_host=previous_public.get('public_host'),
+                public_port=previous_public.get('public_port'),
             )
         elif install_base == 'xray':
             install_args = ()
@@ -4208,6 +4901,7 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         proto_record['container_name'] = protocol_container_name(install_protocol)
         if previous_link:
             proto_record['exit_link'] = previous_link
+        proto_record.update(previous_public)
         server['protocols'][install_protocol] = proto_record
         result['protocol'] = install_protocol
         result['base_protocol'] = install_base
@@ -4600,6 +5294,16 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         if req.protocol in server.get('protocols', {}):
             del server['protocols'][req.protocol]
             save_data(data)
+        # The instance is gone: its peers are gone with it, so connections
+        # pointing at this (server, protocol) would dangle forever — the
+        # modal would list a phantom that errors with 'Client not found'
+        # on every action. Purge them like server/user deletion does.
+        data['user_connections'] = [
+            c for c in data.get('user_connections', [])
+            if not (c.get('server_id') == server_id
+                    and c.get('protocol') == req.protocol)
+        ]
+        save_data(data)
         ssh.disconnect()
         if base == 'exit':
             detached = await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_uninstalled')
@@ -4703,7 +5407,7 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
         return JSONResponse({'error': 'Invalid backup filename'}, status_code=400)
     ssh = None
     tmp_path = None
-    tmp_remote = f'/tmp/{filename}'
+    remote_temp_dir = None
     remote_path = f'{manager.BACKUP_ROOT}/{safe_proto}/{filename}'
     try:
         data = load_data()
@@ -4712,6 +5416,10 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
         server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
+        # mktemp creates a mode-0700 directory owned by the SSH/SFTP user.
+        # The root-owned readable copy stays inaccessible to other local users.
+        remote_temp_dir = ssh._make_private_temp_dir()
+        tmp_remote = remote_temp_dir + '/' + filename
         quoted_remote = shlex.quote(remote_path)
         quoted_tmp = shlex.quote(tmp_remote)
         # `sudo <a> && <b>` elevates only `<a>`; the whole chain needs one shell
@@ -4727,9 +5435,6 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
             sftp.get(tmp_remote, tmp_path)
         finally:
             sftp.close()
-            ssh.run_sudo_command(f"rm -f {quoted_tmp}")
-            ssh.disconnect()
-            ssh = None
         return FileResponse(
             tmp_path,
             media_type='application/gzip',
@@ -4746,7 +5451,16 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
         return JSONResponse({'error': str(e)}, status_code=500)
     finally:
         if ssh:
-            ssh.disconnect()
+            try:
+                if remote_temp_dir:
+                    _, cleanup_error, cleanup_code = ssh.run_sudo_command(
+                        'rm -rf -- ' + shlex.quote(remote_temp_dir))
+                    if cleanup_code != 0:
+                        logger.warning('Remote backup staging cleanup failed: %s', cleanup_error)
+            except Exception:
+                logger.warning('Remote backup staging cleanup failed', exc_info=True)
+            finally:
+                ssh.disconnect()
 
 
 @app.post('/api/servers/{server_id}/backups/upload', tags=["Protocols"])
@@ -4900,6 +5614,8 @@ def api_container_toggle(request: Request, server_id: int, req: ContainerToggleR
         else:
             ssh.run_sudo_command(f"docker start {container}")
             action = 'started'
+        if hasattr(ssh, 'docker_ps_invalidate'):
+            ssh.docker_ps_invalidate()
         ssh.disconnect()
         return {'status': 'success', 'action': action, 'container': container}
     except Exception as e:
@@ -4969,6 +5685,35 @@ async def api_ssh_cooldown(request: Request, server_id: int):
     data['servers'][server_id]['ssh_cooldown_base'] = seconds
     save_data(data)
     return {'ok': True, 'ssh_cooldown_base': seconds}
+
+
+# Allowed live peer-list refresh intervals (seconds); 0 disables polling.
+PEER_POLL_INTERVALS = (0, 5, 10, 15, 20, 45, 120, 300, 600)
+
+
+@app.post('/api/servers/{server_id}/peer_poll_interval', tags=["Servers"])
+async def api_peer_poll_interval(request: Request, server_id: int):
+    """Set the per-server live peer-list refresh interval (0 = off).
+
+    Polling is opt-in: every poll is a full connections read over SSH, which
+    is cheap on fast servers but painful on slow/flaky ones."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        body = await request.json()
+        seconds = int(body.get('seconds', 0))
+    except Exception:
+        return JSONResponse({'error': 'Invalid value'}, status_code=400)
+    if seconds not in PEER_POLL_INTERVALS:
+        return JSONResponse(
+            {'error': 'Value must be one of ' + ','.join(map(str, PEER_POLL_INTERVALS))},
+            status_code=400)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    data['servers'][server_id]['peer_poll_interval'] = seconds
+    save_data(data)
+    return {'ok': True, 'peer_poll_interval': seconds}
 
 
 @app.post('/api/servers/{server_id}/host_tuning', tags=["Protocols"])
@@ -5061,6 +5806,67 @@ def api_rename_protocol(request: Request, server_id: int, req: RenameProtocolReq
         return {'status': 'success', 'protocol': proto, 'name': name}
     except Exception as e:
         logger.exception("Error renaming protocol")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/protocol/public-endpoint', tags=["Protocols"])
+async def api_set_protocol_public_endpoint(request: Request, server_id: int, req: PublicEndpointRequest):
+    """Set or clear the address clients dial for one protocol instance.
+
+    Both fields are optional and empty means "as before": the server's own
+    address, the instance's listen port. Useful when an instance answers on a
+    second IP of the same box, behind a port forward, or under a domain name.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        proto = req.protocol.strip()
+        if proto not in server.get('protocols', {}):
+            return JSONResponse({'error': 'Protocol not found'}, status_code=404)
+        try:
+            host = normalize_public_host(req.public_host)
+            port = normalize_public_port(req.public_port)
+        except ValueError as e:
+            return JSONResponse({'error': str(e)}, status_code=400)
+
+        record = server['protocols'][proto]
+        for key, value in (('public_host', host), ('public_port', port)):
+            if value:
+                record[key] = value
+            else:
+                record.pop(key, None)
+        save_data(data)
+
+        # Telemt composes its own tg:// links from config.toml, so for that
+        # protocol the override reaches clients only after the file on the
+        # server carries it. The record is saved either way: a box that is down
+        # right now must not lose the setting, and the next install re-applies
+        # it.
+        warning = ''
+        if protocol_base(proto) == 'telemt':
+            ssh = None
+            try:
+                pub_host, pub_port = protocol_public_endpoint(server, proto)
+                ssh = await asyncio.to_thread(get_ssh, server)
+                await asyncio.to_thread(ssh.connect)
+                manager = get_protocol_manager(ssh, proto)
+                await asyncio.to_thread(
+                    manager.set_public_endpoint, pub_host, pub_port or record.get('port', '443'))
+            except Exception as e:
+                logger.warning(f"Could not apply the public endpoint to {proto}: {e}")
+                warning = str(e)
+            finally:
+                if ssh is not None:
+                    ssh.disconnect()
+
+        return {'status': 'success', 'protocol': proto,
+                'public_host': host, 'public_port': port, 'warning': warning}
+    except Exception as e:
+        logger.exception("Error setting protocol public endpoint")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
@@ -5268,13 +6074,14 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
         server = data['servers'][server_id]
         proto_info = server.get('protocols', {}).get(req.protocol, {})
         port = proto_info.get('port', '55424')
+        pub_host, pub_port = protocol_public_endpoint(server, req.protocol)
         ssh = get_ssh(server)
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
         
         if protocol_base(req.protocol) == 'telemt':
             result = manager.add_client(
-                req.protocol, req.name, server['host'], port,
+                req.protocol, req.name, pub_host, pub_port or port,
                 telemt_quota=req.telemt_quota,
                 telemt_max_ips=req.telemt_max_ips,
                 telemt_expiry=req.telemt_expiry,
@@ -5283,15 +6090,15 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
                 max_tcp_conns=req.telemt_max_conns
             )
         elif protocol_base(req.protocol) == 'wireguard':
-            result = manager.add_client(req.name, server['host'])
+            result = manager.add_client(req.name, pub_host, public_port=pub_port)
         elif protocol_base(req.protocol) == 'aivpn':
             result = manager.add_client(
-                req.protocol, req.name, server['host'], port,
+                req.protocol, req.name, pub_host, port,
                 expires_at=normalize_rfc3339(req.aivpn_expiry),
                 one_time=bool(req.aivpn_one_time),
             )
         else:
-            result = manager.add_client(req.protocol, req.name, server['host'], port)
+            result = manager.add_client(req.protocol, req.name, pub_host, port, public_port=pub_port)
         ssh.disconnect()
 
         if result.get('config'):
@@ -5762,12 +6569,13 @@ def api_clear_conn_warnings(request: Request, server_id: int, req: ConnectionAct
 
 
 @app.post('/api/servers/{server_id}/connections/rename', tags=["Connections"])
-def api_rename_connection(request: Request, server_id: int, req: RenameConnectionRequest):
+async def api_rename_connection(request: Request, server_id: int, req: RenameConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        data = load_data()
-        if server_id >= len(data['servers']):
+        async with DATA_LOCK:
+            data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
         new_name = (req.new_name or '').strip()
@@ -5775,30 +6583,45 @@ def api_rename_connection(request: Request, server_id: int, req: RenameConnectio
             return JSONResponse({'error': 'New name is required'}, status_code=400)
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        result = _manager_call(manager, 'rename_client', req.protocol, req.client_id, new_name) or {}
-        # Optional per-peer bandwidth limit (managers exposing set_speed_limit)
-        speed_warning = None
-        if req.max_speed >= 0 and hasattr(manager, 'set_speed_limit'):
+        connection_ids = {
+            conn['id'] for conn in data.get('user_connections', [])
+            if conn.get('id') and conn.get('client_id') == req.client_id
+            and conn.get('server_id') == server_id and conn.get('protocol') == req.protocol
+        }
+
+        def rename_peer():
+            ssh = get_ssh(server)
             try:
-                _manager_call(manager, 'set_speed_limit', req.protocol, req.client_id, req.max_speed)
-            except Exception as se:
-                logger.warning(f"set_speed_limit failed: {se}")
-                speed_warning = str(se)
-        ssh.disconnect()
+                ssh.connect()
+                manager = get_protocol_manager(ssh, req.protocol)
+                result = _manager_call(manager, 'rename_client', req.protocol, req.client_id, new_name) or {}
+                speed_warning = None
+                if req.max_speed >= 0 and hasattr(manager, 'set_speed_limit'):
+                    try:
+                        _manager_call(manager, 'set_speed_limit', req.protocol, req.client_id, req.max_speed)
+                    except Exception as se:
+                        logger.warning(f"set_speed_limit failed: {se}")
+                        speed_warning = str(se)
+                return result, speed_warning
+            finally:
+                ssh.disconnect()
+
+        # Blocking SSH stays outside DATA_LOCK and off the event loop.
+        result, speed_warning = await asyncio.to_thread(rename_peer)
         # Telemt rename may also change client_id (username is the identity there)
         new_client_id = result.get('client_id', req.client_id)
         stored_name = result.get('name', new_name)
-        changed = False
-        for conn in data.get('user_connections', []):
-            if conn.get('client_id') == req.client_id and conn.get('server_id') == server_id and conn.get('protocol') == req.protocol:
-                conn['name'] = stored_name
-                conn['client_id'] = new_client_id
-                changed = True
-        if changed:
-            save_data(data)
+        async with DATA_LOCK:
+            current = load_data()
+            changed = False
+            for conn in current.get('user_connections', []):
+                if (conn.get('id') in connection_ids and conn.get('client_id') == req.client_id
+                        and conn.get('server_id') == server_id and conn.get('protocol') == req.protocol):
+                    conn['name'] = stored_name
+                    conn['client_id'] = new_client_id
+                    changed = True
+            if changed:
+                save_data(current)
         resp = {'status': 'success', 'name': stored_name, 'client_id': new_client_id}
         if speed_warning:
             resp['speed_warning'] = speed_warning
@@ -5806,6 +6629,51 @@ def api_rename_connection(request: Request, server_id: int, req: RenameConnectio
     except Exception as e:
         logger.exception("Error renaming connection")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/connections/speed', tags=["Connections"])
+async def api_set_connection_speed(request: Request, server_id: int, req: ConnectionSpeedRequest):
+    actor = _check_admin(request)
+    if not actor or actor.get('role') != 'admin':
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if (not math.isfinite(req.max_speed) or not 0 <= req.max_speed <= 1000000
+            or round(req.max_speed, 1) != req.max_speed):
+        return JSONResponse({'error': 'max_speed must be finite, 0..1000000 Mbit/s, in steps of 0.1'}, status_code=400)
+    data = load_data()
+    if server_id < 0 or server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    if req.protocol not in (server.get('protocols') or {}):
+        return JSONResponse({'error': 'Protocol not installed'}, status_code=404)
+
+    def set_peer_speed():
+        ssh = get_ssh(server)
+        try:
+            ssh.connect()
+            manager = get_protocol_manager(ssh, req.protocol)
+            if not callable(getattr(manager, 'set_speed_limit', None)):
+                return JSONResponse({'error': 'Speed limits are not supported by this protocol'}, status_code=501)
+            clients = _manager_call(manager, 'get_clients', req.protocol)
+            if not any(c.get('clientId') == req.client_id for c in clients):
+                return JSONResponse({'error': 'Client not found'}, status_code=404)
+            result = _manager_call(manager, 'set_speed_limit', req.protocol, req.client_id, req.max_speed)
+            if not isinstance(result, dict) or result.get('status') != 'success' or result.get('speed_warning'):
+                raise RuntimeError('Speed limit application was not confirmed')
+            clients = _manager_call(manager, 'get_clients', req.protocol)
+            peer = next((c for c in clients if c.get('clientId') == req.client_id), None)
+            if peer is None or float((peer.get('userData') or {}).get('maxSpeed') or 0) != req.max_speed:
+                raise RuntimeError('Speed limit read-back mismatch')
+            return {'status': 'success', 'server_id': server_id, 'protocol': req.protocol,
+                    'client_id': req.client_id, 'max_speed': req.max_speed}
+        finally:
+            ssh.disconnect()
+
+    try:
+        # No rename, local JSON write, or DATA_LOCK held across SSH.
+        return await asyncio.to_thread(set_peer_speed)
+    except Exception:
+        logger.exception('Error applying connection speed limit')
+        return JSONResponse({'error': 'Speed limit could not be applied or verified'}, status_code=502)
 
 
 @app.post('/api/servers/{server_id}/connections/config/save', tags=["Connections"])
@@ -5842,11 +6710,17 @@ def api_get_connection_config(request: Request, server_id: int, req: ConnectionA
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
-        # Users can only view their own connections
-        if user['role'] in (*USER_EQUIVALENT_ROLES, 'none'):
+        # Only explicit privileged roles may view unowned connections.
+        if user.get('role') not in ('admin', 'support'):
             owned = any(
                 c for c in data.get('user_connections', [])
-                if c.get('client_id') == req.client_id and c.get('server_id') == server_id and c.get('user_id') == user['id']
+                if c.get('client_id') == req.client_id
+                and c.get('server_id') == server_id
+                and c.get('user_id') == user['id']
+                and c.get('protocol')
+                # Preserve manager aliases such as awg and awg__1.
+                and protocol_base(c['protocol']) == protocol_base(req.protocol)
+                and protocol_instance(c['protocol']) == protocol_instance(req.protocol)
             )
             if not owned:
                 return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -5855,10 +6729,11 @@ def api_get_connection_config(request: Request, server_id: int, req: ConnectionA
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
         proto_info = server.get('protocols', {}).get(req.protocol, {})
         port = proto_info.get('port', '55424')
+        pub_host, pub_port = protocol_public_endpoint(server, req.protocol)
         ssh = get_ssh(server)
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
-        config = _manager_call(manager, 'get_client_config', req.protocol, req.client_id, server['host'], port)
+        config = _manager_call(manager, 'get_client_config', req.protocol, req.client_id, pub_host, port, public_port=pub_port)
         ssh.disconnect()
         return {'config': config, **config_payloads(config, server, req.protocol)}
     except Exception as e:
@@ -6121,13 +6996,14 @@ def api_add_user(request: Request, req: AddUserRequest):
                 server = data['servers'][req.server_id]
                 proto_info = server.get('protocols', {}).get(req.protocol, {})
                 port = proto_info.get('port', '55424')
+                pub_host, pub_port = protocol_public_endpoint(server, req.protocol)
                 conn_name = req.connection_name or f"{req.username}_vpn"
                 ssh = get_ssh(server)
                 ssh.connect()
                 manager = get_protocol_manager(ssh, req.protocol)
                 if protocol_base(req.protocol) == 'telemt':
                     conn_result = manager.add_client(
-                        req.protocol, conn_name, server['host'], port,
+                        req.protocol, conn_name, pub_host, pub_port or port,
                         telemt_quota=req.telemt_quota,
                         telemt_max_ips=req.telemt_max_ips,
                         telemt_expiry=req.telemt_expiry,
@@ -6136,7 +7012,7 @@ def api_add_user(request: Request, req: AddUserRequest):
                         max_tcp_conns=req.telemt_max_conns
                     )
                 else:
-                    conn_result = manager.add_client(req.protocol, conn_name, server['host'], port)
+                    conn_result = manager.add_client(req.protocol, conn_name, pub_host, port, public_port=pub_port)
                 ssh.disconnect()
 
                 if conn_result.get('client_id'):
@@ -6171,48 +7047,57 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        data = load_data()
-        user = next((u for u in data['users'] if u['id'] == user_id), None)
-        if not user:
-            return JSONResponse({'error': 'User not found'}, status_code=404)
-            
-        if req.username is not None:
-            new_name = req.username.strip()
-            lang = request.cookies.get('lang', 'ru')
-            if not new_name:
-                return JSONResponse({'error': _t('username_empty', lang)}, status_code=400)
-            if any(u['username'] == new_name and u['id'] != user_id for u in data.get('users', [])):
-                return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
-            user['username'] = new_name
-        if req.telegramId is not None:
-            try:
-                user['telegramId'] = _normalize_telegram_id(req.telegramId)
-            except ValueError as exc:
-                return JSONResponse({'error': str(exc)}, status_code=400)
-        if req.email is not None: user['email'] = req.email
-        if req.description is not None: user['description'] = req.description
-        if req.traffic_limit is not None: 
-            new_limit = int(req.traffic_limit * 1024**3)
-            user['traffic_limit'] = new_limit
-        
-        if req.traffic_reset_strategy is not None:
-            user['traffic_reset_strategy'] = req.traffic_reset_strategy
-            user['last_reset_at'] = datetime.now().isoformat()
-            
-        req_fields = getattr(req, 'model_fields_set', getattr(req, '__fields_set__', set()))
-        if 'expiration_date' in req_fields:
-            user['expiration_date'] = req.expiration_date or None
+        async with DATA_LOCK:
+            data = load_data()
+            user = next((u for u in data['users'] if u['id'] == user_id), None)
+            if not user:
+                return JSONResponse({'error': 'User not found'}, status_code=404)
 
-        if req.password:
-            user['password_hash'] = hash_password(req.password)
-            
-        save_data(data)
-        
-        # Auto re-enable if traffic limit increased beyond usage
-        if req.traffic_limit is not None:
-            if new_limit > 0 and user.get('traffic_used', 0) < new_limit and not user.get('enabled', True):
-                await perform_toggle_user(data, user_id, True)
-                save_data(data)
+            if req.username is not None:
+                new_name = req.username.strip()
+                lang = request.cookies.get('lang', 'ru')
+                if not new_name:
+                    return JSONResponse({'error': _t('username_empty', lang)}, status_code=400)
+                if any(u['username'] == new_name and u['id'] != user_id for u in data.get('users', [])):
+                    return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
+                user['username'] = new_name
+            if req.telegramId is not None:
+                try:
+                    user['telegramId'] = _normalize_telegram_id(req.telegramId)
+                except ValueError as exc:
+                    return JSONResponse({'error': str(exc)}, status_code=400)
+            if req.email is not None: user['email'] = req.email
+            if req.description is not None: user['description'] = req.description
+            if req.traffic_limit is not None:
+                new_limit = int(req.traffic_limit * 1024**3)
+                user['traffic_limit'] = new_limit
+
+            if req.traffic_reset_strategy is not None:
+                user['traffic_reset_strategy'] = req.traffic_reset_strategy
+                user['last_reset_at'] = datetime.now().isoformat()
+
+            req_fields = getattr(req, 'model_fields_set', getattr(req, '__fields_set__', set()))
+            if 'expiration_date' in req_fields:
+                user['expiration_date'] = req.expiration_date or None
+
+            if req.password:
+                user['password_hash'] = hash_password(req.password)
+
+            # Persist the complete local intent before SSH can yield. Never write
+            # this snapshot again after SSH: traffic accounting and other requests
+            # may have saved newer fields while the network operation was pending.
+            auto_reenable = (
+                req.traffic_limit is not None
+                and new_limit > 0
+                and user.get('traffic_used', 0) < new_limit
+                and not user.get('enabled', True)
+            )
+            if auto_reenable:
+                user['enabled'] = True
+            save_data(data)
+
+        if auto_reenable:
+            await perform_toggle_user(data, user_id, True)
 
         return {'status': 'success'}
     except Exception as e:
@@ -6246,11 +7131,16 @@ async def api_toggle_user(request: Request, user_id: str, req: ToggleUserRequest
     if not cur or cur['role'] != 'admin':
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        data = load_data()
-        success = await perform_toggle_user(data, user_id, req.enabled)
-        if not success:
-            return JSONResponse({'error': 'User not found'}, status_code=404)
-        save_data(data)
+        async with DATA_LOCK:
+            data = load_data()
+            user = next((u for u in data['users'] if u['id'] == user_id), None)
+            if not user:
+                return JSONResponse({'error': 'User not found'}, status_code=404)
+            user['enabled'] = req.enabled
+            save_data(data)
+        # SSH only propagates the committed intent; it must not save an old
+        # full-data snapshot when it completes.
+        await perform_toggle_user(data, user_id, req.enabled)
         return {'status': 'success', 'enabled': req.enabled}
     except Exception as e:
         logger.exception("Error toggling user")
@@ -6313,6 +7203,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
                 return JSONResponse({'error': _t('peer_already_linked', lang).replace('{}', owner_name)}, status_code=400)
         proto_info = server.get('protocols', {}).get(req.protocol, {})
         port = proto_info.get('port', '55424')
+        pub_host, pub_port = protocol_public_endpoint(server, req.protocol)
         ssh = await asyncio.to_thread(get_ssh, server)
         await asyncio.to_thread(ssh.connect)
         manager = get_protocol_manager(ssh, req.protocol)
@@ -6321,13 +7212,13 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             # Use existing client
             target_client_id = req.client_id
             # Retrieve config for existing client
-            config = await asyncio.to_thread(_manager_call, manager, 'get_client_config', req.protocol, req.client_id, server['host'], port)
+            config = await asyncio.to_thread(_manager_call, manager, 'get_client_config', req.protocol, req.client_id, pub_host, port, public_port=pub_port)
             result = {'client_id': target_client_id, 'config': config}
         else:
             # Create new client
             if protocol_base(req.protocol) == 'telemt':
                 result = await asyncio.to_thread(
-                    manager.add_client, req.protocol, req.name, server['host'], port,
+                    manager.add_client, req.protocol, req.name, pub_host, pub_port or port,
                     telemt_quota=req.telemt_quota,
                     telemt_max_ips=req.telemt_max_ips,
                     telemt_expiry=req.telemt_expiry,
@@ -6336,7 +7227,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
                     max_tcp_conns=req.telemt_max_conns
                 )
             else:
-                result = await asyncio.to_thread(manager.add_client, req.protocol, req.name, server['host'], port)
+                result = await asyncio.to_thread(manager.add_client, req.protocol, req.name, pub_host, port, public_port=pub_port)
         
         await asyncio.to_thread(ssh.disconnect)
 
@@ -6406,7 +7297,19 @@ def api_get_user_connections(request: Request, user_id: str):
     if user['role'] in (*USER_EQUIVALENT_ROLES, 'none') and user['id'] != user_id:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
-    conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
+    conns = []
+    for c in data.get('user_connections', []):
+        if c['user_id'] != user_id:
+            continue
+        sid = c.get('server_id', 0)
+        # Skip links to uninstalled instances: the peer is gone with the
+        # container, and every action on such a phantom ends in
+        # 'Client not found'. (Uninstall purges them; this is the belt.)
+        if sid < len(data['servers']):
+            srv = data['servers'][sid]
+            if c.get('protocol') not in (srv.get('protocols') or {}):
+                continue
+        conns.append(c)
     for c in conns:
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
@@ -6519,6 +7422,10 @@ def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Request)
     if not user:
         return JSONResponse({'error': 'User not found'}, status_code=404)
     
+    # Revoke signed cookies without changing the public URL. Missing revisions
+    # on existing records start at zero; legacy boolean cookies are rejected.
+    if not req.enabled or req.password is not None:
+        user['share_auth_revision'] = user.get('share_auth_revision', 0) + 1
     user['share_enabled'] = req.enabled
     if not user.get('share_token'):
         user['share_token'] = secrets.token_urlsafe(16)
@@ -6531,6 +7438,14 @@ def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Request)
     return {'status': 'success', 'share_token': user.get('share_token')}
 
 
+def _share_session_authorized(user, request):
+    if not user.get('share_password_hash'):
+        return True
+    revision = request.session.get(f"share_auth_{user['share_token']}")
+    # bool is an int subclass: require the exact type to reject old True cookies.
+    return type(revision) is int and revision == user.get('share_auth_revision', 0)
+
+
 @app.get('/share/{token}', response_class=HTMLResponse, tags=["System Templates"])
 def share_page(token: str, request: Request):
     data = load_data()
@@ -6539,8 +7454,7 @@ def share_page(token: str, request: Request):
         lang = request.cookies.get('lang', 'ru')
         return HTMLResponse(f"<h1>{_t('share_not_found', lang)}</h1><p>{_t('share_not_found_desc', lang)}</p>", status_code=404)
     
-    auth_session_key = f'share_auth_{token}'
-    need_password = bool(user.get('share_password_hash')) and not request.session.get(auth_session_key)
+    need_password = not _share_session_authorized(user, request)
     
     return tpl(request, 'user_share.html', 
                share_user=user, 
@@ -6556,7 +7470,7 @@ def api_share_auth(token: str, req: ShareAuthRequest, request: Request):
         return JSONResponse({'error': 'Link expired or disabled'}, status_code=404)
     
     if verify_password(req.password, user.get('share_password_hash', '')):
-        request.session[f'share_auth_{token}'] = True
+        request.session[f'share_auth_{token}'] = user.get('share_auth_revision', 0)
         return {'status': 'success'}
     else:
         lang = request.cookies.get('lang', 'ru')
@@ -6570,9 +7484,8 @@ def api_share_connections(token: str, request: Request):
     if not user or not user.get('share_enabled'):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     
-    if user.get('share_password_hash'):
-        if not request.session.get(f'share_auth_{token}'):
-            return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    if not _share_session_authorized(user, request):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
             
     conns = [dict(c) for c in data.get('user_connections', []) if c['user_id'] == user['id']]
     for c in conns:
@@ -6592,9 +7505,8 @@ def api_share_config(token: str, connection_id: str, request: Request):
     if not user or not user.get('share_enabled'):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     
-    if user.get('share_password_hash'):
-        if not request.session.get(f'share_auth_{token}'):
-            return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    if not _share_session_authorized(user, request):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
             
     conn = next((c for c in data.get('user_connections', []) if c['id'] == connection_id and c['user_id'] == user['id']), None)
     if not conn:
@@ -6605,11 +7517,12 @@ def api_share_config(token: str, connection_id: str, request: Request):
         server = data['servers'][sid]
         proto_info = server.get('protocols', {}).get(conn['protocol'], {})
         port = proto_info.get('port', '55424')
+        pub_host, pub_port = protocol_public_endpoint(server, conn['protocol'])
         ssh = get_ssh(server)
         ssh.connect()
         # Use appropriate manager for the protocol
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], server['host'], port)
+        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], pub_host, port, public_port=pub_port)
         ssh.disconnect()
         return {'config': config, **config_payloads(config, server, conn['protocol'])}
     except Exception as e:
@@ -6636,16 +7549,81 @@ def api_my_connection_config(request: Request, connection_id: str):
         server = data['servers'][sid]
         proto_info = server.get('protocols', {}).get(conn['protocol'], {})
         port = proto_info.get('port', '55424')
+        pub_host, pub_port = protocol_public_endpoint(server, conn['protocol'])
         ssh = get_ssh(server)
         ssh.connect()
         # Use appropriate manager for the protocol (fixes Telemt/Xray not working for users)
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], server['host'], port)
+        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], pub_host, port, public_port=pub_port)
         ssh.disconnect()
         return {'config': config, **config_payloads(config, server, conn['protocol'])}
     except Exception as e:
         logger.exception("Error getting my connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+# ======================== EMAIL DELIVERY (admin) ========================
+
+@app.post('/api/settings/mail/test', tags=["Email"])
+async def api_mail_test(request: Request, req: MailTestRequest):
+    """Send a one-liner through the stored SMTP settings to prove they work."""
+    admin = _check_admin(request)
+    if not admin:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    lang = request.cookies.get('lang', 'en')
+    recipient = (req.recipient or '').strip() or str(admin.get('email') or '').strip()
+    try:
+        return await asyncio.to_thread(mail_svc.send_test, recipient, lang)
+    except MailError as exc:
+        return _mail_error_response(exc, lang)
+    except Exception as exc:
+        logger.exception("Mail: test send failed")
+        return JSONResponse({'error': str(exc)}, status_code=502)
+
+
+@app.post('/api/users/mail/bulk', tags=["Email"])
+def api_mail_send_bulk(request: Request, req: MailBulkRequest):
+    """Start a mass send. Returns immediately with the initial job state --
+    reading a few hundred configs over SSH takes minutes, far longer than a
+    browser waits, so the run continues in a worker thread and the page polls
+    /api/users/mail/bulk/status."""
+    admin = _check_admin(request)
+    if not admin:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    lang = request.cookies.get('lang', 'en')
+    try:
+        options = MailOptions.from_dict(req.dict())
+        return mail_svc.start_bulk(options, lang=lang, user_ids=req.user_ids,
+                                   started_by=admin.get('username', ''))
+    except MailError as exc:
+        return _mail_error_response(exc, lang)
+    except Exception as exc:
+        logger.exception("Mail: bulk send failed to start")
+        return JSONResponse({'error': str(exc)}, status_code=500)
+
+
+@app.get('/api/users/mail/bulk/status', tags=["Email"])
+def api_mail_bulk_status(request: Request):
+    """Progress of the current (or last) mass send."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    return mail_svc.bulk_status()
+
+
+@app.post('/api/users/{user_id}/mail/send', tags=["Email"])
+async def api_mail_send_user(request: Request, user_id: str, req: MailSendRequest):
+    """Email one user their configs and/or proxy links."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    lang = request.cookies.get('lang', 'en')
+    try:
+        options = MailOptions.from_dict(req.dict())
+        return await asyncio.to_thread(mail_svc.send_to_user, user_id, options, lang)
+    except MailError as exc:
+        return _mail_error_response(exc, lang)
+    except Exception as exc:
+        logger.exception("Mail: send to user failed")
+        return JSONResponse({'error': str(exc)}, status_code=502)
 
 
 @app.get('/settings', tags=["System Templates"])
@@ -7011,6 +7989,7 @@ def save_settings(request: Request, payload: SaveSettingsRequest):
     settings['captcha'] = payload.captcha.dict()
     settings['telegram'] = payload.telegram.dict()
     settings['ssl'] = payload.ssl.dict()
+    settings['mail'] = merge_mail_settings(settings.get('mail'), payload.mail.dict())
 
     old_auto_backup = settings.get('auto_backup', {}) or {}
     interval_hours = max(1, min(24, int(payload.auto_backup.interval_hours or 24)))
@@ -7049,6 +8028,163 @@ def save_settings(request: Request, payload: SaveSettingsRequest):
             asyncio.create_task(tg_bot.stop_bot())
 
     return {"status": "success", "bot_running": tg_bot.is_running(), "warnings": warnings}
+
+
+# ----- DuckDNS: free domain + one-click auto-renewed Let's Encrypt cert -----
+
+DUCKDNS_CERT_DIR = '/etc/amnezia'
+DUCKDNS_UPDATE_INTERVAL = 600
+
+
+def _duckdns_normalize_domain(domain):
+    """Accept 'example' or 'example.duckdns.org', return the full domain."""
+    d = (domain or '').strip().lower().rstrip('.')
+    if d.endswith('.duckdns.org'):
+        d = d[:-len('.duckdns.org')]
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,61}[a-z0-9]|[a-z0-9]', d or ''):
+        return ''
+    return f"{d}.duckdns.org"
+
+
+def _duckdns_update_ip(domain, token):
+    """Point the duckdns domain at this server's public IP.
+
+    An empty ip= makes duckdns use the caller's address, which is exactly
+    the panel server. Returns (ok, detail)."""
+    subdomain = domain[:-len('.duckdns.org')]
+    url = ('https://www.duckdns.org/update?domains=%s&token=%s&ip='
+           % (urllib.parse.quote(subdomain), urllib.parse.quote(token)))
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            body = resp.read().decode('utf-8', 'replace').strip()
+    except Exception as e:
+        return False, str(e)
+    return (body.upper().startswith('OK'), body)
+
+
+def _duckdns_issue_cert(domain, token):
+    """Issue a Let's Encrypt cert via acme.sh DNS-01 (duckdns plugin) and
+    install it where the panel ssl settings expect. acme.sh drops its own
+    cron entry, so renewal (and the panel restart via --reloadcmd under
+    systemd) is automatic from then on. Returns (ok, log_tail)."""
+    if os.name == 'nt':
+        return False, 'DuckDNS auto-cert is supported on Linux panel hosts only'
+    acme = os.path.expanduser('~/.acme.sh/acme.sh')
+    logs = []
+    if not os.path.exists(acme):
+        inst = subprocess.run(
+            'curl -s https://get.acme.sh | sh -s email=admin@%s' % domain,
+            shell=True, capture_output=True, text=True, timeout=300)
+        logs.append(((inst.stdout or '') + (inst.stderr or ''))[-2000:])
+        if not os.path.exists(acme):
+            return False, 'acme.sh install failed:\n' + '\n'.join(logs)
+    env = dict(os.environ, DuckDNS_Token=token)
+    issue = subprocess.run(
+        [acme, '--issue', '--dns', 'dns_duckdns', '-d', domain,
+         '--server', 'letsencrypt'],
+        capture_output=True, text=True, timeout=300, env=env)
+    logs.append(((issue.stdout or '') + (issue.stderr or ''))[-4000:])
+    # rc 2 = "Skip, next renewal time" (a valid cert already exists) — fine,
+    # --install-cert below will still export it to the panel paths.
+    if issue.returncode not in (0, 2):
+        return False, 'certificate issue failed:\n' + '\n'.join(logs)
+    os.makedirs(DUCKDNS_CERT_DIR, exist_ok=True)
+    key_file = os.path.join(DUCKDNS_CERT_DIR, 'duckdns.key.pem')
+    cert_file = os.path.join(DUCKDNS_CERT_DIR, 'duckdns.cert.pem')
+    cmd = [acme, '--install-cert', '-d', domain,
+           '--key-file', key_file, '--fullchain-file', cert_file]
+    if os.environ.get('INVOCATION_ID'):
+        # renewed/installed cert -> restart the panel so uvicorn picks it up.
+        # Delayed AND detached: a plain 'systemctl restart' here would kill
+        # the very HTTP request that is running this install-cert (observed
+        # on the first apply: files installed, child SIGTERMed, 502).
+        cmd += ['--reloadcmd',
+                "sh -c '(sleep 5 && systemctl restart amnezia-panel) >/dev/null 2>&1 &'"]
+    install = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+    logs.append(((install.stdout or '') + (install.stderr or ''))[-2000:])
+    if install.returncode != 0 or not (os.path.exists(key_file) and os.path.exists(cert_file)):
+        return False, 'certificate install failed:\n' + '\n'.join(logs)
+    return True, '\n'.join(logs)
+
+
+@app.post('/api/settings/duckdns/apply', tags=["Settings"])
+def api_duckdns_apply(request: Request, payload: DuckDNSApplyRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    settings = data.setdefault('settings', {})
+    stored = settings.get('duckdns', {}) or {}
+    domain = _duckdns_normalize_domain(payload.domain) or stored.get('domain', '')
+    token = payload.token.strip() or stored.get('token', '')
+    if payload.enabled and (not domain or not token):
+        return JSONResponse({'error': 'duckdns_domain_token_required'}, status_code=400)
+    settings['duckdns'] = {
+        'enabled': bool(payload.enabled),
+        'domain': domain,
+        'token': token,
+    }
+    result = {'status': 'success', 'domain': domain}
+    if payload.enabled:
+        ok, detail = _duckdns_update_ip(domain, token)
+        result['ip_update'] = {'ok': ok, 'detail': detail}
+        if not ok:
+            save_data(data)
+            return JSONResponse(
+                {'error': 'duckdns_ip_update_failed', 'detail': detail},
+                status_code=502)
+        ok, log = _duckdns_issue_cert(domain, token)
+        if not ok:
+            save_data(data)
+            return JSONResponse(
+                {'error': 'duckdns_cert_failed', 'detail': log[-3000:]},
+                status_code=502)
+        # The duckdns card drives the SAME ssl config as the manual card:
+        # issued paths are written into settings['ssl'].
+        ssl_conf = settings.setdefault('ssl', {})
+        ssl_conf.update({
+            'enabled': True,
+            'domain': domain,
+            'cert_path': os.path.join(DUCKDNS_CERT_DIR, 'duckdns.cert.pem'),
+            'key_path': os.path.join(DUCKDNS_CERT_DIR, 'duckdns.key.pem'),
+            'cert_text': '',
+            'key_text': '',
+        })
+        if os.environ.get('INVOCATION_ID'):
+            # install-cert's detached reloadcmd restarts the panel in ~5s,
+            # switching it to HTTPS on its own
+            result['restarting'] = True
+        else:
+            result['restart_required'] = True
+    save_data(data)
+    logger.info(f"DuckDNS settings applied: enabled={payload.enabled} domain={domain}")
+    return result
+
+
+_duckdns_monitor_started = False
+
+
+def _duckdns_monitor_loop():
+    """Keep the duckdns record pointed at this server's current public IP."""
+    while True:
+        try:
+            d = load_data().get('settings', {}).get('duckdns', {}) or {}
+            if d.get('enabled') and d.get('domain') and d.get('token'):
+                ok, detail = _duckdns_update_ip(d['domain'], d['token'])
+                if not ok:
+                    logger.warning(f"duckdns monitor: ip update failed: {detail}")
+        except Exception as e:
+            logger.warning(f"duckdns monitor loop: {e}")
+        time.sleep(DUCKDNS_UPDATE_INTERVAL)
+
+
+def _start_duckdns_monitor():
+    global _duckdns_monitor_started
+    if _duckdns_monitor_started:
+        return
+    _duckdns_monitor_started = True
+    threading.Thread(target=_duckdns_monitor_loop, daemon=True,
+                     name='duckdns-monitor').start()
+    logger.info(f"DuckDNS monitor started (every {DUCKDNS_UPDATE_INTERVAL}s)")
 
 
 @app.post('/api/settings/telegram/toggle', tags=["Settings"])
@@ -7242,7 +8378,12 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        content = await file.read()
+        # Limit the in-memory JSON read; enforce request-body limits at the
+        # reverse proxy too, since multipart parsing happens before this handler.
+        max_backup_bytes = 32 * 1024 * 1024
+        content = await file.read(max_backup_bytes + 1)
+        if len(content) > max_backup_bytes:
+            return JSONResponse({'error': 'Backup exceeds the 32 MiB limit'}, status_code=413)
         if not content:
             return JSONResponse({'error': 'Empty file'}, status_code=400)
         async with DATA_LOCK:
@@ -7256,8 +8397,10 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
 
             try:
                 backup_data = json.loads(content)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return JSONResponse({'error': 'Invalid SQLite backup or legacy JSON format'}, status_code=400)
+            if not isinstance(backup_data, dict):
+                return JSONResponse({'error': 'Invalid structure: expected a JSON object'}, status_code=400)
 
             required_keys = ['servers', 'users']
             missing = [key for key in required_keys if key not in backup_data]
@@ -7265,6 +8408,8 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
                 return JSONResponse({'error': f'Invalid structure. Missing keys: {", ".join(missing)}'}, status_code=400)
             if not isinstance(backup_data['servers'], list) or not isinstance(backup_data['users'], list):
                 return JSONResponse({'error': 'Invalid structure: servers and users must be lists'}, status_code=400)
+            # Older backups predate server uids; mint them before saving.
+            backfill_server_uids(backup_data['servers'])
             save_data(backup_data)
         return {'status': 'success', 'format': 'legacy-json'}
     except StorageError as error:

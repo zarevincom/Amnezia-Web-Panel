@@ -41,7 +41,7 @@ class FakeManager:
     def get_clients(self, protocol):
         return [dict(c) for c in self.clients]
 
-    def add_client(self, protocol, name, host, port):
+    def add_client(self, protocol, name, host, port, public_port=None):
         if name in self.fail_add:
             raise RuntimeError('target is full')
         client_id = f'new-{name}'

@@ -97,5 +97,65 @@ class ExitNodeUiWiringTests(unittest.TestCase):
             self.assertEqual(missing, [], f'{lang}: {missing}')
 
 
+class RknBlockUiWiringTests(unittest.TestCase):
+    """RKN Block is a host-level marketplace app: its card must bypass the
+    protocol installer and every rknblock_* key must exist in all locales."""
+
+    def setUp(self):
+        self.page = read('templates', 'server.html')
+
+    def test_marketplace_card_and_modal(self):
+        self.assertRegex(self.page, r"\{ proto: 'rknblock', category: 'services'")
+        # host-level app installs directly, never through the AWG installer
+        self.assertNotIn("installFromMarketplace('rknblock'", self.page)
+        self.assertIn("installRknBlock()", self.page)
+
+    def test_rknblock_card_as_marketplace_app(self):
+        self.assertIn('id="proto-rknblock"', self.page)
+        self.assertIn('rknblock/install', self.page)
+        self.assertIn('rknblock/uninstall', self.page)
+        self.assertIn('rknblock/enable', self.page)
+        # renderRknBlockCard must use the global escapeHtml, not the local
+        # esc helpers defined inside other functions (ReferenceError at runtime)
+        self.assertNotIn('esc(d.', self.page)
+        self.assertIn('escapeHtml(d.agent_state)', self.page)
+        self.assertIn('function renderRknBlockCard(', self.page)
+        self.assertIn('function installRknBlock(', self.page)
+        self.assertIn('function uninstallRknBlock(', self.page)
+        self.assertIn('rknblock-toggle-btn', self.page)
+        # scan count must be rendered straight into the badge row
+        self.assertIn('rkn_scan_alert', self.page)
+        # the legacy toggle card and endpoint are gone
+        self.assertNotIn('id="rknBlockCard"', self.page)
+        self.assertNotIn('/rkn_block`', self.page)
+        self.assertNotIn('function toggleRknBlock(', self.page)
+
+    def test_rknblock_options_ui(self):
+        # options button + modal + API wiring
+        self.assertIn('rknblock-options-btn', self.page)
+        self.assertIn('id="rknOptionsModal"', self.page)
+        self.assertIn('function openRknOptionsModal(', self.page)
+        self.assertIn('function saveRknOptions(', self.page)
+        self.assertIn('/rknblock/options', self.page)
+        for flag in ('BlockIn', 'BlockOut', 'LogIn', 'LogOut'):
+            self.assertIn(f'id="rknOpt{flag}"', self.page)
+        # rainbow icon on the card and in the marketplace list
+        self.assertIn('<div class="protocol-icon">🌈</div>', self.page)
+        self.assertIn("icon: '🌈'", self.page)
+
+    def test_rknblock_translations_in_all_languages(self):
+        keys = set(re.findall(r"_\('(rknblock_[a-z0-9_]+)'\)", self.page))
+        keys |= set(re.findall(r"\{\{ _\('(rknblock_[a-z0-9_]+)'\) \}\}", self.page))
+        self.assertGreaterEqual(len(keys), 10)
+        for lang in ('en', 'ru', 'fr', 'fa', 'zh'):
+            data = json.loads(read('translations', f'{lang}.json'))
+            missing = sorted(k for k in keys if k not in data)
+            self.assertEqual(missing, [], f'{lang}: {missing}')
+
+    def test_card_not_shown_via_container_status(self):
+        self.assertIn("if (app.proto === 'rknblock') return;", self.page)
+
+
+
 if __name__ == '__main__':
     unittest.main()

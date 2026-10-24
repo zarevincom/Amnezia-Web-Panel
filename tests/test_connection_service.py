@@ -20,8 +20,11 @@ class FakeManager:
     def __init__(self, result=None):
         self.result = result or {'client_id': 'client-1', 'config': 'client config'}
         self.removed = []
+        self.calls = []
 
-    def add_client(self, protocol, name, host, port):
+    def add_client(self, protocol, name, host, port, public_port=None):
+        self.calls.append({'protocol': protocol, 'name': name, 'host': host,
+                           'port': port, 'public_port': public_port})
         return dict(self.result)
 
     def remove_client(self, protocol, client_id):
@@ -29,7 +32,7 @@ class FakeManager:
 
 
 class FailingManager(FakeManager):
-    def add_client(self, protocol, name, host, port):
+    def add_client(self, protocol, name, host, port, public_port=None):
         raise RuntimeError('remote failed')
 
 
@@ -66,8 +69,11 @@ def base_data():
 
 
 class ConnectionServiceTest(unittest.IsolatedAsyncioTestCase):
-    def make_service(self, data=None, manager=None, save_raises=False):
+    def make_service(self, data=None, manager=None, save_raises=False,
+                     public_endpoint=None):
         state = copy.deepcopy(data or base_data())
+        public_endpoint = public_endpoint or (
+            lambda server, protocol: (server.get('host', ''), None))
         fake_manager = manager or FakeManager()
 
         def load_data():
@@ -86,8 +92,9 @@ class ConnectionServiceTest(unittest.IsolatedAsyncioTestCase):
             data_lock=asyncio.Lock(),
             get_ssh=lambda server: FakeSSH(),
             get_protocol_manager=lambda ssh, protocol: fake_manager,
-            manager_call=lambda manager, method, protocol, *args: getattr(manager, method)(protocol, *args),
+            manager_call=lambda manager, method, protocol, *args, **kwargs: getattr(manager, method)(protocol, *args, **kwargs),
             generate_vpn_link=lambda config: f'vpn://{config}',
+            protocol_public_endpoint=public_endpoint,
         )
         return service, state, fake_manager
 
@@ -350,9 +357,9 @@ class ConnectionServiceTest(unittest.IsolatedAsyncioTestCase):
             state.update(new_data)
 
         class MutatingManager(FakeManager):
-            def add_client(self, protocol, name, host, port):
+            def add_client(self, protocol, name, host, port, public_port=None):
                 state['users'][0]['enabled'] = False
-                return super().add_client(protocol, name, host, port)
+                return super().add_client(protocol, name, host, port, public_port)
 
         fake_manager = MutatingManager()
         service = ConnectionService(
@@ -361,7 +368,7 @@ class ConnectionServiceTest(unittest.IsolatedAsyncioTestCase):
             data_lock=asyncio.Lock(),
             get_ssh=lambda server: FakeSSH(),
             get_protocol_manager=lambda ssh, protocol: fake_manager,
-            manager_call=lambda manager, method, protocol, *args: getattr(manager, method)(protocol, *args),
+            manager_call=lambda manager, method, protocol, *args, **kwargs: getattr(manager, method)(protocol, *args, **kwargs),
             generate_vpn_link=lambda config: f'vpn://{config}',
         )
 

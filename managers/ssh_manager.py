@@ -8,8 +8,17 @@ import io
 import time
 import threading
 import logging
+import shlex
+import os
+from contextlib import nullcontext
+from managers import ssh_trust
 
 logger = logging.getLogger(__name__)
+
+
+def _conn_lock_of(obj):
+    """_conn_lock, tolerating objects built without __init__ (tests)."""
+    return getattr(obj, '_conn_lock', None) or nullcontext()
 
 
 class SSHManager:
@@ -26,7 +35,12 @@ class SSHManager:
         self._is_root = (username == 'root')
         # Serializes connect/disconnect so concurrent threads (UI request
         # handler + background monitor) cannot race a half-built transport.
-        self._conn_lock = threading.Lock()
+        # RLock: run_command holds it for the whole command (see below) and
+        # the reconnect-retry path re-enters connect() on the same thread.
+        # Holding it during exec is what finally closes the race where
+        # force_disconnect() nulled self.client between ensure_connected()
+        # and exec_command(), surfacing as 'NoneType open_session'.
+        self._conn_lock = threading.RLock()
         # Serializes command/SFTP execution on the shared transport. Pooled
         # managers are used concurrently by request handlers and background
         # threads (traffic sync, conn monitor); without this a failed
@@ -53,27 +67,49 @@ class SSHManager:
 
     def connect(self):
         """Establish SSH connection to the server."""
-        with self._conn_lock:
-            self._disconnect_locked()
-            # One retry on TCP connect timeout: links with random SYN loss
-            # (e.g. transcontinental/DPI-filtered routes) drop ~half of the
-            # first attempts while the retry succeeds in milliseconds.
-            last_exc = None
-            for attempt in (1, 2):
-                try:
-                    self._connect_once()
-                    last_exc = None
-                    break
-                except (TimeoutError, OSError) as e:
-                    last_exc = e
-                    logger.warning(
-                        f"SSH connect to {self.host} attempt {attempt} "
-                        f"failed: {e}")
-                    self._disconnect_locked()
-            if last_exc is not None:
-                self._record_connect_failure()
-                raise last_exc
-            self._reset_connect_failures()
+        # Legacy endpoints still call connect() after get_ssh() has returned a
+        # pooled manager.  Reconnecting there used to close the shared
+        # transport underneath another request (stats/background checks),
+        # producing "Unable to open channel" bursts and hanging service checks.
+        # Use the same lock as command execution and make a live pooled
+        # connection idempotent.
+        with self._exec_lock:
+            with self._conn_lock:
+                if self.pooled:
+                    try:
+                        transport = self.client.get_transport() if self.client else None
+                        if transport and transport.is_active():
+                            return True
+                    except Exception:
+                        pass
+
+                self._disconnect_locked()
+                # One retry on TCP connect timeout: links with random SYN loss
+                # (e.g. transcontinental/DPI-filtered routes) drop ~half of the
+                # first attempts while the retry succeeds in milliseconds.
+                last_exc = None
+                for attempt in (1, 2):
+                    try:
+                        self._connect_once()
+                        last_exc = None
+                        break
+                    except (TimeoutError, OSError) as e:
+                        last_exc = e
+                        logger.warning(
+                            f"SSH connect to {self.host} attempt {attempt} "
+                            f"failed: {e}")
+                        self._disconnect_locked()
+                    except Exception:
+                        # Host-key/authentication/configuration failures are
+                        # not transient TCP failures: never retry or accept a
+                        # different key, and do not leave a half-open client.
+                        self._disconnect_locked()
+                        self._record_connect_failure()
+                        raise
+                if last_exc is not None:
+                    self._record_connect_failure()
+                    raise last_exc
+                self._reset_connect_failures()
         return True
 
     def _record_connect_failure(self):
@@ -94,7 +130,15 @@ class SSHManager:
     def _connect_once(self):
         """Single TCP+SSH handshake attempt (caller holds _conn_lock)."""
         self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client.load_system_host_keys()
+        # Persist trust alongside DATA_FILE (the standard Docker data volume).
+        # Explicitly configured files must exist and parse successfully; never
+        # fall back to trust-on-first-use when trust configuration is broken.
+        configured = os.environ.get('SSH_KNOWN_HOSTS_FILE')
+        known_hosts = ssh_trust.trust_path()
+        if configured or os.path.isfile(known_hosts):
+            self.client.load_host_keys(known_hosts)
+        self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
         kwargs = {
             'hostname': self.host,
@@ -154,6 +198,47 @@ class SSHManager:
         with self._conn_lock:
             self._disconnect_locked()
 
+    # ----- docker container state snapshot (batch status checks) -----
+
+    # A full `docker ps -a` round trip answers every "container exists /
+    # running" question at once. Status checks used to fire one SSH command
+    # per protocol per question (~20-30 commands per /check), which is what
+    # made server pages slow on high-latency links. The snapshot is cached
+    # for a few seconds so a burst of checks costs a single command.
+    DOCKER_PS_TTL = 10.0
+
+    def docker_ps_snapshot(self):
+        """Dict {container_name: state} from one `docker ps -a` command."""
+        now = time.time()
+        cached = getattr(self, '_docker_ps_cache', None)
+        if cached and now - cached[0] < self.DOCKER_PS_TTL:
+            return cached[1]
+        out, err, code = self.run_sudo_command(
+            "docker ps -a --format '{{.Names}}\t{{.State}}'", timeout=30)
+        states = {}
+        if code == 0:
+            for line in (out or '').splitlines():
+                parts = line.split('\t')
+                if len(parts) == 2 and parts[0]:
+                    states[parts[0]] = parts[1]
+        self._docker_ps_cache = (now, states)
+        return states
+
+    def docker_container_state(self, name):
+        """(exists, running) for one container from the snapshot.
+
+        Returns None when the snapshot itself failed, so callers fall back
+        to their direct per-container command."""
+        try:
+            states = self.docker_ps_snapshot()
+        except Exception:
+            return None
+        return (name in states, states.get(name) == 'running')
+
+    def docker_ps_invalidate(self):
+        """Drop the snapshot after a mutating docker operation."""
+        self._docker_ps_cache = None
+
     def ensure_connected(self):
         """Connect only if there is no live transport.
 
@@ -185,8 +270,11 @@ class SSHManager:
         stdin_input, when given, is written to the channel's stdin right after
         exec and the write side is closed (same semantics as a shell pipe).
         Used to feed the sudo password without putting it on the command line.
+
+        _conn_lock is held for the whole command so force_disconnect() (pool
+        eviction) cannot tear down the transport mid-command.
         """
-        with self._exec_lock:
+        with self._exec_lock, _conn_lock_of(self):
             return self._run_command_locked(command, timeout, _retried, stdin_input)
 
     @staticmethod
@@ -275,19 +363,21 @@ class SSHManager:
         if self._is_root:
             return self.run_script(script, timeout=timeout)
 
-        # Write script to temp file via SFTP (avoids heredoc/pipe conflicts)
-        import hashlib
-        script_hash = hashlib.md5(script.encode()).hexdigest()[:8]
-        tmp_script = f"/tmp/_amnz_script_{script_hash}.sh"
-        self.upload_file(script, tmp_script)
+        # Atomically allocate private staging; never follow a preplanted /tmp file.
+        tmp_dir = self._make_private_temp_dir()
+        try:
+            tmp_script = tmp_dir + '/script.sh'
+            self.upload_file(script, tmp_script)
+            return self.run_sudo_command('bash ' + shlex.quote(tmp_script), timeout=timeout)
+        finally:
+            self.run_command('rm -rf -- ' + shlex.quote(tmp_dir))
 
-        # Run with sudo (password via stdin, never on the command line)
-        if self.password:
-            return self.run_command(
-                f"sudo -S -p '' bash {tmp_script}; rm -f {tmp_script}",
-                timeout=timeout, stdin_input=self.password + '\n')
-
-        return self.run_command(f"sudo bash {tmp_script}; rm -f {tmp_script}", timeout=timeout)
+    def _make_private_temp_dir(self):
+        out, err, code = self.run_command('mktemp -d /tmp/amnezia-private.XXXXXXXXXX')
+        path = out.strip()
+        if code != 0 or not path.startswith('/tmp/amnezia-private.') or '/' in path[5:] or '\n' in path:
+            raise RuntimeError(err or 'Failed to create private remote staging directory')
+        return path
 
     def run_script(self, script, timeout=120):
         """Execute a multi-line script on remote server."""
@@ -295,7 +385,7 @@ class SSHManager:
 
     def upload_file(self, content, remote_path):
         """Upload text content to a remote file via SFTP."""
-        with self._exec_lock:
+        with self._exec_lock, _conn_lock_of(self):
             return self._upload_file_locked(content, remote_path)
 
     def _upload_file_locked(self, content, remote_path):
@@ -322,19 +412,22 @@ class SSHManager:
         # Normalize line endings (Windows CRLF -> Unix LF)
         content = content.replace('\r\n', '\n')
 
-        # Write to temp file via SFTP (no sudo needed for /tmp)
-        import hashlib
-        tmp_name = f"/tmp/_amnz_{hashlib.md5(remote_path.encode()).hexdigest()[:8]}"
-        self.upload_file(content, tmp_name)
-
-        # Move to target with sudo
-        self.run_sudo_command(f"mv {tmp_name} {remote_path}")
+        tmp_dir = self._make_private_temp_dir()
+        try:
+            tmp_path = tmp_dir + '/content'
+            self.upload_file(content, tmp_path)
+            out, err, code = self.run_sudo_command(
+                'mv -- ' + shlex.quote(tmp_path) + ' ' + shlex.quote(remote_path))
+            if code != 0:
+                raise RuntimeError(err or out or 'Failed to install remote file')
+        finally:
+            self.run_command('rm -rf -- ' + shlex.quote(tmp_dir))
         self.run_sudo_command(f"chmod 644 {remote_path}")
         return True
 
     def download_file(self, remote_path):
         """Download text content from a remote file."""
-        with self._exec_lock:
+        with self._exec_lock, _conn_lock_of(self):
             return self._download_file_locked(remote_path)
 
     def _download_file_locked(self, remote_path):
@@ -349,7 +442,7 @@ class SSHManager:
 
     def file_exists(self, remote_path):
         """Check if a remote file exists."""
-        with self._exec_lock:
+        with self._exec_lock, _conn_lock_of(self):
             return self._file_exists_locked(remote_path)
 
     def _file_exists_locked(self, remote_path):

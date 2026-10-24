@@ -13,12 +13,17 @@
 
         <div class="page-header__search search-field toolbar-search">
             <input type="text" class="form-input" id="userSearch" placeholder="{{ _('search_placeholder') }}"
+                autocomplete="off" readonly onfocus="this.removeAttribute('readonly')"
                 oninput="handleSearch(this.value)">
             <span class="search-field-icon">🔍</span>
         </div>
 
         {% if current_user.role == 'admin' %}
         <div class="page-header__actions">
+            <button class="btn btn-secondary" onclick="openBulkMailModal()" id="bulkMailBtn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-right: 6px;"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m2 7 10 6 10-6"/></svg>
+                {{ _('mail_send_all_btn') }}
+            </button>
             <button class="btn btn-primary" onclick="openModal('addUserModal')">
                 <span>＋</span> {{ _('add_user') }}
             </button>
@@ -358,7 +363,7 @@
             <h2 class="modal-title" id="userConnsTitle">{{ _('user_conns_title') }}</h2>
             <button class="modal-close" onclick="closeModal('userConnsModal')">×</button>
         </div>
-        <div id="userConnsList" style="max-height:400px; overflow-y:auto;"></div>
+        <div id="userConnsList" style="max-height:700px; overflow-y:auto;"></div>
     </div>
 </div>
 
@@ -495,6 +500,153 @@
         }[ch]));
     }
 
+
+    /* ===== Send configs and links by email ===== */
+    let mailMode = 'single';
+    let mailUserId = null;
+    let mailPollTimer = null;
+
+    function mailOptionsFromForm() {
+        return {
+            include_configs: document.getElementById('mailIncludeConfigs').checked,
+            include_links: document.getElementById('mailIncludeLinks').checked,
+            subject: document.getElementById('mailSubject').value.trim(),
+            message: document.getElementById('mailMessage').value
+        };
+    }
+
+    function resetMailModal() {
+        document.getElementById('mailSubject').value = '';
+        document.getElementById('mailMessage').value = '';
+        document.getElementById('mailIncludeConfigs').checked = true;
+        document.getElementById('mailIncludeLinks').checked = true;
+        document.getElementById('mailProgress').classList.add('hidden');
+        document.getElementById('mailSendBtn').disabled = false;
+    }
+
+    function openMailModal(dataset) {
+        mailMode = 'single';
+        mailUserId = dataset.id;
+        stopMailPolling();
+        resetMailModal();
+        document.getElementById('mailModalTitle').textContent = `${_('mail_send_title')} — ${dataset.username}`;
+        document.getElementById('mailRecipientGroup').style.display = '';
+        document.getElementById('mailRecipient').value = dataset.email || '';
+        document.getElementById('mailBulkTargets').style.display = 'none';
+        document.getElementById('mailBulkOptions').style.display = 'none';
+        openModal('mailModal');
+    }
+
+    function openBulkMailModal() {
+        mailMode = 'bulk';
+        mailUserId = null;
+        resetMailModal();
+        document.getElementById('mailModalTitle').textContent = _('mail_send_all_title');
+        document.getElementById('mailRecipientGroup').style.display = 'none';
+        document.getElementById('mailBulkTargets').style.display = '';
+        document.getElementById('mailBulkOptions').style.display = '';
+        openModal('mailModal');
+        // A run started earlier (or from another browser tab) keeps going on the
+        // server: show where it is and, if it is still going, follow it.
+        refreshBulkMailStatus().then(status => {
+            if (status && status.running) startMailPolling();
+        });
+    }
+
+    async function submitMail() {
+        const btn = document.getElementById('mailSendBtn');
+        const spinner = document.getElementById('mailSendSpinner');
+        const options = mailOptionsFromForm();
+        if (!options.include_configs && !options.include_links) {
+            showToast(_('mail_error_nothing_to_send'), 'error');
+            return;
+        }
+        btn.disabled = true;
+        spinner.classList.remove('hidden');
+        try {
+            if (mailMode === 'single') {
+                options.recipient = document.getElementById('mailRecipient').value.trim();
+                const res = await apiCall(`/api/users/${mailUserId}/mail/send`, 'POST', options);
+                showToast(_('mail_sent_ok').replace('{}', res.email), 'success');
+                closeModal('mailModal');
+            } else {
+                options.only_enabled = document.getElementById('mailOnlyEnabled').checked;
+                options.skip_without_connections = document.getElementById('mailSkipEmpty').checked;
+                await apiCall('/api/users/mail/bulk', 'POST', options);
+                showToast(_('mail_bulk_started'), 'success');
+                startMailPolling();
+            }
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+        } finally {
+            spinner.classList.add('hidden');
+            // The status poll disables it again while a run is in flight; this
+            // keeps a refused start (409, bad settings) from freezing the button.
+            btn.disabled = false;
+        }
+    }
+
+    function startMailPolling() {
+        stopMailPolling();
+        mailPollTimer = setInterval(() => refreshBulkMailStatus(true), 2000);
+        refreshBulkMailStatus(true);
+    }
+
+    function stopMailPolling() {
+        if (mailPollTimer) {
+            clearInterval(mailPollTimer);
+            mailPollTimer = null;
+        }
+    }
+
+    // `announce` is on only while we are following a run we started: opening
+    // the dialog must show the last run's numbers without toasting them again.
+    async function refreshBulkMailStatus(announce = false) {
+        let status;
+        try {
+            status = await apiCall('/api/users/mail/bulk/status');
+        } catch (err) {
+            stopMailPolling();
+            return null;
+        }
+        const done = (status.sent || 0) + (status.skipped || 0) + (status.failed || 0);
+        const total = status.total || 0;
+        if (!total) return status;
+
+        const box = document.getElementById('mailProgress');
+        box.classList.remove('hidden');
+        document.getElementById('mailProgressText').textContent =
+            _('mail_bulk_progress').replace('{}', done).replace('{}', total);
+        document.getElementById('mailProgressCounts').textContent =
+            _('mail_bulk_summary').replace('{}', status.sent || 0)
+                .replace('{}', status.skipped || 0).replace('{}', status.failed || 0);
+        document.getElementById('mailProgressBar').style.width = `${total ? (done / total) * 100 : 0}%`;
+        document.getElementById('mailSendBtn').disabled = !!status.running;
+
+        // Counters say how many; this says who, and why they were left out.
+        const leftOut = (status.results || []).filter(row => row.status !== 'sent');
+        document.getElementById('mailResults').innerHTML = leftOut.map(row => `
+            <div><span class="badge badge-${row.status === 'failed' ? 'danger' : 'secondary'}"
+                style="font-size:0.65rem;">${_('mail_status_' + row.status)}</span>
+                ${escapeHtml(row.username || row.email || '')} — ${escapeHtml(_(row.reason || ''))}</div>
+        `).join('');
+
+        if (!status.running) {
+            stopMailPolling();
+            if (!announce) {
+                return status;
+            }
+            if (status.error) {
+                showToast(`${_('error')}: ${status.error}`, 'error');
+            } else if (done) {
+                const summary = _('mail_bulk_summary').replace('{}', status.sent || 0)
+                    .replace('{}', status.skipped || 0).replace('{}', status.failed || 0);
+                showToast(summary, (status.failed || 0) ? 'warning' : 'success');
+            }
+        }
+        return status;
+    }
+
     function escapeJs(value) {
         return String(value ?? '').replace(/[\\'"\n\r<>]/g, ch => ({
             '\\': '\\\\', "'": "\\'", '"': '\\"', '\n': '\\n', '\r': '\\r', '<': '\\x3c', '>': '\\x3e'
@@ -593,6 +745,10 @@
                                 data-enabled="${u.share_enabled ? 'true' : 'false'}"
                                 data-haspassword="${u.has_share_password ? 'true' : 'false'}"
                                 title="${_('share_access')}">📤</button>
+                        <button class="btn btn-secondary btn-sm btn-icon" onclick="openMailModal(this.dataset)"
+                                data-id="${u.id}" data-username="${u.username}" data-email="${u.email || ''}"
+                                ${u.email ? '' : 'disabled'}
+                                title="${u.email ? _('mail_send_btn') : _('mail_no_email_hint')}">${ICON_MAIL}</button>
                         ${u.id !== "{{ current_user.id }}" ? `
                             <button class="btn btn-secondary btn-sm btn-icon peer-toggle${u.enabled ? '' : ' peer-toggle-off'}" onclick="toggleUser(this.dataset, this)"
                                     data-id="${u.id}" data-enable="${u.enabled ? 'false' : 'true'}"
@@ -1258,6 +1414,74 @@
             <button class="btn btn-primary" onclick="saveShareSetup()" id="saveShareBtn">
                 <span id="saveShareBtnText">{{ _('save') }}</span>
                 <div class="spinner hidden" id="saveShareSpinner"></div>
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Send by email ===== -->
+<div class="modal-backdrop" id="mailModal">
+    <div class="modal">
+        <div class="modal-header">
+            <h2 class="modal-title" id="mailModalTitle">{{ _('mail_send_title') }}</h2>
+            <button class="modal-close" onclick="closeModal('mailModal')">×</button>
+        </div>
+
+        <div class="form-group" id="mailRecipientGroup">
+            <label class="form-label">{{ _('mail_recipient_label') }}</label>
+            <input class="form-input" type="email" id="mailRecipient" placeholder="user@example.com">
+        </div>
+
+        <p class="form-hint" id="mailBulkTargets" style="display:none;">{{ _('mail_bulk_targets') }}</p>
+
+        <div class="form-group">
+            <label style="display:flex; align-items:center; gap:var(--space-sm); cursor:pointer;">
+                <input type="checkbox" id="mailIncludeConfigs" checked> {{ _('mail_include_configs') }}
+            </label>
+            <label style="display:flex; align-items:center; gap:var(--space-sm); cursor:pointer; margin-top:var(--space-sm);">
+                <input type="checkbox" id="mailIncludeLinks" checked> {{ _('mail_include_links') }}
+            </label>
+        </div>
+
+        <div class="form-group" id="mailBulkOptions" style="display:none;">
+            <label style="display:flex; align-items:center; gap:var(--space-sm); cursor:pointer;">
+                <input type="checkbox" id="mailOnlyEnabled" checked> {{ _('mail_only_enabled') }}
+            </label>
+            <label style="display:flex; align-items:center; gap:var(--space-sm); cursor:pointer; margin-top:var(--space-sm);">
+                <input type="checkbox" id="mailSkipEmpty" checked> {{ _('mail_skip_empty') }}
+            </label>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">{{ _('mail_subject_label') }}</label>
+            <input class="form-input" type="text" id="mailSubject" placeholder="{{ _('mail_subject_placeholder') }}">
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">{{ _('mail_message_label') }}</label>
+            <textarea class="form-input" id="mailMessage" rows="3"
+                placeholder="{{ _('mail_message_placeholder') }}"></textarea>
+        </div>
+
+        <div id="mailProgress" class="hidden" style="margin-bottom: var(--space-md);">
+            <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:var(--text-muted);">
+                <span id="mailProgressText"></span>
+                <span id="mailProgressCounts"></span>
+            </div>
+            <div style="width:100%; height:6px; background:var(--bg-tertiary); border-radius:3px; overflow:hidden; margin-top:4px;">
+                <div id="mailProgressBar" style="height:100%; width:0%; background:var(--accent); transition:width 0.3s ease;"></div>
+            </div>
+            <p class="form-hint" style="margin-top:var(--space-sm);">{{ _('mail_bulk_running_note') }}</p>
+            <div id="mailResults" style="max-height:140px; overflow:auto; margin-top:var(--space-sm);
+                font-size:0.78rem; color:var(--text-muted);"></div>
+        </div>
+
+        <div class="divider"></div>
+        <div style="display: flex; gap: var(--space-md); justify-content: flex-end;">
+            <button class="btn btn-secondary" onclick="closeModal('mailModal')">{{ _('cancel') }}</button>
+            <button class="btn btn-primary" onclick="submitMail()" id="mailSendBtn">
+                <span id="mailSendBtnText">{{ _('mail_send_action') }}</span>
+                <div class="spinner hidden" id="mailSendSpinner"></div>
             </button>
         </div>
     </div>

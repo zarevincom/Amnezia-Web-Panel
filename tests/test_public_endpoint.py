@@ -1,0 +1,368 @@
+"""Per-instance public address: the endpoint a client actually dials.
+
+The panel handed out its own SSH address for every protocol on a server. A box
+can publish an instance somewhere else -- a second IP, a port forward, a domain
+name -- and the configs it issued were then unreachable; for telemt, which
+prints its own tg:// links, they were wrong even when the tunnel worked. The
+instance record now carries `public_host`/`public_port`, and these cover the
+lookup, the API around it, and the places the address reaches a client.
+"""
+
+import json
+import os
+import re
+import shutil
+import tempfile
+import unittest
+from unittest import mock
+
+from fastapi.testclient import TestClient
+
+import app as panel
+import json_state
+from managers.awg_manager import AWGManager
+from managers.telemt_manager import TelemtManager
+from managers.wireguard_manager import WireGuardManager
+from managers.xray_manager import XrayManager
+
+
+def server_with(protocols):
+    return {'name': 'Aeza', 'host': '198.51.100.1', 'ssh_port': 22, 'username': 'root',
+            'password': 'x', 'private_key': '', 'server_info': {}, 'uid': 'srv-uid',
+            'protocols': protocols}
+
+
+class EndpointResolutionTests(unittest.TestCase):
+    def test_without_an_override_the_panel_address_is_used(self):
+        server = server_with({'awg2': {'port': '55424'}})
+        self.assertEqual(panel.protocol_public_endpoint(server, 'awg2'), ('198.51.100.1', None))
+
+    def test_public_host_replaces_the_panel_address(self):
+        server = server_with({'telemt': {'port': '8443', 'public_host': '203.0.113.9'}})
+        self.assertEqual(panel.protocol_public_endpoint(server, 'telemt'), ('203.0.113.9', None))
+
+    def test_public_port_comes_back_for_the_managers(self):
+        server = server_with({'telemt': {'port': '8443', 'public_host': '203.0.113.9',
+                                         'public_port': '443'}})
+        self.assertEqual(panel.protocol_public_endpoint(server, 'telemt'), ('203.0.113.9', '443'))
+
+    def test_blank_and_missing_records_fall_back(self):
+        server = server_with({'awg2': {'port': '55424', 'public_host': '   ', 'public_port': ''}})
+        self.assertEqual(panel.protocol_public_endpoint(server, 'awg2'), ('198.51.100.1', None))
+        # an instance the panel has no record of at all
+        self.assertEqual(panel.protocol_public_endpoint(server, 'xray'), ('198.51.100.1', None))
+
+
+class ValidationTests(unittest.TestCase):
+    def test_addresses_and_names_pass(self):
+        for value in ('198.51.100.1', 'vpn.example.com', '[2a01:e5c0:7bc2::2]', 'a-b_c.example'):
+            self.assertEqual(panel.normalize_public_host(value), value)
+        self.assertEqual(panel.normalize_public_host('  198.51.100.1  '), '198.51.100.1')
+        self.assertEqual(panel.normalize_public_host(''), '')
+
+    def test_anything_that_would_silently_break_a_config_is_rejected(self):
+        for value in ('https://vpn.example.com', 'vpn.example.com/path', 'vpn example com',
+                      'host&other', 'a' * 254,
+                      # a bare IPv6 would read as host:port and never connect
+                      '2a01:e5c0:7bc2::2'):
+            with self.assertRaises(ValueError, msg=value):
+                panel.normalize_public_host(value)
+
+    def test_port_must_be_a_port(self):
+        self.assertEqual(panel.normalize_public_port(' 443 '), '443')
+        self.assertEqual(panel.normalize_public_port(''), '')
+        for value in ('0', '65536', '-1', '44a3', 'http'):
+            with self.assertRaises(ValueError, msg=value):
+                panel.normalize_public_port(value)
+
+
+class ClientConfigTests(unittest.TestCase):
+    """Every manager that builds an endpoint must honour the override."""
+
+    def wireguard(self):
+        mgr = WireGuardManager(ssh_manager=mock.Mock())
+        mgr._get_clients_table = lambda: [{'clientId': 'peer', 'userData': {
+            'clientPrivateKey': 'priv', 'clientIp': '10.8.0.6', 'psk': 'psk'}}]
+        mgr._get_server_public_key = lambda: 'serverpub'
+        mgr._get_server_psk = lambda: 'serverpsk'
+        mgr._get_listen_port = lambda: '51820'
+        mgr._get_dns = lambda ud=None: '1.1.1.1'
+        return mgr
+
+    def awg(self):
+        mgr = AWGManager(mock.Mock())
+        mgr._get_clients_table = lambda proto: [{'clientId': 'peer', 'userData': {
+            'clientPrivateKey': 'priv', 'clientIp': '10.8.1.6', 'psk': 'psk'}}]
+        mgr._get_client_ipv6 = lambda proto, ip: ''
+        mgr._get_server_public_key = lambda proto: 'serverpub'
+        mgr._get_server_psk = lambda proto: 'serverpsk'
+        mgr._get_awg_params_from_config = lambda proto: {}
+        mgr._get_dns = lambda proto, ud: '1.1.1.1'
+        mgr._get_mtu = lambda proto, ud: '1376'
+        return mgr
+
+    def xray(self):
+        mgr = XrayManager(mock.Mock())
+        mgr._get_clients_table = lambda: [{'clientId': 'uuid-1',
+                                          'userData': {'clientName': 'laptop'}}]
+        mgr._get_meta_json = lambda: {'port': 443, 'public_key': 'pbk', 'short_id': 'sid',
+                                      'site_name': 'yahoo.com'}
+        mgr._get_server_json = lambda: None
+        return mgr
+
+    def test_wireguard_endpoint_follows_the_public_port(self):
+        config = self.wireguard().get_client_config('peer', 'vpn.example.com', '51820',
+                                                    public_port='443')
+        self.assertIn('Endpoint = vpn.example.com:443', config)
+
+    def test_wireguard_keeps_the_listen_port_without_an_override(self):
+        config = self.wireguard().get_client_config('peer', 'vpn.example.com', '51820')
+        self.assertIn('Endpoint = vpn.example.com:51820', config)
+
+    def test_awg_endpoint_follows_the_public_port(self):
+        config = self.awg().get_client_config('awg2', 'peer', '203.0.113.9', '55424',
+                                              public_port='443')
+        self.assertIn('Endpoint = 203.0.113.9:443', config)
+
+    def test_awg_keeps_the_listen_port_without_an_override(self):
+        config = self.awg().get_client_config('awg2', 'peer', '198.51.100.1', '55424')
+        self.assertIn('Endpoint = 198.51.100.1:55424', config)
+
+    def test_xray_link_prefers_the_public_port_over_the_live_config(self):
+        link = self.xray().get_client_config('xray', 'uuid-1', 'vpn.example.com', '55424',
+                                             public_port='8443')
+        self.assertIn('@vpn.example.com:8443?', link)
+
+    def test_xray_link_without_an_override_still_trusts_meta(self):
+        # meta.json is synced from the live server.json; the panel's own record
+        # can be stale, so an unset override must not promote it.
+        link = self.xray().get_client_config('xray', 'uuid-1', 'vpn.example.com', '55424')
+        self.assertIn('@vpn.example.com:443?', link)
+
+
+TELEMT_CONFIG = """[general]
+port = 443
+
+[general.links]
+show = "*"
+# public_host = "proxy.example.com"  # Host (IP or domain) for tg:// links
+public_port = 443                  # Port for tg:// links
+
+[access.users]
+alice = "deadbeef"
+"""
+
+
+class TelemtLinkConfigTests(unittest.TestCase):
+    """Telemt prints its own links, so the address has to land in config.toml."""
+
+    def manager(self):
+        ssh = mock.Mock()
+        ssh.host = '198.51.100.1'
+        return TelemtManager(ssh)
+
+    def test_commented_host_is_activated_and_lines_stay_separate(self):
+        patched = self.manager()._patch_public_links(TELEMT_CONFIG, '203.0.113.9', '443')
+        self.assertIn('public_host = "203.0.113.9"', patched)
+        self.assertIn('public_port = 443', patched)
+        # A pattern allowed to span lines eats the newline before the key and
+        # welds it onto the previous line, quietly corrupting the config.
+        self.assertIn('show = "*"\n', patched)
+        self.assertEqual(len(TELEMT_CONFIG.splitlines()), len(patched.splitlines()))
+
+    def test_an_already_set_host_is_replaced_in_place(self):
+        once = self.manager()._patch_public_links(TELEMT_CONFIG, '203.0.113.9', '443')
+        twice = self.manager()._patch_public_links(once, '203.0.113.10', '8443')
+        self.assertIn('public_host = "203.0.113.10"', twice)
+        self.assertNotIn('203.0.113.9', twice)
+        self.assertEqual(twice.count('public_host'), 1)
+        self.assertEqual(len(once.splitlines()), len(twice.splitlines()))
+
+    def test_keys_are_added_when_the_section_has_neither(self):
+        bare = '[general.links]\nshow = "*"\n'
+        patched = self.manager()._patch_public_links(bare, 'vpn.example.com', '443')
+        self.assertIn('public_host = "vpn.example.com"', patched)
+        self.assertIn('public_port = 443', patched)
+
+    def test_set_public_endpoint_writes_and_reloads(self):
+        mgr = self.manager()
+        mgr._get_server_config = lambda: TELEMT_CONFIG
+        saved = []
+        mgr.save_server_config = lambda proto, content: saved.append(content)
+        self.assertTrue(mgr.set_public_endpoint('203.0.113.9', '443'))
+        self.assertEqual(len(saved), 1)
+        self.assertIn('public_host = "203.0.113.9"', saved[0])
+
+    def test_set_public_endpoint_reports_a_missing_config(self):
+        mgr = self.manager()
+        mgr._get_server_config = lambda: ''
+        mgr.save_server_config = lambda proto, content: self.fail('nothing to save')
+        self.assertFalse(mgr.set_public_endpoint('203.0.113.9', '443'))
+
+class PublicEndpointApiTests(unittest.TestCase):
+    """The API around the record, through the real app."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._data_file = panel.DATA_FILE
+        panel.DATA_FILE = os.path.join(self.tmp, 'data.json')
+        json_state.install(self, panel)
+        with open(panel.DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'servers': [server_with({
+                'awg2': {'installed': True, 'port': '55424', 'base_protocol': 'awg2'},
+                'telemt': {'installed': True, 'port': '8443', 'base_protocol': 'telemt'},
+            })], 'users': [], 'user_connections': []}, f)
+        self._monitor_flag = panel._conn_monitor_started
+        panel._conn_monitor_started = True
+
+    def tearDown(self):
+        panel.DATA_FILE = self._data_file
+        panel._conn_monitor_started = self._monitor_flag
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def stored(self, protocol):
+        with open(panel.DATA_FILE, encoding='utf-8') as f:
+            return json.load(f)['servers'][0]['protocols'][protocol]
+
+    def client(self):
+        client = TestClient(panel.app)
+        client.__enter__()
+        self.addCleanup(client.__exit__, None, None, None)
+        login = client.post('/api/auth/login', json={'username': 'admin', 'password': 'admin'})
+        self.assertEqual(login.status_code, 200, login.text)
+        return client
+
+    def set_endpoint(self, client, **body):
+        return client.post('/api/servers/0/protocol/public-endpoint', json=body)
+
+    def test_set_and_clear_round_trip(self):
+        client = self.client()
+        res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
+                                public_port='443')
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()['warning'], '')
+        self.assertEqual(self.stored('awg2')['public_host'], '203.0.113.9')
+        self.assertEqual(self.stored('awg2')['public_port'], '443')
+
+        # empty fields mean "back to the server address and the listen port":
+        # the keys go away rather than lingering as empty strings
+        res = self.set_endpoint(client, protocol='awg2', public_host='', public_port='')
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertNotIn('public_host', self.stored('awg2'))
+        self.assertNotIn('public_port', self.stored('awg2'))
+        self.assertEqual(self.stored('awg2')['port'], '55424', 'listen port must survive')
+
+    def test_bad_input_is_refused_before_it_reaches_a_config(self):
+        client = self.client()
+        res = self.set_endpoint(client, protocol='awg2', public_host='https://vpn.example.com')
+        self.assertEqual(res.status_code, 400, res.text)
+        res = self.set_endpoint(client, protocol='awg2', public_port='70000')
+        self.assertEqual(res.status_code, 400, res.text)
+        self.assertNotIn('public_host', self.stored('awg2'))
+
+    def test_unknown_protocol_and_server(self):
+        client = self.client()
+        self.assertEqual(self.set_endpoint(client, protocol='xray',
+                                           public_host='203.0.113.9').status_code, 404)
+        res = client.post('/api/servers/7/protocol/public-endpoint',
+                          json={'protocol': 'awg2', 'public_host': '203.0.113.9'})
+        self.assertEqual(res.status_code, 404)
+
+    def test_anonymous_callers_are_refused(self):
+        with TestClient(panel.app) as client:
+            res = client.post('/api/servers/0/protocol/public-endpoint',
+                              json={'protocol': 'awg2', 'public_host': '203.0.113.9'})
+            self.assertEqual(res.status_code, 403)
+
+    def test_telemt_override_is_pushed_into_the_running_config(self):
+        client = self.client()
+        manager = mock.Mock()
+        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+             mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
+            res = self.set_endpoint(client, protocol='telemt', public_host='203.0.113.9',
+                                    public_port='443')
+        self.assertEqual(res.status_code, 200, res.text)
+        manager.set_public_endpoint.assert_called_once_with('203.0.113.9', '443')
+
+    def test_telemt_falls_back_to_the_instance_port(self):
+        client = self.client()
+        manager = mock.Mock()
+        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+             mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
+            self.set_endpoint(client, protocol='telemt', public_host='203.0.113.9')
+        manager.set_public_endpoint.assert_called_once_with('203.0.113.9', '8443')
+
+    def test_an_unreachable_server_still_keeps_the_setting(self):
+        client = self.client()
+        with mock.patch.object(panel, 'get_ssh', side_effect=RuntimeError('host is down')):
+            res = self.set_endpoint(client, protocol='telemt', public_host='203.0.113.9')
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertIn('host is down', res.json()['warning'])
+        self.assertEqual(self.stored('telemt')['public_host'], '203.0.113.9')
+
+    def test_reinstall_keeps_the_public_address(self):
+        client = self.client()
+        manager = mock.Mock()
+        manager.install_protocol.return_value = {'status': 'success', 'awg_params': {}}
+        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+             mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
+            self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
+                              public_port='443')
+            with mock.patch.object(panel, 'ensure_docker_installed', return_value=''), \
+                 mock.patch.object(panel, 'get_used_ports', return_value={}):
+                res = client.post('/api/servers/0/install',
+                                  json={'protocol': 'awg2', 'port': '55424'})
+        self.assertEqual(res.status_code, 200, res.text)
+        # The install rebuilds the record from scratch; where the instance is
+        # published is a property of the network, not of this install.
+        self.assertEqual(self.stored('awg2')['public_host'], '203.0.113.9')
+        self.assertEqual(self.stored('awg2')['public_port'], '443')
+
+    def test_telemt_reinstall_writes_the_override_into_the_fresh_config(self):
+        client = self.client()
+        manager = mock.Mock()
+        manager.install_protocol.return_value = {'status': 'success'}
+        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+             mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
+            self.set_endpoint(client, protocol='telemt', public_host='203.0.113.9',
+                              public_port='443')
+            with mock.patch.object(panel, 'ensure_docker_installed', return_value=''), \
+                 mock.patch.object(panel, 'get_used_ports', return_value={}):
+                res = client.post('/api/servers/0/install',
+                                  json={'protocol': 'telemt', 'port': '8443'})
+        self.assertEqual(res.status_code, 200, res.text)
+        kwargs = manager.install_protocol.call_args.kwargs
+        self.assertEqual(kwargs['public_host'], '203.0.113.9')
+        self.assertEqual(kwargs['public_port'], '443')
+
+    def test_issued_config_uses_the_override(self):
+        client = self.client()
+        manager = mock.Mock()
+        manager.add_client.return_value = {'client_id': 'peer', 'config': '[Interface]'}
+        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+             mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
+            self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
+                              public_port='443')
+            res = client.post('/api/servers/0/connections/add',
+                              json={'protocol': 'awg2', 'name': 'laptop'})
+        self.assertEqual(res.status_code, 200, res.text)
+        args, kwargs = manager.add_client.call_args
+        self.assertEqual(args[2], '203.0.113.9', 'the client must dial the published address')
+        self.assertEqual(kwargs['public_port'], '443')
+
+    def test_server_page_carries_the_endpoints_and_the_modal(self):
+        client = self.client()
+        self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9', public_port='443')
+        page = client.get('/server/0').text
+        self.assertIn('id="publicEndpointModal"', page)
+        self.assertIn('function openPublicEndpointModal', page)
+        endpoints = re.search(r'const PUBLIC_ENDPOINTS = (\{.*?\});', page, re.S).group(1)
+        self.assertIn('"awg2"', endpoints)
+        self.assertIn('203.0.113.9', endpoints)
+        self.assertIn('"443"', endpoints)
+        # a missing translation renders as the raw key
+        self.assertEqual(re.findall(r'>\s*public_endpoint_[a-z0-9_]+\s*<', page), [])
+
+
+if __name__ == '__main__':
+    unittest.main()
