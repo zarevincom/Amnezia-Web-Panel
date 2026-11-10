@@ -449,6 +449,22 @@
         </div>
     </div>
 
+    <div class="card card-hover protocol-card protocol-vkturn" id="proto-vkturn">
+        <div class="protocol-card-head">
+            <div class="protocol-icon">📞</div>
+            <div class="protocol-name">VK TURN Proxy</div>
+            <div class="flex gap-sm protocol-ctrl" id="vkturn-ctrl" style="display:none!important;"></div>
+        </div>
+        <div class="protocol-desc">{{ _('vkturn_desc') }}</div>
+        <div class="protocol-status" id="vkturn-status">
+            <span class="badge badge-warn">{{ _('not_checked') }}</span>
+        </div>
+        <div id="vkturn-info" class="hidden"><div class="protocol-info" id="vkturn-info-grid"></div></div>
+        <div class="flex gap-sm" id="vkturn-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('vkturn')" id="vkturn-install-btn">{{ _('install') }}</button>
+        </div>
+    </div>
+
     <!-- DNS Card -->
     <div class="card card-hover protocol-card protocol-dns" id="proto-dns">
         <div class="protocol-card-head">
@@ -1428,6 +1444,50 @@
     </div>
 </div>
 
+<div class="modal-backdrop" id="vkTurnModal">
+    <div class="modal" style="max-width:680px;">
+        <div class="modal-header">
+            <h2 class="modal-title">VK TURN Proxy · WRAP</h2>
+            <button class="modal-close" onclick="closeModal('vkTurnModal')">×</button>
+        </div>
+        <p class="form-hint">{{ _('vkturn_client_hint') }}</p>
+        <div class="form-group">
+            <label class="form-label" for="vkTurnSettingsText">{{ _('vkturn_settings') }}</label>
+            <textarea class="form-input" id="vkTurnSettingsText" rows="4" readonly spellcheck="false"></textarea>
+        </div>
+        <div class="flex gap-sm" style="flex-wrap:wrap;margin-bottom:var(--space-md);">
+            <a class="btn btn-secondary btn-sm" href="https://github.com/anton48/vk-turn-proxy-ios" target="_blank" rel="noopener noreferrer">iPhone / iPad</a>
+            <a class="btn btn-secondary btn-sm" href="https://github.com/Moroka8/vk-turn-proxy/releases/tag/v1.10.1" target="_blank" rel="noopener noreferrer">Android / Windows / macOS / Linux</a>
+            <button class="btn btn-secondary btn-sm" onclick="closeModal('vkTurnModal'); selectProtocolForConns('wireguard')">{{ _('vkturn_profiles') }}</button>
+        </div>
+        <div id="vkTurnExportForm" class="hidden">
+            <div class="form-group">
+                <label class="form-label" for="vkTurnCallLink">{{ _('vkturn_call_link') }}</label>
+                <input class="form-input" type="url" id="vkTurnCallLink" placeholder="https://vk.ru/call/join/..." autocomplete="off">
+                <div class="form-hint">{{ _('vkturn_call_hint') }}</div>
+            </div>
+            <button class="btn btn-primary btn-sm" id="vkTurnExportBtn" onclick="exportVkTurnClient()">{{ _('vkturn_export') }}</button>
+        </div>
+        <div id="vkTurnExportResult" class="hidden" style="margin-top:var(--space-md);">
+            <div class="form-group">
+                <label class="form-label" for="vkTurnConfig">WireGuard .conf · 127.0.0.1:9000 · MTU 1280</label>
+                <textarea class="form-input" id="vkTurnConfig" rows="9" readonly spellcheck="false"></textarea>
+                <button class="btn btn-secondary btn-sm" onclick="downloadFile(document.getElementById('vkTurnConfig').value, 'wireguard-vkturn.conf')">{{ _('download_conf') }}</button>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="vkTurnCommand">{{ _('vkturn_command') }}</label>
+                <textarea class="form-input" id="vkTurnCommand" rows="4" readonly spellcheck="false"></textarea>
+                <div class="form-hint">{{ _('vkturn_routes_hint') }}</div>
+            </div>
+            <div class="form-group" id="vkTurnIosGroup">
+                <label class="form-label" for="vkTurnIosLink">iOS · SRTP-WRAP</label>
+                <textarea class="form-input" id="vkTurnIosLink" rows="3" readonly spellcheck="false"></textarea>
+                <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(document.getElementById('vkTurnIosLink').value)">{{ _('copy_key') }}</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- ===== Connection Config Modal (with Tabs) ===== -->
 <div class="modal-backdrop" id="configModal">
     <div class="modal" style="max-width: 600px;">
@@ -1591,6 +1651,7 @@
         { proto: 'dns', category: 'services', icon: '🔍', title: 'AmneziaDNS', descKey: 'dns_desc' },
         { proto: 'adguard', category: 'services', icon: '🛡️', title: 'AdGuard Home', descKey: 'adguard_desc' },
         { proto: 'socks5', category: 'services', icon: '🧦', title: 'SOCKS5 Proxy', descKey: 'socks5_desc' },
+        { proto: 'vkturn', category: 'services', icon: '📞', title: 'VK TURN Proxy (Moroka8)', descKey: 'vkturn_desc', badge: 'NEW' },
         { proto: 'exit', category: 'services', icon: '🚪', title: 'Exit Node', descKey: 'exit_desc', badge: 'NEW' },
         { proto: 'rknblock', category: 'services', icon: '🌈', title: 'RKN Block (C24Be)', descKey: 'rknblock_desc' },
         { proto: 'nginx', category: 'web_servers', icon: '🌐', title: 'NGINX', descKey: 'nginx_desc' },
@@ -1668,7 +1729,7 @@
     // ---- Used-port awareness for the install modal ----
     // Fetches real listening ports from the server (not just same-family
     // protocol records) so the suggested port is actually free.
-    const UDP_INSTALL_PROTOS = new Set(['awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'exit']);
+    const UDP_INSTALL_PROTOS = new Set(['awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'exit', 'vkturn']);
     const SKIP_PORT_CHECK = new Set(['dns', 'adguard']); // internal bindings
     window.usedPorts = { ts: 0, udp: {}, tcp: {} };
 
@@ -2013,6 +2074,7 @@
             case 'xray': title = 'Xray'; break;
             case 'telemt': title = 'Telemt'; break;
             case 'wireguard': title = 'WireGuard'; break;
+            case 'vkturn': title = 'VK TURN Proxy'; break;
             case 'aivpn': title = 'AIVPN'; break;
             case 'dns': title = 'AmneziaDNS'; break;
             case 'socks5': title = 'SOCKS5 Proxy'; break;
@@ -2279,11 +2341,15 @@
 
     // Services that don't have per-user "connections" — they expose a single
     // shared endpoint (DNS/proxy/admin UI) rather than per-client configs.
-    const SERVICE_PROTOS = ['dns', 'socks5', 'adguard', 'nginx', 'exit'];
+    const SERVICE_PROTOS = ['dns', 'socks5', 'adguard', 'nginx', 'exit', 'vkturn'];
 
     function buildServiceInfoGrid(proto, info) {
         // Custom info-grid markup for non-VPN services. Returns HTML for the grid body.
         const base = protoBase(proto);
+        if (base === 'vkturn') {
+            return `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${escapeHtml(String(info.port || '56000'))}/UDP · WRAP</span></div>
+                <div class="protocol-info-item"><span class="protocol-info-label">WireGuard</span><span class="protocol-info-value">${escapeHtml(String(info.backend_port || '51820'))}/UDP</span></div>`;
+        }
         if (base === 'dns') {
             return `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">172.29.172.254:53 (Internal)</span></div>`;
         }
@@ -2417,7 +2483,12 @@
                 }
                 infoGrid.innerHTML = grid;
             }
-            if (protoBase(proto) === 'socks5') {
+            if (protoBase(proto) === 'vkturn') {
+                actionsEl.innerHTML = `
+                    <button class="btn btn-secondary btn-sm" onclick="openVkTurnSettings()" style="flex:1">${_('vkturn_settings')}</button>
+                    <button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')">${_('backup')}</button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">${_('uninstall')}</button>`;
+            } else if (protoBase(proto) === 'socks5') {
                 actionsEl.innerHTML = `
                     <button class="btn btn-secondary btn-sm" onclick="openSocks5Settings('${proto}')" style="flex:1">${_('socks5_change_settings')}</button>
                     <button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')">${_('backup')}</button>
@@ -2471,6 +2542,7 @@
                     `;
                 } else if (isService) {
                     ctrlEl.innerHTML = `
+                        ${proto === 'vkturn' ? `<button class="btn btn-secondary btn-sm" onclick="openPublicEndpointModal('vkturn')" title="${_('public_endpoint_title')}">🌐</button>` : ''}
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
                 } else {
@@ -2496,7 +2568,12 @@
         } else if (info.container_exists) {
             installedProtocols[proto] = true;
             statusEl.innerHTML = `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('stop')}</span>`;
-            if (isService) {
+            if (protoBase(proto) === 'vkturn') {
+                actionsEl.innerHTML = `
+                    <button class="btn btn-secondary btn-sm" onclick="openVkTurnSettings()" style="flex:1">${_('vkturn_settings')}</button>
+                    <button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')">${_('backup')}</button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">${_('uninstall')}</button>`;
+            } else if (isService) {
                 actionsEl.innerHTML = `
                     <button class="btn btn-primary btn-sm" onclick="openInstallModal('${proto}')" style="flex:1">${_('reinstall')}</button>
                     <button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')">${_('backup')}</button>
@@ -2950,6 +3027,7 @@
         const nginxOpts = document.getElementById('nginxOptions');
         const awgOpts = document.getElementById('awgOptions');
         const exitOpts = document.getElementById('exitOptions');
+        portInput.min = '1';
 
         telemtOpts.style.display = 'none';
         socks5Opts.style.display = 'none';
@@ -2963,6 +3041,12 @@
             portInput.value = '53';
             portInput.disabled = true;
             portHint.textContent = _('dns_internal_hint');
+        } else if (base === 'vkturn') {
+            portLabel.textContent = _('port') + ' (UDP)';
+            portInput.disabled = false;
+            portInput.min = '1024';
+            portInput.value = '56000';
+            portHint.textContent = _('vkturn_install_hint');
         } else if (base === 'xray') {
             portLabel.textContent = _('port') + ' (TCP)';
             portInput.disabled = false;
@@ -3895,6 +3979,7 @@
                             ${protoBase(proto) === 'aivpn' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="showProfile('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('profile')}">👁</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="startRenameConnection('${escapeJs(client.clientId)}', this)" title="${_('rename')}">${ICON_PENCIL}</button>
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt' || protoBase(proto) === 'aivpn'})" title="${_('config')}">📄</button>
+                            ${proto === 'wireguard' && installedProtocols.vkturn && userData.clientPrivateKey ? `<button class="btn btn-secondary btn-sm" onclick="openVkTurnSettings('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('vkturn_export')}">VK</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="openTransferConnectionModal('${escapeJs(client.clientId)}', '${escapeJs(name)}')" title="${_('transfer_connection')}">⇄</button>
                             ${(proto === 'telemt' || protoBase(proto) === 'aivpn') ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">⚙️</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon ${toggleClass}" onclick="toggleConnection('${escapeJs(client.clientId)}', ${!enabled}, this)" title="${toggleTitle}">💡</button>
@@ -4476,6 +4561,54 @@
             showToast(_('config_saved'), 'success');
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    let vkTurnClientId = null;
+    let vkTurnClientName = '';
+    let vkTurnDialogGeneration = 0;
+
+    async function openVkTurnSettings(clientId = null, name = '') {
+        const generation = ++vkTurnDialogGeneration;
+        vkTurnClientId = clientId;
+        vkTurnClientName = name;
+        document.getElementById('vkTurnExportBtn').disabled = false;
+        ['vkTurnConfig', 'vkTurnCommand', 'vkTurnIosLink'].forEach(id => {
+            document.getElementById(id).value = '';
+        });
+        document.getElementById('vkTurnExportResult').classList.add('hidden');
+        document.getElementById('vkTurnExportForm').classList.toggle('hidden', !clientId);
+        document.getElementById('vkTurnSettingsText').value = _('loading');
+        openModal('vkTurnModal');
+        try {
+            const data = await apiCall(`/api/servers/${SERVER_ID}/vkturn/settings`);
+            if (generation !== vkTurnDialogGeneration) return;
+            document.getElementById('vkTurnSettingsText').value = `${data.endpoint}\nWRAP key: ${data.wrap_key}\nMoroka8 ${data.version} · WireGuard ${data.backend_port}/UDP`;
+        } catch (err) {
+            if (generation === vkTurnDialogGeneration) document.getElementById('vkTurnSettingsText').value = err.message;
+        }
+    }
+
+    async function exportVkTurnClient() {
+        const generation = vkTurnDialogGeneration;
+        const button = document.getElementById('vkTurnExportBtn');
+        button.disabled = true;
+        document.getElementById('vkTurnExportResult').classList.add('hidden');
+        try {
+            const data = await apiCall(`/api/servers/${SERVER_ID}/vkturn/client`, 'POST', {
+                client_id: vkTurnClientId, name: vkTurnClientName,
+                vk_link: document.getElementById('vkTurnCallLink').value.trim(),
+            });
+            if (generation !== vkTurnDialogGeneration) return;
+            document.getElementById('vkTurnConfig').value = data.config;
+            document.getElementById('vkTurnCommand').value = data.client_command;
+            document.getElementById('vkTurnIosLink').value = data.ios_link;
+            document.getElementById('vkTurnIosGroup').classList.toggle('hidden', !data.ios_link);
+            document.getElementById('vkTurnExportResult').classList.remove('hidden');
+        } catch (err) {
+            if (generation === vkTurnDialogGeneration) showToast(err.message, 'error');
+        } finally {
+            if (generation === vkTurnDialogGeneration) button.disabled = false;
         }
     }
 

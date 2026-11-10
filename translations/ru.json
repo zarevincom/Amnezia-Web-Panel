@@ -826,5 +826,15 @@
   "notify_status_no_bot": "Токен Telegram-бота не задан — профиль не отправлен",
   "notify_badge_sent": "📨 отправлен в Telegram",
   "notify_badge_no_telegram": "нет Telegram",
-  "notify_badge_no_bot": "не отправлен: бот не настроен"
+  "notify_badge_no_bot": "не отправлен: бот не настроен",
+    "vkturn_desc": "Транспорт Moroka8 WRAP через звонки VK для обычного WireGuard. При необходимости устанавливает WireGuard.",
+    "vkturn_install_hint": "По умолчанию: 56000/UDP. Использует существующий WireGuard или устанавливает его на 51820/UDP. Разрешите UDP-порт прокси в firewall сервера и у провайдера.",
+    "vkturn_settings": "Настройки подключения",
+    "vkturn_profiles": "Профили WireGuard",
+    "vkturn_client_hint": "Установите совместимый VK TURN клиент. iOS: anton48, режим SRTP-WRAP. Android и ПК: клиент Moroka8 вместе с WireGuard. Обычное приложение AmneziaVPN этот транспорт не предоставляет.",
+    "vkturn_call_link": "Ваша ссылка на звонок VK",
+    "vkturn_call_hint": "Создайте свой звонок VK и вставьте HTTPS-ссылку для входа. Нужна для ссылки импорта iOS; обрабатывается только при экспорте и не сохраняется на сервере.",
+    "vkturn_export": "Экспорт для VK TURN",
+    "vkturn_command": "Команда клиента Moroka8 (Linux/macOS; для Windows/Android замените имя бинарника)",
+    "vkturn_routes_hint": "Сначала запустите прокси, затем WireGuard. На ПК используйте скрипт маршрутов Moroka8; на Android исключите приложение прокси из VPN. Ссылка импорта iOS появится после ввода ссылки звонка для профиля со всем трафиком через VPN. Храните WRAP-ключ и ссылки экспорта в секрете."
 }
