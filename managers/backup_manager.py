@@ -5,6 +5,7 @@ import shlex
 import tarfile
 import tempfile
 import time
+from managers.wireguard_manager import serialized_wireguard_lifecycle
 
 
 class BackupManager:
@@ -136,6 +137,9 @@ class BackupManager:
             # docker cp needed.
             config_dir = inst_path('/opt/amnezia/aivpn')
             paths['host'] = [config_dir]
+            paths['container'] = []
+        elif base == 'vkturn':
+            paths['host'] = ['/opt/amnezia/vkturn']
             paths['container'] = []
         elif base == 'exit':
             paths['host'] = [f'/opt/amnezia/{container_name}']
@@ -374,6 +378,7 @@ printf '%s\n' "$archive"
             return {'status': 'error', 'message': err or out or 'Backup not found'}
         return {'status': 'success', 'protocol': protocol, 'filename': safe_name}
 
+    @serialized_wireguard_lifecycle
     def restore_backup(self, protocol, container_name, filename):
         safe_proto = self.safe_protocol(protocol)
         safe_name = self.safe_filename(filename)
@@ -391,6 +396,12 @@ printf '%s\n' "$archive"
             info = inspected.get('info') or {}
             if str(info.get('protocol') or '') != str(protocol):
                 return {'status': 'error', 'message': 'Backup protocol mismatch'}
+            if self.proto_base(protocol) == 'vkturn':
+                from managers.vkturn_manager import VkTurnManager
+                try:
+                    VkTurnManager(self.ssh).validate_backup(local_path)
+                except (ValueError, RuntimeError, tarfile.TarError) as e:
+                    return {'status': 'error', 'message': str(e)}
         finally:
             try:
                 os.remove(local_path)
@@ -525,4 +536,12 @@ echo "restore_success"
         out, err, code = self.ssh.run_sudo_script(script, timeout=180)
         if code != 0:
             return {'status': 'error', 'message': err or out or 'Failed to restore backup'}
+        if self.proto_base(protocol) == 'vkturn':
+            from managers.vkturn_manager import VkTurnManager
+            time.sleep(1)
+            try:
+                if not VkTurnManager(self.ssh).check_container_running():
+                    return {'status': 'error', 'message': 'Restored VK TURN container failed its startup check'}
+            except RuntimeError:
+                return {'status': 'error', 'message': 'Could not verify restored VK TURN container'}
         return {'status': 'success', 'protocol': protocol, 'filename': filename}

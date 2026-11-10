@@ -826,5 +826,15 @@
   "notify_status_no_bot": "The Telegram bot token is not configured — the profile was not sent",
   "notify_badge_sent": "📨 sent in Telegram",
   "notify_badge_no_telegram": "no Telegram",
-  "notify_badge_no_bot": "not sent: bot is not configured"
+  "notify_badge_no_bot": "not sent: bot is not configured",
+    "vkturn_desc": "Moroka8 WRAP transport through VK Calls for standard WireGuard. Includes WireGuard installation when needed.",
+    "vkturn_install_hint": "Default: 56000/UDP. Reuses existing WireGuard; installs it on 51820/UDP if absent. Allow the proxy UDP port in the server and provider firewalls.",
+    "vkturn_settings": "Connection settings",
+    "vkturn_profiles": "WireGuard profiles",
+    "vkturn_client_hint": "Install a compatible VK TURN client. iOS: anton48, SRTP-WRAP mode. Android/desktop: Moroka8 client plus WireGuard. The regular AmneziaVPN app does not provide this transport.",
+    "vkturn_call_link": "Your VK call link",
+    "vkturn_call_hint": "Create your own VK call and paste its HTTPS join link. Required for the iOS import link; processed for this export only, not saved on the server.",
+    "vkturn_export": "Export for VK TURN",
+    "vkturn_command": "Moroka8 client command (Linux/macOS; adapt the binary name on Windows/Android)",
+    "vkturn_routes_hint": "Start the proxy before WireGuard. Use the Moroka8 route script on desktop; exclude the proxy app from the VPN on Android. An iOS import link is available after entering a call link for a full-tunnel profile. Keep the WRAP key and exported links private."
 }

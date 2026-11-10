@@ -29,6 +29,20 @@ logger = logging.getLogger(__name__)
 # resurfaces as 'External (native app)' (the config stores no names).
 _WG_TABLE_LOCKS = {}
 _WG_TABLE_LOCKS_GUARD = threading.Lock()
+_WG_LIFECYCLE_LOCKS = {}
+_WG_LIFECYCLE_GUARD = threading.Lock()
+
+
+def serialized_wireguard_lifecycle(method):
+    """WG and its VK transport share one lifecycle lock per SSH target."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        key = tuple(str(getattr(self.ssh, field, '')) for field in ('host', 'port', 'username'))
+        with _WG_LIFECYCLE_GUARD:
+            lock = _WG_LIFECYCLE_LOCKS.setdefault(key, threading.RLock())
+        with lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 def _wg_clients_table_lock(host, container_name):
@@ -175,7 +189,16 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         self.ssh.run_sudo_script(script)
         return True
 
-    def install_protocol(self, port=None):
+    def _assert_no_vkturn_dependency(self):
+        out, err, code = self.ssh.run_sudo_command(
+            "docker ps -a --filter name=^amnezia-vkturn$ --format '{{.Names}}'")
+        if code != 0:
+            raise RuntimeError(err or 'Could not check VK TURN dependency')
+        if 'amnezia-vkturn' in out.splitlines():
+            raise ValueError('Remove VK TURN before replacing or deleting its WireGuard backend')
+
+    @serialized_wireguard_lifecycle
+    def install_protocol(self, port=None, replace_existing=True):
         """
         Full installation of WireGuard protocol.
         Steps: install docker -> prepare host -> build container ->
@@ -194,6 +217,15 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         else:
             results.append("Docker already installed")
 
+        self._assert_no_vkturn_dependency()
+        if not replace_existing:
+            out, err, code = self.ssh.run_sudo_command(
+                "docker ps -a --filter name=^amnezia-wireguard$ --format '{{.Names}}'")
+            if code != 0:
+                raise RuntimeError(err or 'Could not check existing WireGuard')
+            if 'amnezia-wireguard' in out.splitlines():
+                raise ValueError('WireGuard already exists; automatic replacement is refused')
+
         # Step 2: Prepare host
         results.append("Preparing host...")
         self.prepare_host()
@@ -201,6 +233,8 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
         # Step 3: Remove old container if exists
         if self.check_protocol_installed():
+            if not replace_existing:
+                raise ValueError('WireGuard already exists; automatic replacement is refused')
             results.append("Removing old container...")
             self.remove_container()
             results.append("Old container removed")
@@ -395,8 +429,10 @@ tail -f /dev/null
         import time
         time.sleep(5)
 
+    @serialized_wireguard_lifecycle
     def remove_container(self):
         """Remove WireGuard container."""
+        self._assert_no_vkturn_dependency()
         self.ssh.run_sudo_command(f"docker stop {self.CONTAINER_NAME}")
         self.ssh.run_sudo_command(f"docker rm -fv {self.CONTAINER_NAME}")
         self.ssh.run_sudo_command(f"docker rmi {self.CONTAINER_NAME}")

@@ -1081,7 +1081,7 @@ async def wait_for_tunnel_url(provider: str, seconds: int = 20):
     return get_tunnel_status(provider)
 
 
-BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn', 'exit']
+BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn', 'exit', 'vkturn']
 MULTI_INSTANCE_PROTOCOLS = {'awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'}
 
 
@@ -1169,6 +1169,7 @@ def protocol_display_name(protocol: str, header_protection=False) -> str:
         'telemt': 'Telemt',
         'dns': 'AmneziaDNS',
         'wireguard': 'WireGuard',
+        'vkturn': 'VK TURN Proxy',
         'socks5': 'SOCKS5',
         'adguard': 'AdGuard Home',
         'nginx': 'NGINX',
@@ -1191,6 +1192,7 @@ def protocol_container_name(protocol: str) -> Optional[str]:
         'telemt': 'telemt',
         'dns': 'amnezia-dns',
         'wireguard': 'amnezia-wireguard',
+        'vkturn': 'amnezia-vkturn',
         'socks5': 'amnezia-socks5proxy',
         'adguard': 'amnezia-adguard',
         'nginx': 'amnezia-nginx',
@@ -1209,7 +1211,10 @@ def is_valid_protocol(protocol: str) -> bool:
 
 def get_protocol_manager(ssh, protocol: str):
     base = protocol_base(protocol)
-    if base == 'xray':
+    if base == 'vkturn':
+        from managers.vkturn_manager import VkTurnManager
+        return VkTurnManager(ssh, protocol)
+    elif base == 'xray':
         from managers.xray_manager import XrayManager
         return XrayManager(ssh, protocol)
     elif base == 'telemt':
@@ -2503,6 +2508,12 @@ class EditConnectionRequest(BaseModel):
 class ConnectionActionRequest(BaseModel):
     protocol: str = 'awg'
     client_id: str = ''
+
+
+class VkTurnClientRequest(BaseModel):
+    client_id: str
+    vk_link: str = ''
+    name: str = 'WireGuard'
 
 
 class TransferConnectionRequest(ConnectionActionRequest):
@@ -4707,7 +4718,7 @@ def get_used_ports(ssh):
 # mapped to their transport. dns/adguard are skipped (internal bindings).
 INSTALL_PORT_TRANSPORT = {
     'awg': 'udp', 'awg2': 'udp', 'awg3': 'udp', 'awg_legacy': 'udp',
-    'wireguard': 'udp', 'exit': 'udp',
+    'wireguard': 'udp', 'exit': 'udp', 'vkturn': 'udp',
     'xray': 'tcp', 'telemt': 'tcp', 'socks5': 'tcp', 'nginx': 'tcp',
 }
 
@@ -4743,6 +4754,8 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         if 'protocols' not in server:
             server['protocols'] = {}
         base_protocol = protocol_base(req.protocol)
+        if base_protocol == 'vkturn' and 'port' not in req.model_fields_set:
+            req.port = '56000'
         if req.install_another:
             if base_protocol not in MULTI_INSTANCE_PROTOCOLS:
                 return JSONResponse({'error': 'Multiple instances are not supported for this protocol yet'}, status_code=400)
@@ -4750,6 +4763,16 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         else:
             install_protocol = req.protocol
         install_base = protocol_base(install_protocol)
+        if install_base == 'wireguard' and server['protocols'].get('vkturn'):
+            return JSONResponse({'error': 'Remove VK TURN before reinstalling its WireGuard backend'}, status_code=409)
+        if install_base == 'vkturn':
+            from managers.vkturn_manager import VkTurnManager
+            try:
+                VkTurnManager._port(req.port)
+                if install_protocol != 'vkturn':
+                    raise ValueError('VK TURN supports a single instance per server')
+            except ValueError as e:
+                return JSONResponse({'error': str(e)}, status_code=400)
         # A reinstalled entry keeps its exit link and is re-linked below
         previous_link = None
         # Where an instance is published is a property of the network, not
@@ -4793,7 +4816,10 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
 
         # Pass parameters to installer
         install_kwargs = None
-        if install_base == 'telemt':
+        if install_base == 'vkturn':
+            install_args = ()
+            install_kwargs = dict(protocol_type=install_protocol, port=req.port)
+        elif install_base == 'telemt':
             install_args = ()
             install_kwargs = dict(
                 protocol_type=install_protocol,
@@ -4860,7 +4886,11 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         else:
             install_args = (install_protocol,)
             install_kwargs = dict(port=req.port)
-        result = await asyncio.to_thread(manager.install_protocol, *install_args, **install_kwargs)
+        try:
+            result = await asyncio.to_thread(manager.install_protocol, *install_args, **install_kwargs)
+        except ValueError as e:
+            ssh.disconnect()
+            return JSONResponse({'error': str(e)}, status_code=400)
 
         if not isinstance(result, dict):
             result = {'status': 'success', 'message': str(result)}
@@ -4870,6 +4900,39 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         if result.get('status') == 'error' or result.get('error'):
             ssh.disconnect()
             return JSONResponse({'error': result.get('message') or result.get('error') or 'Installation failed'}, status_code=400)
+
+        if install_base == 'vkturn':
+            # Installation can take minutes. Merge only its records into the
+            # latest state so concurrent user edits and server reorders survive.
+            async with DATA_LOCK:
+                fresh = load_data()
+                if server.get('uid'):
+                    _, current = find_server_by_uid(fresh, server['uid'])
+                else:
+                    current = (fresh['servers'][server_id]
+                               if 0 <= server_id < len(fresh['servers'])
+                               and fresh['servers'][server_id].get('host') == server.get('host') else None)
+                if current is None:
+                    ssh.disconnect()
+                    return JSONResponse({'error': 'Server was removed during installation; check the VPS before retrying'}, status_code=409)
+                protocols = current.setdefault('protocols', {})
+                previous = protocols.get('vkturn') or {}
+                record = {key: previous[key] for key in ('public_host', 'public_port', 'custom_name') if key in previous}
+                record.update(installed=True, port=result['port'], backend_port=result['backend_port'],
+                              version=result['version'], base_protocol='vkturn', instance=1,
+                              display_name='VK TURN Proxy', container_name='amnezia-vkturn')
+                protocols['vkturn'] = record
+                if result.get('wireguard_created'):
+                    protocols.setdefault('wireguard', {
+                        'installed': True, 'port': result['wireguard_port'],
+                        'base_protocol': 'wireguard', 'instance': 1,
+                        'display_name': 'WireGuard', 'container_name': 'amnezia-wireguard',
+                    })
+                save_data(fresh)
+            ssh.disconnect()
+            result.update(protocol='vkturn', base_protocol='vkturn',
+                          display_name='VK TURN Proxy', container_name='amnezia-vkturn')
+            return result
 
         proto_record = {
             'installed': True,
@@ -4946,6 +5009,71 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
     except Exception as e:
         logger.exception("Error installing protocol")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+def _vkturn_endpoint(server, settings):
+    host, public_port = protocol_public_endpoint(server, 'vkturn')
+    if ':' in host and not host.startswith('['):
+        host = f'[{host}]'
+    return f"{host}:{public_port or settings['port']}"
+
+
+@app.get('/api/servers/{server_id}/vkturn/settings', tags=["Protocols"])
+def api_vkturn_settings(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    ssh = None
+    try:
+        data = load_data()
+        if not 0 <= server_id < len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        if not server.get('protocols', {}).get('vkturn'):
+            return JSONResponse({'error': 'VK TURN is not installed'}, status_code=400)
+        from managers.vkturn_manager import VkTurnManager
+        ssh = get_ssh(server)
+        settings = VkTurnManager(ssh).get_settings()
+        return JSONResponse({**settings, 'endpoint': _vkturn_endpoint(server, settings)},
+                            headers={'Cache-Control': 'no-store'})
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception:
+        logger.exception('Error reading VK TURN settings')
+        return JSONResponse({'error': 'Could not read VK TURN settings'}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/vkturn/client', tags=["Connections"])
+def api_vkturn_client(request: Request, server_id: int, req: VkTurnClientRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    ssh = None
+    try:
+        from managers.vkturn_manager import VkTurnManager, build_client_bundle, validate_vk_link
+        validate_vk_link(req.vk_link)
+        data = load_data()
+        if not 0 <= server_id < len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        if not req.client_id or not server.get('protocols', {}).get('vkturn'):
+            return JSONResponse({'error': 'Select a WireGuard profile and install VK TURN first'}, status_code=400)
+        ssh = get_ssh(server)
+        settings = VkTurnManager(ssh).get_settings()
+        manager = get_protocol_manager(ssh, 'wireguard')
+        config = manager.get_client_config(req.client_id, server['host'])
+        bundle = build_client_bundle(config, _vkturn_endpoint(server, settings),
+                                     settings['wrap_key'], req.vk_link, req.name)
+        return bundle
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception:
+        logger.exception('Error exporting VK TURN client')
+        return JSONResponse({'error': 'Could not export VK TURN client'}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
 
 
 @app.get('/api/servers/{server_id}/socks5/credentials', tags=["Protocols"])
@@ -5276,6 +5404,8 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
         base = protocol_base(req.protocol)
+        if base == 'wireguard' and server.get('protocols', {}).get('vkturn'):
+            return JSONResponse({'error': 'Remove VK TURN before deleting its WireGuard backend'}, status_code=409)
         if base in AWG_PROTOCOLS and ((server.get('protocols') or {}).get(req.protocol) or {}).get('exit_link'):
             # Drop our peer on the exit while the container still exists
             try:
@@ -5328,6 +5458,7 @@ CONTAINER_NAMES = {
     'telemt': 'telemt',
     'dns': 'amnezia-dns',
     'wireguard': 'amnezia-wireguard',
+    'vkturn': 'amnezia-vkturn',
     'socks5': 'amnezia-socks5proxy',
     'adguard': 'amnezia-adguard',
     'nginx': 'amnezia-nginx',

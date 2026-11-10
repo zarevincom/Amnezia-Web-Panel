@@ -70,6 +70,7 @@ Configuration panel for system parameters and preferences:
     *   **AmneziaDNS**: Internal DNS resolver on a private docker network (`amnezia-dns-net`, IP `172.29.172.254`) to prevent DNS leaks and blockings.
     *   **AdGuard Home**: DNS-based ad blocker with a web admin UI. Two install modes: **Replace AmneziaDNS** (takes its IP, all VPN clients use AdGuard immediately) or **Side-by-side** (parallel deployment on `172.29.172.253`, web UI accessible only over the VPN by default). Optional opt-in checkboxes to expose the web UI / DoT / DoH on the host.
     *   **SOCKS5 Proxy**: Single-account 3proxy-based SOCKS5 server modelled after the official Amnezia client. Auto-generated 16-character password on install, port and credentials editable later from the panel without re-install.
+    *   **VK TURN Proxy (Moroka8)**: Install the pinned **v1.10.1** WRAP server from Marketplace. Linux amd64/arm64 binaries are checked against their release SHA-256 before use. The service reuses standard WireGuard without replacing peers; if absent, WireGuard is installed on `51820/udp`. The proxy defaults to `56000/udp` and runs in a read-only Docker container as an unprivileged user. Removing the proxy preserves WireGuard. Remove the proxy first before deleting or reinstalling its backend.
     *   **NGINX + Let's Encrypt**: Reverse-proxy and HTTPS automation with certificate management for secure public endpoints.
 *   **⚙️ Core Server Management**:
     *   **Add / Edit / Delete / Reorder** server entries — drag-and-drop reorder updates `server_id` references in saved connections automatically.
@@ -315,6 +316,48 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
   -d '{"protocol":"telemt","public_host":"203.0.113.9","public_port":"443"}' \
   http://your-panel:5000/api/servers/0/protocol/public-endpoint
 ```
+
+### VK TURN Proxy clients
+
+Install **VK TURN Proxy (Moroka8)** from a managed server's Marketplace. Allow
+its chosen UDP port in the VPS firewall and the provider's firewall. An existing
+WireGuard backend must be running and publish an IPv4 UDP port. On a fresh
+server, `51820/udp` must be free for automatic WireGuard installation. Existing
+AmneziaWG instances are separate and are not used as this backend.
+
+Create clients under **WireGuard**, then select the **VK** button on a profile
+whose private key is stored in the panel. The service's **Connection settings**
+button shows the public endpoint and WRAP key. The globe button overrides the
+proxy's public host/port when a domain or port forward is needed. A VK call link
+is supplied at export time; the panel does not save it.
+
+- **iPhone/iPad**: install [anton48/vk-turn-proxy-ios](https://github.com/anton48/vk-turn-proxy-ios),
+  enter your VK call link in the panel and copy the generated `vkturnproxy://`
+  link into the app's connection-link importer. It selects **SRTP-WRAP** with
+  the generated WRAP key and the profile's WireGuard keys. iOS imports use a
+  full IPv4 tunnel; split-tunnel profiles only receive the `.conf` export.
+- **Android and desktop**: use the matching
+  [Moroka8 v1.10.1 client](https://github.com/Moroka8/vk-turn-proxy/releases/tag/v1.10.1).
+  Export and import the separate WireGuard `.conf` (`Endpoint = 127.0.0.1:9000`,
+  `MTU = 1280`) and start the displayed Moroka8 command before WireGuard.
+  Full-tunnel exports use two IPv4 `/1` routes to keep Windows WireGuard's
+  `/0` firewall kill switch from blocking the separate TURN client.
+  Replace `./client` with the downloaded executable name (on Windows,
+  `./client-windows-amd64.exe`, for example). Desktop users must use the matching
+  `routes.sh`, `routes-macos.sh` or `routes.ps1` from Moroka8 (pipe the proxy's
+  output into the route script, as shown in the export) to keep TURN traffic
+  outside the VPN; Android users must exclude the proxy app from WireGuard.
+
+The ordinary WireGuard export remains unchanged. Standard AmneziaVPN/INCY
+clients do not implement this VK TURN WRAP transport by importing a profile
+alone. The WRAP key, `.conf` and iOS import link contain secrets; share them
+only with the intended client. Status checks and panel state do not contain
+the WRAP key. Proxy backups include its binary, startup settings and key;
+back up WireGuard separately to preserve the actual VPN profiles. Restoring a
+proxy backup uses the existing container; install the service before restoring
+onto a different VPS. Restore is refused unless its binary matches the pinned
+release for the target CPU and the startup settings have the same listener and
+WireGuard backend binding. VLESS transport is not included in this template.
 
 ### Profile Transfer Between VPS
 
