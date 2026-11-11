@@ -1,0 +1,13 @@
+{
+  "log": {"level": "warn", "timestamp": true},
+  "inbounds": [{
+    "type": "tun", "tag": "openflux-tun", "interface_name": "oflux0",
+    "address": ["198.19.0.1/30"], "mtu": 1280,
+    "auto_route": false, "stack": "system"
+  }],
+  "outbounds": [{
+    "type": "socks", "tag": "openflux-socks", "server": "127.0.0.1",
+    "server_port": 1080, "version": "5"
+  }],
+  "route": {"final": "openflux-socks"}
+}

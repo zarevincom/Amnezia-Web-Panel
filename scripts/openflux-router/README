@@ -1,0 +1,37 @@
+OpenFlux for Routerich AX3000
+
+Activation script revision: r2.2.
+
+Current connection remains VK TURN. Its /etc/vkturn directory and routing table 200 are preserved.
+
+Activate (from Windows PowerShell):
+ssh -t root@192.168.1.1 "sh /etc/openflux/activate.sh"
+
+The script requires three consecutive SOCKS + TUN checks before switching LAN/DNS, then asks for YES.
+Check websites and https://api.ipify.org on a LAN device: expected IP 37.252.5.64.
+Type YES within the printed confirmation timeout (up to 120 seconds) to keep OpenFlux as primary and enable autostart.
+The persistent routing marker is saved only after YES. Boot/restart restores OpenFlux LAN policy only after three successful TUN checks.
+Any other answer, timeout or interrupted SSH restores VK TURN.
+Rollback removes the OpenFlux policy immediately, before waiting for its processes to stop.
+Failed preflight stops the isolated OpenFlux client and leaves the VK TURN policy in place.
+An independent guard restores VK TURN after 180 seconds from cutover if the activation shell disappears. A transient post-switch TUN probe is retried before rollback.
+VK TURN is not stopped or removed, including after confirmation.
+
+Immediate rollback (from Windows PowerShell):
+ssh root@192.168.1.1 "sh /etc/openflux/restore-vkturn.sh"
+
+Read-only readiness check while OpenFlux is running:
+sh /etc/openflux/activate.sh --check
+
+OpenFlux: /tmp/openflux-core, node-v1.3.1 arm64; verified gzip stored in /etc/openflux/openflux.gz.
+Private key and config stay under /etc/openflux, root-only.
+Existing sing-box supplies oflux0 (198.19.0.1/30, MTU 1280), SOCKS5 is localhost:1080.
+New routing table 201 overrides LAN/DNS only while activated. Router bootstrap traffic stays on WAN.
+Yandex transport and encrypted direct fallback reuse the installed VPS profile at 37.252.5.64:8445.
+Existing IPv6 forwarding guard remains because the tunnel routes IPv4.
+No router reboot was performed.
+
+These source files contain no private channel key, document address or account cookies.
+The installed VPS profile in /etc/openflux/client.conf and encryption.key is kept separately.
+
+Diagnostic 2026-11-11: Yandex passed isolated HTTPS and UDP DNS, but 6/16 concurrent TUN HTTPS requests failed. Full-LAN reliability has not been established. VK TURN remains the default; OpenFlux autostart is off until an explicit successful cutover and YES.
