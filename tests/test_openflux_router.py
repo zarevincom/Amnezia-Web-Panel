@@ -147,5 +147,61 @@ esac
             self.assertIn('route-down', calls)
 
 
+@unittest.skipUnless(BASH and Path(BASH).is_file(), 'bash is required')
+class InitTests(unittest.TestCase):
+    def run_init(self, cookies):
+        with tempfile.TemporaryDirectory(prefix='openflux-init-') as temporary:
+            root = Path(temporary)
+            (root / 'bin').mkdir()
+            (root / 'config').mkdir()
+            base = posix(root)
+            for name in ('sha256sum', 'sing-box'):
+                (root / 'bin' / name).write_bytes(b'#!/bin/sh\nexit 0\n')
+            if cookies is not None:
+                (root / 'config/yandex-cookies.txt').write_text(cookies)
+            (root / 'tmp').mkdir()
+            cache = root / 'tmp/openflux-browser-cookies.json'
+            cache.write_text('{"stale": {"old": "cookie"}}')
+            original = root / 'config/cookies.json'
+            original.write_text('{"kept": {"existing": "cookie"}}')
+            source = SOURCE.with_name('openflux.init').read_text()
+            source = source.replace('/etc/openflux', base + '/config')
+            source = source.replace('/usr/bin/sing-box', base + '/bin/sing-box')
+            source = source.replace('/tmp/', base + '/tmp/')
+            (root / 'openflux.init').write_bytes(source.encode())
+            command = '''export PATH="$BASE/bin:$PATH"
+chmod +x "$BASE"/bin/*
+procd_open_instance() { :; }
+procd_close_instance() { :; }
+procd_set_param() { if [ "$1" = command ]; then printf '%s\\n' "$@"; fi; }
+. "$BASE/openflux.init"
+start_service
+'''
+            result = subprocess.run([BASH, '-c', command], capture_output=True,
+                                    env=dict(os.environ, BASE=base), timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(original.read_text(), '{"kept": {"existing": "cookie"}}')
+            return result.stdout.decode().splitlines(), base, cache.exists()
+
+    def test_init_passes_yandex_cookies_file_when_present(self):
+        commands, base, cache_exists = self.run_init('# Netscape HTTP Cookie File\n')
+        self.assertIn('--yandex-cookies-file', commands)
+        index = commands.index('--yandex-cookies-file')
+        self.assertEqual(commands[index + 1], base + '/config/yandex-cookies.txt')
+        self.assertIn('--cookie-store', commands)
+        index = commands.index('--cookie-store')
+        self.assertEqual(commands[index + 1], base + '/tmp/openflux-browser-cookies.json')
+        self.assertFalse(cache_exists, 'Stale JSON must not replace imported browser cookies')
+
+    def test_init_keeps_command_without_missing_or_empty_cookie_file(self):
+        for cookies in (None, ''):
+            with self.subTest(cookies=cookies):
+                commands, base, cache_exists = self.run_init(cookies)
+                self.assertTrue(cache_exists)
+                self.assertEqual(commands, [
+                    'command', base + '/tmp/openflux-core', '--config',
+                    base + '/config/client.conf', 'command', base + '/config/run-gateway.sh'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -12,8 +12,15 @@ start_service() {
     mv /tmp/openflux-core.new /tmp/openflux-core
   fi
   /usr/bin/sing-box check -c /etc/openflux/gateway.json || return 1
+  set -- /tmp/openflux-core --config /etc/openflux/client.conf
+  if [ -s /etc/openflux/yandex-cookies.txt ]; then
+    chmod 600 /etc/openflux/yandex-cookies.txt || return 1
+    # The core replays its JSON store after importing Netscape cookies.
+    rm -f /tmp/openflux-browser-cookies.json || return 1
+    set -- "$@" --yandex-cookies-file /etc/openflux/yandex-cookies.txt --cookie-store /tmp/openflux-browser-cookies.json
+  fi
   procd_open_instance client
-  procd_set_param command /tmp/openflux-core --config /etc/openflux/client.conf
+  procd_set_param command "$@"
   procd_set_param env GOMEMLIMIT=96MiB GOGC=50
   procd_set_param stdout 1
   procd_set_param stderr 1

@@ -23,6 +23,27 @@ ssh root@192.168.1.1 "sh /etc/openflux/restore-vkturn.sh"
 Read-only readiness check while OpenFlux is running:
 sh /etc/openflux/activate.sh --check
 
+Yandex captcha/login on the router:
+If logread reports "yandex docs: captcha required", the Yandex carrier cannot connect.
+A handshake timeout then prevents the local SOCKS listener from starting. Increasing the
+activation delay does not solve this authentication failure.
+The core supports a Netscape cookies.txt export for vyandex. Sign in to Yandex and open
+the configured editable document in a browser. Export only the relevant Yandex cookies
+locally; keep this file out of Git, chat, and diagnostic output.
+Copy it from Windows PowerShell (replace the local path):
+scp -O "C:/path/to/yandex-cookies.txt" root@192.168.1.1:/etc/openflux/yandex-cookies.txt
+ssh root@192.168.1.1 "chmod 600 /etc/openflux/yandex-cookies.txt"
+The next manual activation automatically passes this file via --yandex-cookies-file.
+With an explicit browser export, the core uses a temporary JSON store reset at each
+service start so stale cached cookies cannot overwrite the imported login. The original
+/etc/openflux/cookies.json stays intact. Updated runtime cookies are temporary; a later
+captcha/login wall can require refreshing the browser export.
+Uploading the file does not start a service or switch routing. No restart is needed
+before the manual activation command above. The normal readiness checks still apply.
+Browser cookies obtained through VK TURN may still be challenged when reused from the
+router's WAN address. If captcha persists, solve it from that same WAN address and
+refresh the export; the presence of a cookie file alone does not prove authentication.
+
 OpenFlux: /tmp/openflux-core, node-v1.3.1 arm64; verified gzip stored in /etc/openflux/openflux.gz.
 Private key and config stay under /etc/openflux, root-only.
 Existing sing-box supplies oflux0 (198.19.0.1/30, MTU 1280), SOCKS5 is localhost:1080.
