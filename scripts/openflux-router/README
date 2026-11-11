@@ -44,6 +44,27 @@ Browser cookies obtained through VK TURN may still be challenged when reused fro
 router's WAN address. If captcha persists, solve it from that same WAN address and
 refresh the export; the presence of a cookie file alone does not prove authentication.
 
+Isolated CAPTCHA browser through the router WAN (Windows):
+Run from the repository with its existing Python environment and installed Chrome:
+.venv/Scripts/python.exe scripts/openflux-router/authorize-yandex.py
+Enter the router SSH password in the local masked dialog. The tool opens an empty
+Chrome context through a loopback-only SSH HTTP proxy; its Yandex connections use
+IPv4 through the router, with the pinned core's user-agent. It imports no personal
+browser cookies. Pass the check without signing into a Yandex account, then click
+the local Save button. Only unexpired yandex.ru cookies are sent to the router;
+account-session cookies are explicitly rejected and values/URLs are never logged.
+The proxy accepts only HTTPS Yandex destinations. It and the temporary browser close
+on completion, cancellation, or the 15-minute interaction deadline. The previous
+router cookie export is preserved as yandex-cookies.before-wan-auth.txt (root-only).
+The browser can be let through without a visible CAPTCHA. Before replacing the cookie
+file, the tool probes the document from the router using curl with the core's user-agent.
+It follows only validated HTTPS Yandex redirects, transfers response cookies back to
+the isolated browser, and opens any challenge returned by the router request there.
+Saving requires HTTP 200 with the editor's client-config, rather than the presence of
+a spravka marker alone. The tool never starts OpenFlux or changes routing. This document
+fetch check does not prove that the OpenFlux tunnel is ready; manually activate and
+use the normal preflight checks afterward. No full-LAN readiness is assumed.
+
 OpenFlux: /tmp/openflux-core, node-v1.3.1 arm64; verified gzip stored in /etc/openflux/openflux.gz.
 Private key and config stay under /etc/openflux, root-only.
 Existing sing-box supplies oflux0 (198.19.0.1/30, MTU 1280), SOCKS5 is localhost:1080.
