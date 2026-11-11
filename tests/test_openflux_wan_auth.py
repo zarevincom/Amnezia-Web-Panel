@@ -57,22 +57,13 @@ class WanAuthTests(unittest.TestCase):
             with self.subTest(cookies=cookies), self.assertRaises(ValueError):
                 auth.cookie_export(cookies)
 
-    def test_probe_reads_captcha_redirect_and_new_cookies_without_logging_values(self):
-        raw = ('HTTP/1.1 302 Found\r\nLocation: /showcaptcha?token=private\r\n'
-               'Set-Cookie: yandexuid=anonymous; Domain=.yandex.ru; Path=/; Secure; HttpOnly\r\n'
-               '\r\n\x000')
-        result = auth.parse_probe(raw, 'https://docs.yandex.ru/edit/d/document')
-        self.assertEqual(result['status'], 302)
-        self.assertEqual(result['location'], 'https://docs.yandex.ru/showcaptcha?token=private')
-        self.assertFalse(result['editor'])
-        self.assertEqual(result['cookies'][0]['name'], 'yandexuid')
-        self.assertTrue(result['cookies'][0]['httpOnly'])
-
-    def test_probe_requires_editor_page_not_just_http_200(self):
-        self.assertFalse(auth.parse_probe('HTTP/1.1 200 OK\r\n\r\n\x000',
-                                         'https://docs.yandex.ru/')['editor'])
-        self.assertTrue(auth.parse_probe('HTTP/1.1 200 OK\r\n\r\n\x001',
-                                        'https://docs.yandex.ru/')['editor'])
+    def test_saving_requires_document_page_not_captcha_or_other_site(self):
+        self.assertTrue(auth.editor_page('https://docs.yandex.ru/edit/d/document'))
+        for url in ('https://evil.test/edit/d/document',
+                    'https://docs.yandex.ru/showcaptcha?retpath=/edit/d/document',
+                    'http://docs.yandex.ru/edit/d/document'):
+            with self.subTest(url=url):
+                self.assertFalse(auth.editor_page(url))
 
     def test_export_rejects_cookie_line_injection(self):
         with self.assertRaises(ValueError):

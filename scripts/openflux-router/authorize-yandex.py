@@ -4,19 +4,13 @@ Uses the project's existing paramiko/playwright dependencies and installed Chrom
 Does not start OpenFlux, change routing, or read a personal browser profile.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from email.parser import Parser
-from http.cookiejar import CookieJar
 import ipaddress
-import json
 from pathlib import Path
 import re
-import shlex
 import socket
 import threading
 import time
 from urllib.parse import urljoin, urlsplit
-from urllib.request import Request
-from types import SimpleNamespace
 
 
 USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0'
@@ -60,55 +54,10 @@ def cookie_export(cookies):
     return '\n'.join(lines) + '\n'
 
 
-def parse_probe(raw, url):
-    header_text, editor = raw.split('\0', 1)
-    block = header_text.replace('\r\n', '\n').strip().split('\n\n')[-1]
-    status_line, _, fields = block.partition('\n')
-    status = int(status_line.split()[1])
-    headers = Parser().parsestr(fields)
-    location = urljoin(url, headers['Location']) if headers['Location'] else None
-    if location:
-        validate_target(location)
-    jar = CookieJar()
-    jar.extract_cookies(SimpleNamespace(info=lambda: headers), Request(url))
-    cookies = []
-    for cookie in jar:
-        item = dict(name=cookie.name, value=cookie.value, domain=cookie.domain,
-                    path=cookie.path, secure=cookie.secure,
-                    httpOnly=cookie.has_nonstandard_attr('HttpOnly'))
-        if cookie.expires is not None:
-            item['expires'] = cookie.expires
-        cookies.append(item)
-    return dict(status=status, location=location, cookies=cookies,
-                editor=status == 200 and editor.strip() == '1')
-
-
-def probe_document(ssh, context, doc):
-    target = doc
-    for attempt in range(10):
-        validate_target(target)
-        remote(ssh, 'umask 077; cat > /etc/openflux/yandex-cookies.txt.next',
-               cookie_export(context.cookies()))
-        raw = remote(ssh, "set -e\numask 077\n"
-                     "state=$(mktemp -d /tmp/openflux-auth.XXXXXX)\n"
-                     "trap 'rm -f \"$state/headers\" \"$state/body\"; rmdir \"$state\"' EXIT\n"
-                     "curl -q -4 --noproxy '*' --proto '=https' -sS --connect-timeout 10 --max-time 30 "
-                     "--max-filesize 4194304 -b /etc/openflux/yandex-cookies.txt.next "
-                     '-D "$state/headers" -o "$state/body" '
-                     '-H ' + shlex.quote('Accept-Language: ru-RU,ru;q=0.9') + ' '
-                     '-H ' + shlex.quote('Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8') + ' '
-                     '-A ' + shlex.quote(USER_AGENT) + ' ' + shlex.quote(target) + '\n'
-                     'head -c 65536 "$state/headers"\nprintf "\\0"\n'
-                     'if grep -q \'id="client-config"\' "$state/body"; then printf 1; else printf 0; fi')
-        result = parse_probe(raw, target)
-        if result['cookies']:
-            context.add_cookies(result['cookies'])
-        if result['editor'] or not result['location']:
-            return result
-        if 'showcaptcha' in urlsplit(result['location']).path:
-            return result
-        target = result['location']
-    raise RuntimeError('Too many document redirects')
+def editor_page(url):
+    target = urlsplit(url)
+    return (target.scheme == 'https' and target.hostname in ('docs.yandex.ru', 'disk.yandex.ru')
+            and target.path.startswith('/edit/d/'))
 
 
 class WanProxy(BaseHTTPRequestHandler):
@@ -235,14 +184,8 @@ def main():
                     continue
                 state['save'] = False
                 try:
-                    result = probe_document(ssh, context, doc)
-                    if not result['editor']:
-                        print('ROUTER_HTTP_PROBE_REQUIRES_CHECK', flush=True)
-                        if result['location']:
-                            page.goto(result['location'], wait_until='domcontentloaded', timeout=60000)
-                        messagebox.showwarning('OpenFlux', 'Запрос с роутера ещё требует проверки.\n'
-                                               'Пройдите её в Chrome и снова нажмите сохранение.', parent=root)
-                        continue
+                    if not editor_page(page.url):
+                        raise ValueError('The document editor is not open yet. Complete the check first.')
                     export = cookie_export(context.cookies())
                 except ValueError as error:
                     messagebox.showwarning('OpenFlux', str(error), parent=root)
@@ -253,7 +196,7 @@ def main():
                        'cp /etc/openflux/yandex-cookies.txt /etc/openflux/yandex-cookies.before-wan-auth.txt; fi\n'
                        'chmod 600 /etc/openflux/yandex-cookies.txt.next\n'
                        'mv /etc/openflux/yandex-cookies.txt.next /etc/openflux/yandex-cookies.txt')
-                print('ROUTER_DOC_HTTP_VERIFIED_COOKIES_INSTALLED_NO_SERVICES_STARTED', flush=True)
+                print('WAN_BROWSER_COOKIES_INSTALLED_NO_SERVICES_STARTED', flush=True)
                 break
             browser.close()
     except Exception as error:

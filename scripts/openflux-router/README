@@ -56,14 +56,13 @@ account-session cookies are explicitly rejected and values/URLs are never logged
 The proxy accepts only HTTPS Yandex destinations. It and the temporary browser close
 on completion, cancellation, or the 15-minute interaction deadline. The previous
 router cookie export is preserved as yandex-cookies.before-wan-auth.txt (root-only).
-The browser can be let through without a visible CAPTCHA. Before replacing the cookie
-file, the tool probes the document from the router using curl with the core's user-agent.
-It follows only validated HTTPS Yandex redirects, transfers response cookies back to
-the isolated browser, and opens any challenge returned by the router request there.
-Saving requires HTTP 200 with the editor's client-config, rather than the presence of
-a spravka marker alone. The tool never starts OpenFlux or changes routing. This document
-fetch check does not prove that the OpenFlux tunnel is ready; manually activate and
-use the normal preflight checks afterward. No full-LAN readiness is assumed.
+The browser can be let through without a visible CAPTCHA or a spravka cookie. Saving
+requires that the editor page is open and that the user clicks Save; it stages the
+fresh anonymous WAN browser session for the next manual activation. Requests made
+with curl can be challenged even when the browser opens the editor; that is not a
+readiness test for OpenFlux. The tool never starts OpenFlux or changes routing.
+Manually activate and use the normal SOCKS/TUN preflight checks afterward. No tunnel
+or full-LAN readiness is assumed merely because the browser opens the document.
 
 OpenFlux: /tmp/openflux-core, node-v1.3.1 arm64; verified gzip stored in /etc/openflux/openflux.gz.
 Private key and config stay under /etc/openflux, root-only.
