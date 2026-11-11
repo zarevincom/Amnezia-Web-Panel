@@ -224,11 +224,17 @@ for the full list of knobs.
 ### OpenFlux from Marketplace
 
 Open a managed VPS → **Marketplace → OpenFlux**. Specify at least one carrier:
-a Yandex document with editing by link enabled, a public Mail.ru document, or an
+a Yandex Docs editor address (`https://docs.yandex.ru/edit/d/...`), a public Mail.ru document, or an
 existing packed Cups.online room list exported by OpenFlux. Multiple carriers
 can be enabled together. Yandex has priority 100, Mail.ru 90, Cups.online 70;
 an encrypted direct connection is the fallback (priority 50, default `8445/tcp`).
 Allow that TCP port in the VPS/provider firewall to use the fallback.
+
+For Yandex, copy the address bar of the loaded Docs editor. The **Share** link
+(`/i/...` or `/d/...`) can open a Disk preview even when editing is allowed;
+`/edit/disk/...` is a private file path. These are different identifiers and
+cannot be converted by replacing the path. Yandex may require a signed-in
+session on the client and exit; a public share link alone does not establish it.
 
 The panel installs the SHA-256 checked **node-v1.3.1** Linux amd64/arm64 core
 in an unprivileged Docker container. The L4 exit does not change host routes.

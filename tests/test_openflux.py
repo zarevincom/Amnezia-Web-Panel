@@ -35,6 +35,15 @@ class OpenFluxTests(unittest.TestCase):
         value = pack(['1c031f41-e832-404c-a7b4-92f24c993b84'])
         self.assertEqual(OpenFluxManager.validate_options(cups_rooms=value)[0]['url'], value)
 
+    def test_yandex_share_and_private_paths_explain_required_editor_address(self):
+        from managers.openflux_manager import OpenFluxManager
+        for value in ('https://disk.yandex.ru/i/AbCdEfGhIjKlMn',
+                      'https://disk.yandex.ru/d/AbCdEfGhIjKlMn',
+                      'https://yadi.sk/i/AbCdEfGhIjKlMn',
+                      'https://docs.yandex.ru/edit/disk/disk%2FDocument.docx?source=docs'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'editor address.*https://docs.yandex.ru/edit/d/'):
+                OpenFluxManager.validate_options(yandex_url=value)
+
     def test_invalid_install_rejected_before_ssh(self):
         with patch.object(panel, '_check_admin', return_value=True), \
              patch.object(panel, 'load_data', return_value={'servers': [{'protocols': {}}]}), \

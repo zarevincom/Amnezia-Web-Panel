@@ -838,7 +838,7 @@
     "vkturn_command": "Moroka8 client command (Linux/macOS; adapt the binary name on Windows/Android)",
     "vkturn_routes_hint": "Start the proxy before WireGuard. Use the Moroka8 route script on desktop; exclude the proxy app from the VPN on Android. An iOS import link is available after entering a call link for a full-tunnel profile. Keep the WRAP key and exported links private.",
   "openflux_desc": "Encrypted OpenFlux L4 exit over Yandex Docs, Mail.ru or Cups.online, with direct fallback.",
-  "openflux_transport_hint": "Fill in at least one transport. Enable editing by link for the Yandex document; use a public Mail.ru document. For Cups.online paste an existing packed room list from OpenFlux. Carriers may require login or captcha in the OpenFlux client.",
+  "openflux_transport_hint": "For Yandex paste the loaded editor address from the browser address bar: https://docs.yandex.ru/edit/d/… . Share links (/i/, /d/) open a file preview even with editing enabled; /edit/disk/ is a private path. These links cannot be converted by replacing the path. Yandex may require sign-in. For Mail.ru use a public document; for Cups.online paste an existing packed room list. Fill in at least one transport.",
   "openflux_cups_rooms": "Packed room list from OpenFlux",
   "openflux_connection_link": "Connection link",
   "openflux_link_hint": "Import this link into OpenFlux Desktop, Android or iOS. It contains the shared channel key: only share it with trusted users. This channel has no individual client revocation.",

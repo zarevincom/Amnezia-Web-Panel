@@ -60,6 +60,12 @@ class OpenFluxManager:
                 parsed = urlsplit(value)
                 value = parsed._replace(query='', fragment='').geturl().rstrip('/')
             if not re.fullmatch(pattern, value):
+                if kind == 'vyandex':
+                    raise ValueError(
+                        'Yandex Docs requires the editor address https://docs.yandex.ru/edit/d/... '
+                        'from the browser address bar. A Share link (/i/ or /d/) opens a file preview, '
+                        'even with editing enabled; /edit/disk/ is a private file path. '
+                        'These links cannot be converted by replacing the URL path.')
                 raise ValueError(f'Invalid OpenFlux {kind} address')
             if kind == 'cupsonline':
                 try:
