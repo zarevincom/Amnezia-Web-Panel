@@ -221,6 +221,28 @@ for the full list of knobs.
 > [!IMPORTANT]  
 > Secure your panel by changing the default password in the **Users** section immediately after first login.
 
+### OpenFlux from Marketplace
+
+Open a managed VPS → **Marketplace → OpenFlux**. Specify at least one carrier:
+a Yandex document with editing by link enabled, a public Mail.ru document, or an
+existing packed Cups.online room list exported by OpenFlux. Multiple carriers
+can be enabled together. Yandex has priority 100, Mail.ru 90, Cups.online 70;
+an encrypted direct connection is the fallback (priority 50, default `8445/tcp`).
+Allow that TCP port in the VPS/provider firewall to use the fallback.
+
+The panel installs the SHA-256 checked **node-v1.3.1** Linux amd64/arm64 core
+in an unprivileged Docker container. The L4 exit does not change host routes.
+Use **Connection link** on the installed card and import `openflux://` in an
+OpenFlux Desktop, Android or iOS client. Carrier login/captcha prompts are
+handled in the OpenFlux client. Set the service's public address using 🌐 if
+clients connect through a different address or forwarded TCP port.
+
+The link contains the shared channel key and is available only to panel admins.
+There is no individual client revocation for this shared channel. Keys and
+cookie state stay under `/opt/amnezia/openflux` on the managed VPS, outside the
+panel database and ordinary status responses. Stop/start preserves them;
+**Uninstall** removes this service and its keys. Remove it before reinstalling.
+
 ## 🧰 Environment Variables
 
 Every variable is optional — the panel starts with working defaults. Paths marked `<app dir>` resolve

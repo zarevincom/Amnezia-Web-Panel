@@ -465,6 +465,20 @@
         </div>
     </div>
 
+    <div class="card card-hover protocol-card protocol-openflux" id="proto-openflux">
+        <div class="protocol-card-head">
+            <div class="protocol-icon">🌊</div>
+            <div class="protocol-name">OpenFlux</div>
+            <div class="flex gap-sm protocol-ctrl" id="openflux-ctrl" style="display:none!important;"></div>
+        </div>
+        <div class="protocol-desc">{{ _('openflux_desc') }}</div>
+        <div class="protocol-status" id="openflux-status"><span class="badge badge-warn">{{ _('not_checked') }}</span></div>
+        <div id="openflux-info" class="hidden"><div class="protocol-info" id="openflux-info-grid"></div></div>
+        <div class="flex gap-sm" id="openflux-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('openflux')" id="openflux-install-btn">{{ _('install') }}</button>
+        </div>
+    </div>
+
     <!-- DNS Card -->
     <div class="card card-hover protocol-card protocol-dns" id="proto-dns">
         <div class="protocol-card-head">
@@ -920,6 +934,22 @@
                         <input class="form-input mt-xs" type="text" id="installAwgI5" spellcheck="false" placeholder="I5">
                         <div class="form-hint">{{ _('awg_special_junk_syntax') }}</div>
                     </div>
+                </div>
+            </div>
+
+            <div id="openfluxOptions" style="display:none;">
+                <div class="form-hint">{{ _('openflux_transport_hint') }}</div>
+                <div class="form-group">
+                    <label class="form-label" for="installOpenfluxYandex">Yandex Docs</label>
+                    <input class="form-input" type="url" id="installOpenfluxYandex" placeholder="https://docs.yandex.ru/edit/d/…" autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="installOpenfluxMailru">Mail.ru</label>
+                    <input class="form-input" type="url" id="installOpenfluxMailru" placeholder="https://cloud.mail.ru/public/…/…" autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="installOpenfluxCups">Cups.online</label>
+                    <input class="form-input" type="text" id="installOpenfluxCups" placeholder="{{ _('openflux_cups_rooms') }}" autocomplete="off">
                 </div>
             </div>
 
@@ -1444,6 +1474,19 @@
     </div>
 </div>
 
+<div class="modal-backdrop" id="openfluxModal">
+    <div class="modal">
+        <div class="modal-header">
+            <h2 class="modal-title">OpenFlux</h2>
+            <button class="modal-close" onclick="closeModal('openfluxModal')">×</button>
+        </div>
+        <p class="text-muted">{{ _('openflux_link_hint') }}</p>
+        <label class="form-label" for="openfluxLink">{{ _('openflux_connection_link') }}</label>
+        <textarea class="form-input" id="openfluxLink" rows="5" readonly spellcheck="false"></textarea>
+        <button class="btn btn-secondary btn-sm" onclick="copyToClipboard(document.getElementById('openfluxLink').value)">{{ _('copy_key') }}</button>
+    </div>
+</div>
+
 <div class="modal-backdrop" id="vkTurnModal">
     <div class="modal" style="max-width:680px;">
         <div class="modal-header">
@@ -1652,6 +1695,7 @@
         { proto: 'adguard', category: 'services', icon: '🛡️', title: 'AdGuard Home', descKey: 'adguard_desc' },
         { proto: 'socks5', category: 'services', icon: '🧦', title: 'SOCKS5 Proxy', descKey: 'socks5_desc' },
         { proto: 'vkturn', category: 'services', icon: '📞', title: 'VK TURN Proxy (Moroka8)', descKey: 'vkturn_desc', badge: 'NEW' },
+        { proto: 'openflux', category: 'services', icon: '🌊', title: 'OpenFlux', descKey: 'openflux_desc', badge: 'NEW' },
         { proto: 'exit', category: 'services', icon: '🚪', title: 'Exit Node', descKey: 'exit_desc', badge: 'NEW' },
         { proto: 'rknblock', category: 'services', icon: '🌈', title: 'RKN Block (C24Be)', descKey: 'rknblock_desc' },
         { proto: 'nginx', category: 'web_servers', icon: '🌐', title: 'NGINX', descKey: 'nginx_desc' },
@@ -2075,6 +2119,7 @@
             case 'telemt': title = 'Telemt'; break;
             case 'wireguard': title = 'WireGuard'; break;
             case 'vkturn': title = 'VK TURN Proxy'; break;
+            case 'openflux': title = 'OpenFlux'; break;
             case 'aivpn': title = 'AIVPN'; break;
             case 'dns': title = 'AmneziaDNS'; break;
             case 'socks5': title = 'SOCKS5 Proxy'; break;
@@ -2341,11 +2386,14 @@
 
     // Services that don't have per-user "connections" — they expose a single
     // shared endpoint (DNS/proxy/admin UI) rather than per-client configs.
-    const SERVICE_PROTOS = ['dns', 'socks5', 'adguard', 'nginx', 'exit', 'vkturn'];
+    const SERVICE_PROTOS = ['dns', 'socks5', 'adguard', 'nginx', 'exit', 'vkturn', 'openflux'];
 
     function buildServiceInfoGrid(proto, info) {
         // Custom info-grid markup for non-VPN services. Returns HTML for the grid body.
         const base = protoBase(proto);
+        if (base === 'openflux') {
+            return `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${escapeHtml(String(info.port || '8445'))}/TCP · L4</span></div>`;
+        }
         if (base === 'vkturn') {
             return `<div class="protocol-info-item"><span class="protocol-info-label">${_('port')}</span><span class="protocol-info-value">${escapeHtml(String(info.port || '56000'))}/UDP · WRAP</span></div>
                 <div class="protocol-info-item"><span class="protocol-info-label">WireGuard</span><span class="protocol-info-value">${escapeHtml(String(info.backend_port || '51820'))}/UDP</span></div>`;
@@ -2483,7 +2531,10 @@
                 }
                 infoGrid.innerHTML = grid;
             }
-            if (protoBase(proto) === 'vkturn') {
+            if (protoBase(proto) === 'openflux') {
+                actionsEl.innerHTML = `<button class="btn btn-secondary btn-sm" onclick="openOpenfluxSettings()" style="flex:1">${_('openflux_connection_link')}</button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('openflux')">${_('uninstall')}</button>`;
+            } else if (protoBase(proto) === 'vkturn') {
                 actionsEl.innerHTML = `
                     <button class="btn btn-secondary btn-sm" onclick="openVkTurnSettings()" style="flex:1">${_('vkturn_settings')}</button>
                     <button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')">${_('backup')}</button>
@@ -2542,7 +2593,7 @@
                     `;
                 } else if (isService) {
                     ctrlEl.innerHTML = `
-                        ${proto === 'vkturn' ? `<button class="btn btn-secondary btn-sm" onclick="openPublicEndpointModal('vkturn')" title="${_('public_endpoint_title')}">🌐</button>` : ''}
+                        ${['vkturn', 'openflux'].includes(proto) ? `<button class="btn btn-secondary btn-sm" onclick="openPublicEndpointModal('${proto}')" title="${_('public_endpoint_title')}">🌐</button>` : ''}
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
                 } else {
@@ -2568,7 +2619,10 @@
         } else if (info.container_exists) {
             installedProtocols[proto] = true;
             statusEl.innerHTML = `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('stop')}</span>`;
-            if (protoBase(proto) === 'vkturn') {
+            if (protoBase(proto) === 'openflux') {
+                actionsEl.innerHTML = `<button class="btn btn-secondary btn-sm" onclick="openOpenfluxSettings()" style="flex:1">${_('openflux_connection_link')}</button>
+                    <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('openflux')">${_('uninstall')}</button>`;
+            } else if (protoBase(proto) === 'vkturn') {
                 actionsEl.innerHTML = `
                     <button class="btn btn-secondary btn-sm" onclick="openVkTurnSettings()" style="flex:1">${_('vkturn_settings')}</button>
                     <button class="btn btn-secondary btn-sm" onclick="showProtocolBackups('${proto}')">${_('backup')}</button>
@@ -3035,12 +3089,19 @@
         nginxOpts.style.display = 'none';
         awgOpts.style.display = 'none';
         exitOpts.style.display = 'none';
+        document.getElementById('openfluxOptions').style.display = base === 'openflux' ? 'block' : 'none';
 
         if (base === 'dns') {
             portLabel.textContent = _('port') + ' (Internal)';
             portInput.value = '53';
             portInput.disabled = true;
             portHint.textContent = _('dns_internal_hint');
+        } else if (base === 'openflux') {
+            portLabel.textContent = _('port') + ' (TCP)';
+            portInput.disabled = false;
+            portInput.min = '1024';
+            portInput.value = '8445';
+            portHint.textContent = _('openflux_port_hint');
         } else if (base === 'vkturn') {
             portLabel.textContent = _('port') + ' (UDP)';
             portInput.disabled = false;
@@ -3185,7 +3246,11 @@
             const params = {
                 protocol: currentInstallProto, port: port, install_another: currentInstallAnother,
             };
-            if (protoBase(currentInstallProto) === 'telemt') {
+            if (protoBase(currentInstallProto) === 'openflux') {
+                params.openflux_yandex_url = document.getElementById('installOpenfluxYandex').value.trim();
+                params.openflux_mailru_url = document.getElementById('installOpenfluxMailru').value.trim();
+                params.openflux_cups_rooms = document.getElementById('installOpenfluxCups').value.trim();
+            } else if (protoBase(currentInstallProto) === 'telemt') {
                 params.tls_emulation = document.getElementById('installTelemtTls').checked;
                 params.tls_domain = document.getElementById('installTelemtDomain').value;
                 params.max_connections = parseInt(document.getElementById('installTelemtMaxConns').value) || 0;
@@ -4561,6 +4626,18 @@
             showToast(_('config_saved'), 'success');
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function openOpenfluxSettings() {
+        const field = document.getElementById('openfluxLink');
+        field.value = '';
+        openModal('openfluxModal');
+        try {
+            const data = await apiCall(`/api/servers/${SERVER_ID}/openflux/settings`);
+            if (document.getElementById('openfluxModal').classList.contains('active')) field.value = data.link;
+        } catch (err) {
+            showToast(err.message, 'error');
         }
     }
 

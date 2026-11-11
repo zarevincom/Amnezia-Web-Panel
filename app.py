@@ -1081,7 +1081,7 @@ async def wait_for_tunnel_url(provider: str, seconds: int = 20):
     return get_tunnel_status(provider)
 
 
-BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn', 'exit', 'vkturn']
+BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'aivpn', 'exit', 'vkturn', 'openflux']
 MULTI_INSTANCE_PROTOCOLS = {'awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'socks5', 'aivpn'}
 
 
@@ -1170,6 +1170,7 @@ def protocol_display_name(protocol: str, header_protection=False) -> str:
         'dns': 'AmneziaDNS',
         'wireguard': 'WireGuard',
         'vkturn': 'VK TURN Proxy',
+        'openflux': 'OpenFlux',
         'socks5': 'SOCKS5',
         'adguard': 'AdGuard Home',
         'nginx': 'NGINX',
@@ -1193,6 +1194,7 @@ def protocol_container_name(protocol: str) -> Optional[str]:
         'dns': 'amnezia-dns',
         'wireguard': 'amnezia-wireguard',
         'vkturn': 'amnezia-vkturn',
+        'openflux': 'amnezia-openflux',
         'socks5': 'amnezia-socks5proxy',
         'adguard': 'amnezia-adguard',
         'nginx': 'amnezia-nginx',
@@ -1211,6 +1213,9 @@ def is_valid_protocol(protocol: str) -> bool:
 
 def get_protocol_manager(ssh, protocol: str):
     base = protocol_base(protocol)
+    if base == 'openflux':
+        from managers.openflux_manager import OpenFluxManager
+        return OpenFluxManager(ssh, protocol)
     if base == 'vkturn':
         from managers.vkturn_manager import VkTurnManager
         return VkTurnManager(ssh, protocol)
@@ -2362,6 +2367,9 @@ class InstallProtocolRequest(BaseModel):
     protocol: str = 'awg'
     port: str = '55424'
     install_another: Optional[bool] = False
+    openflux_yandex_url: str = ''
+    openflux_mailru_url: str = ''
+    openflux_cups_rooms: str = ''
     tls_emulation: Optional[bool] = None
     tls_domain: Optional[str] = None
     max_connections: Optional[int] = None
@@ -4720,6 +4728,7 @@ INSTALL_PORT_TRANSPORT = {
     'awg': 'udp', 'awg2': 'udp', 'awg3': 'udp', 'awg_legacy': 'udp',
     'wireguard': 'udp', 'exit': 'udp', 'vkturn': 'udp',
     'xray': 'tcp', 'telemt': 'tcp', 'socks5': 'tcp', 'nginx': 'tcp',
+    'openflux': 'tcp',
 }
 
 
@@ -4743,9 +4752,10 @@ def api_used_ports(request: Request, server_id: int):
 async def api_install_protocol(request: Request, server_id: int, req: InstallProtocolRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    ssh = None
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if not 0 <= server_id < len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         if not is_valid_protocol(req.protocol):
             return JSONResponse({'error': 'Invalid protocol type'}, status_code=400)
@@ -4754,6 +4764,17 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         if 'protocols' not in server:
             server['protocols'] = {}
         base_protocol = protocol_base(req.protocol)
+        if base_protocol == 'openflux':
+            from managers.openflux_manager import OpenFluxManager
+            try:
+                if 'port' not in req.model_fields_set or req.port == '':
+                    req.port = str(OpenFluxManager.DEFAULT_PORT)
+                OpenFluxManager._port(req.port)
+                OpenFluxManager.validate_options(req.openflux_yandex_url, req.openflux_mailru_url, req.openflux_cups_rooms)
+                if req.protocol != 'openflux':
+                    raise ValueError('OpenFlux supports a single instance per server')
+            except ValueError as e:
+                return JSONResponse({'error': str(e)}, status_code=400)
         if base_protocol == 'vkturn' and 'port' not in req.model_fields_set:
             req.port = '56000'
         if req.install_another:
@@ -4816,7 +4837,13 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
 
         # Pass parameters to installer
         install_kwargs = None
-        if install_base == 'vkturn':
+        if install_base == 'openflux':
+            install_args = ()
+            install_kwargs = dict(protocol_type=install_protocol, port=req.port,
+                                  yandex_url=req.openflux_yandex_url,
+                                  mailru_url=req.openflux_mailru_url,
+                                  cups_rooms=req.openflux_cups_rooms)
+        elif install_base == 'vkturn':
             install_args = ()
             install_kwargs = dict(protocol_type=install_protocol, port=req.port)
         elif install_base == 'telemt':
@@ -4901,7 +4928,7 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             ssh.disconnect()
             return JSONResponse({'error': result.get('message') or result.get('error') or 'Installation failed'}, status_code=400)
 
-        if install_base == 'vkturn':
+        if install_base in ('vkturn', 'openflux'):
             # Installation can take minutes. Merge only its records into the
             # latest state so concurrent user edits and server reorders survive.
             async with DATA_LOCK:
@@ -4916,13 +4943,16 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                     ssh.disconnect()
                     return JSONResponse({'error': 'Server was removed during installation; check the VPS before retrying'}, status_code=409)
                 protocols = current.setdefault('protocols', {})
-                previous = protocols.get('vkturn') or {}
+                previous = protocols.get(install_base) or {}
                 record = {key: previous[key] for key in ('public_host', 'public_port', 'custom_name') if key in previous}
-                record.update(installed=True, port=result['port'], backend_port=result['backend_port'],
-                              version=result['version'], base_protocol='vkturn', instance=1,
-                              display_name='VK TURN Proxy', container_name='amnezia-vkturn')
-                protocols['vkturn'] = record
-                if result.get('wireguard_created'):
+                record.update(installed=True, port=result['port'], version=result['version'],
+                              base_protocol=install_base, instance=1,
+                              display_name=protocol_display_name(install_base),
+                              container_name=protocol_container_name(install_base))
+                if install_base == 'vkturn':
+                    record['backend_port'] = result['backend_port']
+                protocols[install_base] = record
+                if install_base == 'vkturn' and result.get('wireguard_created'):
                     protocols.setdefault('wireguard', {
                         'installed': True, 'port': result['wireguard_port'],
                         'base_protocol': 'wireguard', 'instance': 1,
@@ -4930,8 +4960,8 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                     })
                 save_data(fresh)
             ssh.disconnect()
-            result.update(protocol='vkturn', base_protocol='vkturn',
-                          display_name='VK TURN Proxy', container_name='amnezia-vkturn')
+            result.update(protocol=install_base, base_protocol=install_base,
+                          display_name=record['display_name'], container_name=record['container_name'])
             return result
 
         proto_record = {
@@ -5009,6 +5039,36 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
     except Exception as e:
         logger.exception("Error installing protocol")
         return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if req.protocol == 'openflux' and ssh:
+            ssh.disconnect()
+
+
+@app.get('/api/servers/{server_id}/openflux/settings', tags=["Protocols"])
+def api_openflux_settings(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    ssh = None
+    try:
+        data = load_data()
+        if not 0 <= server_id < len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        if not server.get('protocols', {}).get('openflux'):
+            return JSONResponse({'error': 'OpenFlux is not installed'}, status_code=400)
+        from managers.openflux_manager import OpenFluxManager
+        ssh = get_ssh(server)
+        host, port = protocol_public_endpoint(server, 'openflux')
+        settings = OpenFluxManager(ssh).get_settings(host, port)
+        return JSONResponse(settings, headers={'Cache-Control': 'no-store'})
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception:
+        logger.exception('Error reading OpenFlux settings')
+        return JSONResponse({'error': 'Could not read OpenFlux settings'}, status_code=500)
+    finally:
+        if ssh:
+            ssh.disconnect()
 
 
 def _vkturn_endpoint(server, settings):
@@ -5459,6 +5519,7 @@ CONTAINER_NAMES = {
     'dns': 'amnezia-dns',
     'wireguard': 'amnezia-wireguard',
     'vkturn': 'amnezia-vkturn',
+    'openflux': 'amnezia-openflux',
     'socks5': 'amnezia-socks5proxy',
     'adguard': 'amnezia-adguard',
     'nginx': 'amnezia-nginx',
